@@ -434,12 +434,11 @@ def action_can_run_while_pending(
     administrative_detour = bool(
         declared_intake_detour
         or trusted_runtime_control
-        or action_type in {"reset_session", "go_back"}
+        or (spec is not None and spec.interrupts_pending)
     )
-    explicit_administrative_detour = action_type in {
-        "reset_session",
-        "go_back",
-    }
+    explicit_administrative_detour = bool(
+        spec is not None and spec.interrupts_pending
+    )
     explicit_navigation = bool(
         spec is not None
         and spec.effect == "workflow_navigation"

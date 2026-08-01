@@ -889,9 +889,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             runtime.close()
             checkpoint_bytes = checkpoint_path.read_bytes()
 
-        self.assertTrue(observed_inputs)
-        self.assertNotIn(raw_secret, observed_inputs[-1])
-        self.assertIn("semantic-secret:", observed_inputs[-1])
+        self.assertEqual(observed_inputs, [])
+        self.assertIn("semantic-secret:", json.dumps(result, ensure_ascii=False))
         self.assertNotIn(raw_secret, json.dumps(result, ensure_ascii=False))
         self.assertNotIn(raw_secret, json.dumps(snapshot, ensure_ascii=False))
         self.assertNotIn(raw_secret.encode(), checkpoint_bytes)
@@ -989,6 +988,61 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         )
         self.assertEqual(decline_bindings, ())
 
+    def test_sensitive_manual_pending_uses_bound_contract_without_semantic_planning(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import adjudicate_turn_step
+        from agent.harness.graph import project_turn_input
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.secret_refs import release_unowned_input_secret_bindings
+        from agent.harness.state import new_state
+
+        state = new_state("sensitive-manual-admission", language="en")
+        state["turn_index"] = 1
+        state["active_group"] = "endpoint_process"
+        state["pending_question"] = manual_question(
+            "endpoint_process",
+            "new_chain_endpoint",
+            question_text("question.chain_rpc.new_chain_endpoint.prompt"),
+            owner="chain_rpc",
+            field="new_chain_endpoint",
+            kind="url",
+            accepted_action_types=("rpc_catalog_command",),
+            manual_action={
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            queue_barrier=True,
+            requires_capabilities=("chain_identity",),
+        )
+        projected, bindings = project_turn_input(
+            state,
+            "http://172.18.0.2:19000",
+            scope_id="turn:test:sensitive-manual-admission",
+        )
+        state["turn_context"] = {
+            "kind": "pending",
+            "text": projected,
+            "origin_group": "endpoint_process",
+            "input_secret_bindings": [dict(item) for item in bindings],
+        }
+
+        admitted = adjudicate_turn_step(state)
+
+        self.assertEqual(admitted["control"]["phase"], "execute")
+        self.assertEqual(len(admitted["action_queue"]), 1)
+        envelope = admitted["action_queue"][0]
+        self.assertEqual(envelope["action_type"], "rpc_catalog_command")
+        self.assertEqual(envelope["arguments"]["catalog_command"], "set_endpoint")
+        self.assertEqual(envelope["arguments"]["rpc_endpoint"], projected)
+        self.assertEqual(envelope["arguments"]["source_evidence"], projected)
+        self.assertEqual(
+            envelope["admission_metadata"]["semantic_secret_bindings"][0]["reference"],
+            projected,
+        )
+        release_unowned_input_secret_bindings(bindings, admitted)
+
     def test_secret_registry_write_rolls_back_when_product_head_rejects(
         self,
     ) -> None:
@@ -1001,23 +1055,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         from agent.harness.state import new_state
         from tests.agent_live.graph_turn import reviewed_stage_planner
 
-        captured_references: list[str] = []
-
-        def resolver(state, text):
-            captured_references.append(str(text))
-            return _admitted_mock_plan(
-                state,
-                text,
-                {
-                    "actions": [{
-                        "type": "answer_pending",
-                        "answer": text,
-                        "selected_value": text,
-                        "source_evidence": text,
-                        "confidence": "high",
-                    }],
-                },
-            )
+        reference = "semantic-secret:rollback-contract-reference"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(
@@ -1039,7 +1077,10 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             )
             runtime._persist_state(state)
             with (
-                reviewed_stage_planner(resolver),
+                patch(
+                    "agent.harness.secret_refs.new_secret_reference",
+                    return_value=reference,
+                ),
                 patch.object(
                     runtime.turn_transactions,
                     "commit_attempt",
@@ -1048,7 +1089,6 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "Product Head rejected"),
             ):
                 runtime.invoke("rollback-secret", language="en")
-            reference = captured_references[-1]
             available = secret_reference_available(
                 reference,
                 draft_id="turn:user:secret-registry-rollback:1",
@@ -17050,8 +17090,23 @@ response:
         state["last_user_input"] = "清空配置重新开始"
 
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
-            resolver.return_value = {"actions": [{"type": "reset_session", "confidence": "high"}]}
+            resolver.return_value = {
+                "actions": [
+                    {"type": "request_session_reset", "confidence": "high"}
+                ]
+            }
             result = process_turn(state)
+
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "session_reset_confirm",
+        )
+        self.assertEqual(
+            (result.get("chain_identity") or {}).get("canonical"), "bsc"
+        )
+
+        result["last_user_input"] = "Y"
+        result = process_turn(result)
 
         text = "\n".join(result.get("visible_response") or [])
         self.assertIn("已清空之前的 Agent 配置", text)
@@ -17074,7 +17129,7 @@ response:
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
             resolver.return_value = {
                 "actions": [
-                    {"type": "reset_session", "confidence": "high"},
+                    {"type": "request_session_reset", "confidence": "high"},
                     {
                         "type": "choose_target_mode",
                         "target_mode": "fake-node",
@@ -17093,9 +17148,64 @@ response:
             resolver.side_effect = _admitted_mock_resolver(resolver.return_value)
             result = process_turn(state)
 
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "session_reset_confirm",
+        )
+        self.assertEqual(result.get("target_mode"), "real-node")
+
+        result["last_user_input"] = "Y"
+        result = process_turn(result)
+
         self.assertEqual(result.get("target_mode"), "fake-node")
         self.assertEqual((result.get("chain_identity") or {}).get("canonical"), "bsc")
         self.assertNotEqual((result.get("confirmed_config") or {}).get("CLOUD_REGION"), "old-region")
+
+    def test_cancelled_session_reset_restores_interrupted_question(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.coordinator import (
+            _install_pending_question,
+            _question_for_group,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
+        }
+        state["confirmed_config"] = {"BLOCKCHAIN_NODE": "bsc"}
+        state["active_group"] = "provider_deployment"
+        _install_pending_question(
+            state,
+            _question_for_group(state, "provider_deployment"),
+        )
+        state["last_user_input"] = "Clear everything and start over."
+
+        with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
+            resolver.return_value = {
+                "actions": [
+                    {"type": "request_session_reset", "confidence": "high"}
+                ]
+            }
+            result = process_turn(state)
+
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "session_reset_confirm",
+        )
+        result["last_user_input"] = "N"
+        result = process_turn(result)
+
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"), "CLOUD_REGION"
+        )
+        self.assertEqual(
+            (result.get("chain_identity") or {}).get("canonical"), "bsc"
+        )
 
     def test_change_to_another_chain_without_name_asks_chain_instead_of_preflight(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn

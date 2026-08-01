@@ -375,15 +375,21 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
     """
 
     flattened: dict[str, Any] = {}
+    semantic_fields: dict[str, Any] = {}
     detected_formats: set[str] = set()
     json_values = _extract_json_flat_values(text)
+    source_evidence: dict[str, str] = {}
     if json_values:
         detected_formats.add("json")
         flattened.update(json_values)
-    yaml_values = _extract_yaml_flat_values(text)
-    if yaml_values:
-        detected_formats.add("yaml")
-        flattened.update(yaml_values)
+        semantic_fields.update(_extract_json_semantic_values(text))
+        source_evidence.update(_extract_json_semantic_source_evidence(text))
+    else:
+        yaml_values = _extract_yaml_flat_values(text)
+        if yaml_values:
+            detected_formats.add("yaml")
+            flattened.update(yaml_values)
+            semantic_fields.update(yaml_values)
     env_values: dict[str, Any] = {}
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
@@ -394,6 +400,7 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
     if env_values:
         detected_formats.add("env")
         flattened.update(env_values)
+        semantic_fields.update(env_values)
     if not flattened:
         return None
 
@@ -401,7 +408,7 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
     if not config_values and not workflow_values and not unmapped_values:
         return None
     field_candidates: list[dict[str, Any]] = []
-    for raw_path, raw_value in flattened.items():
+    for raw_path, raw_value in semantic_fields.items():
         path = str(raw_path or "").strip()
         if not path:
             continue
@@ -424,6 +431,11 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
             "raw_value": raw_value,
             "candidate_kind": kind,
             "canonical_key": canonical,
+            **(
+                {"source_evidence": source_evidence[path]}
+                if source_evidence.get(path)
+                else {}
+            ),
         })
     return {
         "config_values": config_values,
@@ -741,6 +753,84 @@ def _extract_json_flat_values(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return flatten_mapping(parsed)
+
+
+def _extract_json_semantic_values(text: str) -> dict[str, Any]:
+    """Preserve JSON composite fields without reparsing JSON as YAML-like text."""
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return flatten_mapping(parsed)
+    return _flatten_semantic_mapping(parsed)
+
+
+def _extract_json_semantic_source_evidence(text: str) -> dict[str, str]:
+    """Return exact JSON value slices keyed by their semantic source path."""
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    source = text[start : end + 1]
+    decoder = json.JSONDecoder()
+    output: dict[str, str] = {}
+
+    def skip_space(index: int) -> int:
+        while index < len(source) and source[index].isspace():
+            index += 1
+        return index
+
+    def visit_object(index: int, prefix: str = "") -> int:
+        index = skip_space(index)
+        if index >= len(source) or source[index] != "{":
+            raise json.JSONDecodeError("expected object", source, index)
+        index = skip_space(index + 1)
+        if index < len(source) and source[index] == "}":
+            return index + 1
+        while index < len(source):
+            key, key_end = decoder.raw_decode(source, index)
+            if not isinstance(key, str):
+                raise json.JSONDecodeError("expected object key", source, index)
+            index = skip_space(key_end)
+            if index >= len(source) or source[index] != ":":
+                raise json.JSONDecodeError("expected colon", source, index)
+            value_start = skip_space(index + 1)
+            value, value_end = decoder.raw_decode(source, value_start)
+            path = f"{prefix}.{key}" if prefix else key
+            output[path] = source[value_start:value_end]
+            if isinstance(value, dict):
+                visit_object(value_start, path)
+            index = skip_space(value_end)
+            if index < len(source) and source[index] == ",":
+                index = skip_space(index + 1)
+                continue
+            if index < len(source) and source[index] == "}":
+                return index + 1
+            raise json.JSONDecodeError("expected comma or object end", source, index)
+        raise json.JSONDecodeError("unterminated object", source, index)
+
+    try:
+        visit_object(0)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return output
+
+
+def _flatten_semantic_mapping(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, item in value.items():
+        next_key = f"{prefix}.{key}" if prefix else str(key)
+        output[next_key] = item
+        if isinstance(item, dict):
+            output.update(_flatten_semantic_mapping(item, next_key))
+    return output
 
 
 def extract_yaml_like_config_values(text: str) -> tuple[dict[str, Any], dict[str, Any]]:

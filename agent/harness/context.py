@@ -11,6 +11,7 @@ from .action_registry import (
     CONSULTATION_TOPICS,
     ActionLifetime,
     ActionSpec,
+    action_route_groups,
     project_action_specs,
 )
 from .questions import semantic_pending_question
@@ -69,6 +70,7 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "target_group": spec.target_group,
         "target_field_argument": spec.target_field_argument,
         "compiler_groups": list(spec.compiler_groups),
+        "route_groups": sorted(action_route_groups(spec)),
         "semantic_operations": list(spec.semantic_operations),
         "requires_specific_change": spec.requires_specific_change,
         "incomplete_mutation_intake": spec.incomplete_mutation_intake,
@@ -86,6 +88,7 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
                 "alias": intake.alias,
                 "fixed_arguments": dict(intake.fixed_arguments),
                 "value_semantics": intake.value_semantics,
+                "value_argument": intake.value_argument,
             }
             for intake in spec.structured_intake
         ],
@@ -135,7 +138,12 @@ def group_schema() -> list[dict[str, Any]]:
                     ),
                 }
                 for spec in ACTION_SPECS
-                if spec.target_group == group.name and spec.entry_intake
+                if group.name in action_route_groups(spec)
+                and (
+                    spec.entry_intake
+                    or spec.incomplete_mutation_intake
+                    or spec.incomplete_read_intake
+                )
             ],
         }
         for group in GROUPS

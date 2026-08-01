@@ -85,6 +85,7 @@ from .contracts import (
     response_fragment_from_dict,
     response_fragment_to_dict,
     ResponseFragment,
+    is_secret_reference,
 )
 from .control_receipts import (
     EXECUTION_APPROVAL_CONTRACTS,
@@ -1696,6 +1697,18 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         )
         return _set_turn_phase(state, "execute", "pending_answer_admitted")
 
+    sensitive_manual_action = _bound_sensitive_manual_action(
+        state,
+        pending,
+        text,
+    )
+    if sensitive_manual_action:
+        return _admit_deterministic_action(
+            state,
+            sensitive_manual_action,
+            source="pending_question_manual_contract",
+        )
+
     manual_matched, manual_value = (
         contract_exact_answer(text, pending)
         if pending.get("structured_input_owner") is True
@@ -1720,6 +1733,67 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     return _set_turn_phase(state, "plan", "semantic_input")
 
 
+def _bound_sensitive_manual_action(
+    state: AgentGraphState,
+    pending: Mapping[str, Any],
+    projected_value: str,
+) -> dict[str, Any]:
+    """Compile one turn-bound secret through its signed manual contract.
+
+    Sensitive scalar input is replaced before it enters LangGraph.  The raw
+    value is resolved only to validate the active question contract; the
+    admitted action keeps the opaque reference so normal owner invocation and
+    checkpoint redaction remain authoritative.
+    """
+
+    reference = str(projected_value or "").strip()
+    if not (
+        pending.get("sensitive_input") is True
+        and pending.get("manual_input_allowed") is True
+        and not pending.get("secret_reentry_binding")
+        and is_secret_reference(reference)
+    ):
+        return {}
+    binding = next(
+        (
+            dict(item)
+            for item in (
+                (state.get("turn_context") or {}).get("input_secret_bindings")
+                or ()
+            )
+            if isinstance(item, Mapping)
+            and str(item.get("reference") or "") == reference
+        ),
+        {},
+    )
+    if not binding:
+        return {}
+    materialized = resolve_secret_reference(
+        reference,
+        draft_id=str(binding.get("draft_id") or ""),
+        atom_id=str(binding.get("atom_id") or ""),
+        expected_hash=str(binding.get("value_hash") or ""),
+    )
+    if materialized is None:
+        return {}
+    matched, contract_value = contract_exact_answer(materialized, dict(pending))
+    if not matched:
+        return {}
+    action = manual_action_for_value(dict(pending), contract_value)
+    if not action:
+        return {}
+    manual_contract = dict(pending.get("manual_action") or {})
+    value_argument = str(manual_contract.get("value_argument") or "").strip()
+    if not value_argument or value_argument not in action:
+        return {}
+    action[value_argument] = reference
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    if spec is not None and "source_evidence" in spec.allowed_arguments:
+        action["source_evidence"] = reference
+    action["confidence"] = "high"
+    return action
+
+
 def _admit_deterministic_action(
     state: AgentGraphState,
     action: Mapping[str, Any],
@@ -1731,6 +1805,9 @@ def _admit_deterministic_action(
     text = str((state.get("turn_context") or {}).get("text") or "")
     scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
     admitted = assign_action_ids(scope, text, [dict(action)])[0]
+    secret_bindings = _turn_secret_bindings(state, admitted)
+    if secret_bindings:
+        admitted["_semantic_secret_bindings"] = secret_bindings
     pending = dict(state.get("pending_question") or {})
     if source == "pending_question_manual_contract" and pending:
         _record_pending_resolution(
@@ -1784,6 +1861,12 @@ def _admit_deterministic_action(
         if isinstance(item, Mapping)
     ]
     state["action_queue"] = [admitted, *existing]
+    if secret_bindings:
+        register_state_secret_bindings(state, secret_bindings)
+        try:
+            reconcile_state_secret_bindings(state)
+        except ValueError as exc:
+            raise StateInvariantError(str(exc)) from exc
     _record_admitted_action(state, admitted, source=source)
     return _set_turn_phase(state, "execute", "deterministic_action_admitted")
 
@@ -3676,7 +3759,12 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
                 not _queue_has_eligible_action(committed)
             ):
                 defer_after_answer = True
-    if envelope.action_type == "reset_session" and queue[1:]:
+    if (
+        prepared.result.checkpoint_command is not None
+        and prepared.result.checkpoint_command.command == "reset"
+        and prepared.result.checkpoint_command.preserve_remaining_actions
+        and queue[1:]
+    ):
         committed["action_queue"] = queue[1:]
     after_pending_id = str((committed.get("pending_question") or {}).get("id") or "")
     if (
@@ -4038,7 +4126,11 @@ def _merge_durable_action_queue(
         )
         for item in _durable_actions(incoming)
     ]
-    if any(str(item.get("type") or "") == "reset_session" for item in incoming):
+    if any(
+        (spec := ACTION_BY_TYPE.get(str(item.get("type") or ""))) is not None
+        and spec.replaces_deferred_queue
+        for item in incoming
+    ):
         return incoming
     merged_incoming = [dict(item) for item in incoming]
     incoming_index = {

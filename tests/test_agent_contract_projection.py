@@ -14,7 +14,11 @@ class AgentContractProjectionTest(unittest.TestCase):
 
         qps = project_action_specs(groups=frozenset({"qps_profile"}))
         self.assertTrue(qps)
-        self.assertTrue(all(spec.target_group == "qps_profile" for spec in qps))
+        from agent.harness.action_registry import action_route_groups
+
+        self.assertTrue(
+            all("qps_profile" in action_route_groups(spec) for spec in qps)
+        )
 
         local = project_action_specs(lifetimes=frozenset({"turn_local"}))
         self.assertTrue(local)
@@ -27,6 +31,38 @@ class AgentContractProjectionTest(unittest.TestCase):
         self.assertTrue(schema)
         self.assertEqual({row["owner"] for row in schema}, {"performance"})
         self.assertLess(len(schema), len(action_schema()))
+
+    def test_rpc_structured_intake_projects_executable_value_bindings(self) -> None:
+        from agent.harness.context import action_schema
+
+        row = next(
+            item
+            for item in action_schema(action_types=frozenset({"rpc_catalog_command"}))
+            if item["type"] == "rpc_catalog_command"
+        )
+        intakes = {
+            item["alias"]: item
+            for item in row["structured_intake"]
+        }
+
+        self.assertEqual(
+            intakes["validation_endpoint"],
+            {
+                "alias": "validation_endpoint",
+                "fixed_arguments": {"catalog_command": "set_endpoint"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_endpoint",
+            },
+        )
+        self.assertEqual(
+            intakes["rpc_request"],
+            {
+                "alias": "rpc_request",
+                "fixed_arguments": {"catalog_command": "append_evidence"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_schema_evidence",
+            },
+        )
 
     def test_current_turn_rejects_retired_arguments_envelope(self) -> None:
         from agent.harness.action_registry import validate_action_contract

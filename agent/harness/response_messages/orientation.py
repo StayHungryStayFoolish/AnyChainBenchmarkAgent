@@ -19,6 +19,18 @@ MESSAGES = {
         "arguments": {},
         "kinds": {"message"},
     },
+    "harness.orientation.session_reset_cancelled": {
+        "en": "Session reset cancelled. The current workflow configuration is unchanged.",
+        "zh": "已取消清空会话，当前 workflow 配置保持不变。",
+        "arguments": {},
+        "kinds": {"message"},
+    },
+    "question.orientation.session_reset_confirm.prompt": {
+        "en": "Clear the current workflow configuration? This removes confirmed benchmark settings and pending workflow progress. Startup discovery and historical jobs are preserved. A full reset cannot also retain the confirmed settings.",
+        "zh": "是否清空当前 workflow 配置？这会删除已确认的 benchmark 设置和未完成流程进度，但保留启动环境推断和历史 job。完整清空不能同时保留已确认配置。",
+        "arguments": {},
+        "kinds": {"question_prompt"},
+    },
     "harness.orientation.consultation.identity": {
         "en": "I am AnyChain Benchmark Agent, running in the current AnyChain Benchmark project. I configure, validate, execute, and analyze blockchain-node benchmarks and reports. State a goal, ask about current state, or paste configuration, logs, or reports.",
         "zh": "我是 AnyChain Benchmark Agent，运行在当前 AnyChain Benchmark 工程中，负责区块链节点测试的配置、校验、执行和报告分析。你可以直接提出测试目标、询问当前状态，或粘贴配置、日志和报告。",

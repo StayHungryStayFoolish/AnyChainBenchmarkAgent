@@ -69,6 +69,7 @@ _ADMISSION_RECEIPT_KEYS = frozenset({
     "pending_choice_contracts",
     "pending_answer_admissions",
     "pending_support_unit_ids",
+    "semantic_support_unit_ids",
     "chain_selection_admissions",
     "target_mode_selection_admissions",
     "consultation_admissions",
@@ -109,6 +110,7 @@ def prepare_hierarchical_candidate(
     clauses: tuple[TurnClause, ...],
     *,
     pending_choice_unit_ids: frozenset[str],
+    semantic_support_unit_ids: frozenset[str] = frozenset(),
 ) -> tuple[str, PlanCoverageResult]:
     """Prepare Stage A/B output without invoking legacy planner repair.
 
@@ -132,6 +134,16 @@ def prepare_hierarchical_candidate(
             state,
             eligible_unit_ids=pending_choice_unit_ids,
         )
+        if semantic_support_unit_ids:
+            trusted_payload = _parse_json_object(candidate)
+            trusted_payload["semantic_support_unit_ids"] = sorted(
+                semantic_support_unit_ids
+            )
+            candidate = json.dumps(
+                trusted_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         validation = _validate_action_document(candidate, clauses, state)
     except ValueError as exc:
         candidate = "{}"
@@ -499,12 +511,26 @@ def _validate_action_source_grounding(
             errors.append(f"action {index} source_evidence is not an exact mapped-unit quote")
             continue
         for value_argument in exact_arguments:
-            value = str(action.get(value_argument) or "").strip()
-            if value and value not in source:
+            value = action.get(value_argument)
+            if value is not None and value != "" and not _exact_value_has_source(
+                value,
+                source,
+            ):
                 errors.append(
                     f"action {index} {value_argument} is not present in its exact source_evidence"
                 )
     return _merge_plan_errors(validation, tuple(errors)) if errors else validation
+
+
+def _exact_value_has_source(value: Any, source: str) -> bool:
+    """Compare structured evidence by value and scalar evidence by exact text."""
+
+    if isinstance(value, (dict, list)):
+        try:
+            return json.loads(source) == value
+        except (json.JSONDecodeError, TypeError):
+            return False
+    return str(value).strip() in source
 
 
 def _semantic_unit_evidence_sources(
@@ -2081,6 +2107,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "When an active evidence collection exists, an explicit source demand to pause or suspend that collection is independent from navigation or configuration and requires a purpose that pauses while preserving it. Navigation alone is incomplete for that demand. An explicit request to resume a paused collection likewise requires a resume purpose. "
         "A custom-RPC-entry purpose is supported when the source explicitly asks to start, add, supply, or configure a custom RPC method workflow. It intentionally carries no endpoint, method identity, or schema payload; requiring those facts at entry would skip later typed collection questions. A discussion-only question about whether custom RPC is possible does not support entry. "
         "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. A declarative reason attached to a pending-option selection does not become a consultation merely because it explains that selection; when it has no independent question or requested effect, it is support for the pending-answer purpose and a proposed consultation over that reason is unsupported. Distinct consultation subjects remain independent demands: a purpose that reports workflow configuration or pending context does not report whether a current or historical benchmark job exists, and a job-status purpose does not report retained workflow configuration. A compound unit asking for both is complete only when mapped purposes explicitly cover both subjects. "
+        "A request to identify the cause of supplied error evidence and explain how to correct it belongs to the same evidence-analysis demand. It does not independently support a generic opening consultation unless it asks for a distinct product fact beyond that diagnosis or recovery guidance. A plan may render only one primary answer for one demand; a generic consultation that overlaps an admitted evidence diagnosis must be rejected rather than appended as a contradictory fallback. "
         + GROUP_NAVIGATION_SEMANTIC_POLICY
         + "When an action record has registry_incomplete_mutation_intake=true, its authoritative declared_purpose intentionally opens a later typed intake. Admit it when the source explicitly requests the initial selection or replacement described by that purpose but supplies no concrete value; do not require the value that the later question exists to collect. When such an action is the declared owner of an active pending option, selecting that option is sufficient source support for the intake purpose. "
         "When an action record has registry_incomplete_read_intake=true, its authoritative declared_purpose intentionally opens a later typed read-only collection because the source requests that registered analysis but has not supplied its payload yet. Admit that intake when the source explicitly requests the declared read operation; do not require the evidence, document, log, or other payload that the typed collection exists to collect. This rule does not authorize a different read subject, mutation, navigation, or execution request. "

@@ -32,6 +32,7 @@ from .action_registry import (
     registered_semantic_value_domains,
     semantic_grounding_arguments,
     semantic_value_domain_conflicts,
+    action_spec_serves_route,
     lower_empty_entry_action_to_registered_intake,
     validate_action_contract,
 )
@@ -56,6 +57,7 @@ from .questions import (
     pending_value_identity,
     semantic_pending_question,
     typed_pending_value_candidates,
+    value_satisfies_pending_contract,
 )
 from .semantic_compiler import (
     STRICT_JSON_REASONING_MODE,
@@ -247,12 +249,7 @@ def begin_semantic_partition(
             source_partition = [dict(unit) for unit in partition]
             compilation_partition = []
         recoverable_primary_rejection = bool(
-            admission_errors
-            and primary_review_contract_valid
-            and any(
-                str(unit.get("operation") or "") == "unresolved"
-                for unit in partition
-            )
+            admission_errors and primary_review_contract_valid
         )
         if recoverable_primary_rejection or (
             not admission_errors
@@ -450,7 +447,7 @@ def _request_stage_a_proposal(
             provider,
             system_prompt=request_prompt,
             request_payload=request_payload,
-            max_tokens=2600,
+            max_tokens=_stage_a_output_token_budget(stage_a_payload),
             reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
         partition, errors = _validate_partition_document(
@@ -458,19 +455,37 @@ def _request_stage_a_proposal(
             clauses,
             state=state,
         )
-        partition, _ = _canonicalize_unique_option_pending_partition(
-            state,
-            clauses,
-            partition,
-            partition,
-        )
         errors = tuple(dict.fromkeys((
             *errors,
+            *_pending_answer_contract_errors(partition, state),
             *_cross_domain_pending_errors(partition, state),
         )))
         if not errors:
             break
     return partition, errors, tuple(request_sizes)
+
+
+def _stage_a_output_token_budget(
+    stage_a_payload: Mapping[str, Any],
+) -> int:
+    """Size the bounded partition response by parser-owned atom cardinality."""
+
+    structured_atom_count = sum(
+        len(candidate.get("field_candidates") or ())
+        for candidate in stage_a_payload.get("structured_candidates") or ()
+        if isinstance(candidate, Mapping)
+    )
+    return min(12000, max(2600, 2200 + (900 * structured_atom_count)))
+
+
+def _stage_a_review_output_token_budget(
+    partition: Sequence[Mapping[str, Any]],
+    clauses: Sequence[Mapping[str, Any]],
+) -> int:
+    """Bound review output by its required unit and clause verdict rows."""
+
+    verdict_rows = len(partition) + len(clauses)
+    return min(12000, max(2200, 1600 + (700 * verdict_rows)))
 
 
 def _partition_requires_independent_proposal(
@@ -896,6 +911,11 @@ def review_semantic_plan(
             for unit in source_partition
             if str(unit.get("operation") or "") == "pending_answer"
         ),
+        semantic_support_unit_ids=frozenset(
+            str(unit_id)
+            for unit_id in candidate.get("semantic_support_unit_ids") or ()
+            if str(unit_id)
+        ),
     )
     if not validation.valid:
         if validation.unresolved_units and not validation.errors:
@@ -1042,6 +1062,13 @@ def review_semantic_plan(
                     str(unit["unit_id"])
                     for unit in source_partition
                     if str(unit.get("operation") or "") == "pending_answer"
+                ),
+                semantic_support_unit_ids=frozenset(
+                    str(unit_id)
+                    for unit_id in repaired_candidate.get(
+                        "semantic_support_unit_ids"
+                    ) or ()
+                    if str(unit_id)
                 ),
             )
             if repaired_validation.valid:
@@ -1221,9 +1248,12 @@ def _stage_a_prompt() -> str:
         "Harness expands the intervals between prose anchors into the lossless partition, so "
         "do not repeat surrounding prose merely to cover conjunctions or punctuation. "
         "Do not choose product actions, mutate state, answer the user, or copy values from state. "
-        "Each semantic unit must contain exactly: unit_id, clause_id, source_text, operation, "
-        "owner_routes, reason, plus source_path only for a structured DemandAtom. operation "
-        "must be one of the supplied universal_operations. "
+        "Each prose semantic unit must contain exactly: unit_id, clause_id, source_text, "
+        "operation, owner_routes, reason. Each structured DemandAtom must contain exactly: "
+        "unit_id, operation, owner_routes, reason. The Harness binds its immutable clause_id, "
+        "source_text, and source_path from atom_id after your classification; do not repeat "
+        "those fields in structured output. operation must be one of the supplied "
+        "universal_operations. "
         "Treat universal_operation_purposes as authoritative. pending_answer requires a present "
         "commitment to the active question; a hypothetical, counterfactual, consequence, or "
         "explanation question is consultation and never authorizes the pending action. A request "
@@ -1249,9 +1279,12 @@ def _stage_a_prompt() -> str:
         "owner_routes is an ordered list of {owner,group}; use an empty list only for context "
         "or unresolved. A prose unit may route to several owners when one indivisible excerpt "
         "contains independently owned values. A structured clause is one immutable SourceClause; "
-        "represent each semantic field demand as a separate DemandAtom whose source_text is the "
-        "complete SourceClause and whose source_path exactly matches one supplied "
-        "field_candidates path. Use each source_path at most once and never invent one. "
+        "represent each semantic field demand as a separate DemandAtom whose unit_id exactly "
+        "reuses the supplied atom_id. Return exactly one "
+        "semantic unit for every supplied structured atom, in supplied order. The atom_id, "
+        "clause_id, source_text, and source_path are immutable Harness provenance; classify only "
+        "operation, owner_routes, and reason, and omit the provenance fields from your output. "
+        "Never omit, combine, duplicate, or invent an atom. "
         "Preserve questions, corrections, contradictions, "
         "pending answers, navigation, multiline evidence, and every sibling demand separately. "
         "input_shape and structured_candidates describe terminal syntax only; they do not classify "
@@ -1345,12 +1378,13 @@ def _stage_a_payload(
     for clause in clauses:
         if clause.input_shape != "structured":
             continue
-        candidates = extract_structured_input_candidates(clause.text)
+        candidates = _semantic_structured_input_candidates(clause.text)
         if candidates:
             candidates = dict(candidates)
             candidates["field_candidates"] = [
                 {
                     **dict(candidate),
+                    "atom_id": _structured_atom_id(clause.clause_id, index),
                     **(
                         {"registered_intake": matching}
                         if (
@@ -1362,7 +1396,10 @@ def _stage_a_payload(
                         else {}
                     ),
                 }
-                for candidate in candidates.get("field_candidates") or []
+                for index, candidate in enumerate(
+                    candidates.get("field_candidates") or [],
+                    start=1,
+                )
                 if isinstance(candidate, Mapping)
             ]
             structured_candidates.append({
@@ -1457,8 +1494,11 @@ def _stage_a_payload(
                 "entry_actions": row["entry_actions"],
                 "routing_purposes": [
                     {
+                        "action_type": action["type"],
                         "owner": action["owner"],
                         "purpose": action["purpose"],
+                        "semantic_operations": action["semantic_operations"],
+                        "route_groups": action["route_groups"],
                     }
                     for action in action_schema(groups=frozenset({row["name"]}))
                 ],
@@ -1483,6 +1523,51 @@ def _structured_intake_contracts() -> list[dict[str, Any]]:
     ]
 
 
+def _structured_atom_id(clause_id: str, index: int) -> str:
+    """Return the Harness-owned identity for one parser-proven field atom."""
+
+    return f"__harness_structured_{clause_id}_{int(index)}"
+
+
+def _bind_structured_partition_provenance(
+    raw_units: Sequence[Any],
+    clauses: Sequence[TurnClause],
+) -> list[Any]:
+    """Bind semantic classifications to immutable parser-owned evidence."""
+
+    atoms: dict[str, tuple[str, str, str]] = {}
+    for clause in clauses:
+        if clause.input_shape != "structured":
+            continue
+        candidates = _semantic_structured_input_candidates(clause.text)
+        for index, candidate in enumerate(
+            candidates.get("field_candidates") or (),
+            start=1,
+        ):
+            if not isinstance(candidate, Mapping):
+                continue
+            atoms[_structured_atom_id(clause.clause_id, index)] = (
+                clause.clause_id,
+                str(candidate.get("source_path") or ""),
+                clause.text,
+            )
+
+    output: list[Any] = []
+    for raw in raw_units:
+        if not isinstance(raw, Mapping):
+            output.append(raw)
+            continue
+        unit = dict(raw)
+        provenance = atoms.get(str(unit.get("unit_id") or ""))
+        if provenance is not None:
+            clause_id, source_path, source_text = provenance
+            unit["clause_id"] = clause_id
+            unit["source_path"] = source_path
+            unit["source_text"] = source_text
+        output.append(unit)
+    return output
+
+
 def _matching_structured_intake(
     candidate: Mapping[str, Any],
     contracts: Sequence[Mapping[str, Any]],
@@ -1500,9 +1585,38 @@ def _matching_structured_intake(
     return matches[0] if len(matches) == 1 else None
 
 
+def _semantic_structured_input_candidates(text: str) -> dict[str, Any]:
+    """Return one registry-aware, non-overlapping structured atom set."""
+
+    parsed = extract_structured_input_candidates(text) or {}
+    candidates = [
+        dict(candidate)
+        for candidate in parsed.get("field_candidates") or ()
+        if isinstance(candidate, Mapping)
+    ]
+    contracts = _structured_intake_contracts()
+    composite_paths = {
+        str(candidate.get("source_path") or "")
+        for candidate in candidates
+        if isinstance(candidate.get("raw_value"), (Mapping, list))
+        and _matching_structured_intake(candidate, contracts)
+    }
+    filtered = [
+        candidate
+        for candidate in candidates
+        if not any(
+            str(candidate.get("source_path") or "").startswith(f"{path}.")
+            for path in composite_paths
+        )
+    ]
+    return {**dict(parsed), "field_candidates": filtered}
+
+
 def _structured_intake_value_enabled(value: Any, semantics: str) -> bool:
     if semantics == "boolean_true":
         return value is True or str(value).strip().casefold() == "true"
+    if semantics == "direct_value":
+        return value is not None and value != ""
     return False
 
 
@@ -1590,6 +1704,28 @@ def _cross_domain_pending_errors(
     return tuple(dict.fromkeys(errors))
 
 
+def _pending_answer_contract_errors(
+    partition: Sequence[Mapping[str, Any]],
+    state: AgentGraphState,
+) -> tuple[str, ...]:
+    """Reject manual pending claims that cannot satisfy the signed contract."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending or pending.get("options"):
+        return ()
+    errors: list[str] = []
+    for unit in partition:
+        if str(unit.get("operation") or "") != "pending_answer":
+            continue
+        source = _semantic_source_for_unit(unit)
+        if not value_satisfies_pending_contract(source, pending):
+            errors.append(
+                "Stage A pending answer does not satisfy the active signed "
+                f"manual contract: {unit.get('unit_id')}/{pending.get('id')}"
+            )
+    return tuple(dict.fromkeys(errors))
+
+
 def _is_bound_semantic_draft_pending_answer(
     unit: Mapping[str, Any],
     state: Mapping[str, Any],
@@ -1633,7 +1769,7 @@ def _semantic_source_for_unit(unit: Mapping[str, Any]) -> str:
     source_path = str(unit.get("source_path") or "").strip()
     if not source_path:
         return source
-    candidates = extract_structured_input_candidates(source) or {}
+    candidates = _semantic_structured_input_candidates(source)
     matching = [
         candidate
         for candidate in candidates.get("field_candidates") or []
@@ -1642,6 +1778,9 @@ def _semantic_source_for_unit(unit: Mapping[str, Any]) -> str:
     ]
     if len(matching) != 1:
         return source
+    exact_source = str(matching[0].get("source_evidence") or "")
+    if exact_source:
+        return exact_source
     value = matching[0].get("raw_value")
     return json.dumps(
         {source_path: value},
@@ -1657,9 +1796,9 @@ def _semantic_value_for_unit(unit: Mapping[str, Any]) -> Any:
     source_path = str(unit.get("source_path") or "").strip()
     if not source_path:
         return None
-    candidates = extract_structured_input_candidates(
+    candidates = _semantic_structured_input_candidates(
         str(unit.get("source_text") or "")
-    ) or {}
+    )
     matching = [
         candidate
         for candidate in candidates.get("field_candidates") or []
@@ -1690,16 +1829,29 @@ def _validate_partition_document(
         raw_units,
         state or {},
     )
+    raw_units = _bind_structured_partition_provenance(raw_units, clauses)
     raw_units = _retain_unclaimed_prose_clauses(raw_units, clauses)
+    placed_partition = validate_semantic_partition(raw_units, clauses)
+    raw_units = list(placed_partition.units)
+    raw_units, _ = _canonicalize_unique_option_pending_partition(
+        dict(state or {}),
+        clauses,
+        raw_units,
+        raw_units,
+    )
+    raw_units = _project_uncompilable_routes_to_unresolved(raw_units)
     partition = validate_semantic_partition(raw_units, clauses)
-    errors = list(partition.errors)
+    errors = list(dict.fromkeys((
+        *placed_partition.errors,
+        *partition.errors,
+    )))
     output: list[dict[str, Any]] = []
     clauses_by_id = {clause.clause_id: clause for clause in clauses}
     structured_fields = {
         clause.clause_id: {
             str(candidate.get("source_path") or ""): dict(candidate)
             for candidate in (
-                (extract_structured_input_candidates(clause.text) or {}).get(
+                _semantic_structured_input_candidates(clause.text).get(
                     "field_candidates"
                 )
                 or []
@@ -1714,8 +1866,17 @@ def _validate_partition_document(
         clause_id: set(fields)
         for clause_id, fields in structured_fields.items()
     }
+    expected_structured_atom_ids = {
+        clause.clause_id: {
+            _structured_atom_id(clause.clause_id, index)
+            for index, _candidate in enumerate(fields.values(), start=1)
+        }
+        for clause in clauses
+        if (fields := structured_fields.get(clause.clause_id))
+    }
     structured_intake_contracts = _structured_intake_contracts()
     observed_structured_paths: dict[str, set[str]] = defaultdict(set)
+    observed_structured_atom_ids: dict[str, set[str]] = defaultdict(set)
     semantic_draft_answer_clauses: set[str] = set()
     for raw in partition.units:
         unit = dict(raw)
@@ -1809,6 +1970,19 @@ def _validate_partition_document(
                     f"SourceClause: {unit_id}"
                 )
         elif clause_id in structured_paths:
+            expected_atom_ids = expected_structured_atom_ids.get(clause_id, set())
+            if unit_id not in expected_atom_ids:
+                errors.append(
+                    "Stage A structured DemandAtom has unknown atom_id: "
+                    f"{unit_id}"
+                )
+            elif unit_id in observed_structured_atom_ids[clause_id]:
+                errors.append(
+                    "Stage A structured DemandAtom duplicates atom_id: "
+                    f"{unit_id}"
+                )
+            else:
+                observed_structured_atom_ids[clause_id].add(unit_id)
             if not source_path and len(structured_paths[clause_id]) == 1:
                 source_path = next(iter(structured_paths[clause_id]))
                 unit["source_path"] = source_path
@@ -1850,6 +2024,10 @@ def _validate_partition_document(
                             f"{unit_id}/{source_path}/{expected_route[0]}/"
                             f"{expected_route[1]}"
                         )
+                    # This contract is derived from the action registry and the
+                    # parser-proven source path. The model may classify and route
+                    # the atom, but it does not author its executable intake.
+                    unit["registered_intake"] = matched_intake
             if str(unit.get("source_text") or "") != clauses_by_id[clause_id].text:
                 errors.append(
                     "Stage A structured DemandAtom must preserve its SourceClause: "
@@ -1868,7 +2046,91 @@ def _validate_partition_document(
                 f"Stage A structured DemandAtoms omit source paths in {clause_id}: "
                 + ", ".join(missing)
             )
+        missing_atom_ids = sorted(
+            expected_structured_atom_ids.get(clause_id, set())
+            - observed_structured_atom_ids[clause_id]
+        )
+        if missing_atom_ids:
+            errors.append(
+                f"Stage A structured DemandAtoms omit atom ids in {clause_id}: "
+                + ", ".join(missing_atom_ids)
+            )
     return output, tuple(dict.fromkeys(errors))
+
+
+def _project_uncompilable_routes_to_unresolved(
+    units: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fail closed per source unit when no registered action can compile it.
+
+    Stage A may recognize a real demand whose owner currently has no action for
+    the selected group.  That source span is unresolved product work, not an
+    invalid replacement for otherwise compilable sibling units.  Structurally
+    invalid or partly compilable route sets remain untouched so normal
+    validation still rejects them.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for raw in units:
+        unit = dict(raw)
+        operation = str(unit.get("operation") or "")
+        routes = unit.get("owner_routes")
+        if (
+            operation in {"context", "unresolved"}
+            or operation not in _UNIVERSAL_OPERATIONS
+            or not isinstance(routes, list)
+            or not routes
+        ):
+            projected.append(unit)
+            continue
+        structurally_valid = all(
+            isinstance(route, Mapping)
+            and set(route) == _ROUTE_KEYS
+            and str(route.get("owner") or "") in _OWNERS
+            and (
+                not str(route.get("group") or "")
+                or str(route.get("group") or "") in GROUP_SPEC_BY_NAME
+            )
+            and (
+                not str(route.get("group") or "")
+                or str(route.get("owner") or "")
+                in {"coordinator", "orientation", "analysis"}
+                or GROUP_SPEC_BY_NAME[str(route.get("group") or "")].owner
+                == str(route.get("owner") or "")
+            )
+            for route in routes
+        )
+        if not structurally_valid:
+            projected.append(unit)
+            continue
+        route_support = [
+            any(
+                not spec.internal_only
+                and spec.owner == str(route.get("owner") or "")
+                and _action_spec_applies(
+                    spec,
+                    groups=(
+                        frozenset({str(route.get("group") or "")})
+                        if str(route.get("group") or "")
+                        else frozenset()
+                    ),
+                    operations=frozenset({operation}),
+                )
+                for spec in ACTION_SPECS
+            )
+            for route in routes
+        ]
+        if any(route_support):
+            projected.append(unit)
+            continue
+        unit["operation"] = "unresolved"
+        unit["owner_routes"] = []
+        unit["reason"] = (
+            "The Harness has no registered compiler action for this exact "
+            "source demand; preserve it as an unresolved atom."
+        )
+        projected.append(unit)
+    return projected
 
 
 def _normalize_contract_bound_pending_routes(
@@ -1976,6 +2238,7 @@ def _partition_after_stage_a_admission(
         if str(unit.get("unit_id") or "") in redundant_unit_ids:
             unit["operation"] = "context"
             unit["owner_routes"] = []
+            unit["_admission_support"] = True
             unit["reason"] = (
                 f"{str(unit.get('reason') or '').strip()} "
                 "Stage A admission classified this as a non-executable duplicate."
@@ -2466,7 +2729,10 @@ def _review_stage_a_partition_detailed(
             provider,
             system_prompt=request_prompt,
             request_payload=request_payload,
-            max_tokens=2200,
+            max_tokens=_stage_a_review_output_token_budget(
+                partition,
+                stage_a_payload.get("clauses") or (),
+            ),
             reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
         contract_errors, semantic_errors, redundant_unit_ids = (
@@ -2780,6 +3046,12 @@ def _stage_b_prompt(owner: str) -> str:
         "parser-proven typed value at that path. Interpret that scoped demand instead of "
         "sibling fields in the complete source_text. source_text remains the immutable "
         "SourceClause used for exact source_evidence quotes. For a pending_answer DemandAtom "
+        "with registered_intake, emit exactly registered_intake.action_type, copy every "
+        "registered_intake.fixed_arguments entry, and, when value_argument is non-empty, "
+        "bind semantic_value to that argument. This metadata is Harness-authoritative; do "
+        "not substitute an entry intake, infer another command, or omit the registered value. "
+        "Use semantic_source as the exact source_evidence when the registered action declares "
+        "that argument. For a pending_answer DemandAtom "
         "whose pending_question allows manual input and has no options, emit answer equal to "
         "semantic_value and never emit selected_value. "
         "Every action object MUST be flat: place type and every "
@@ -2854,16 +3126,18 @@ def _action_spec_applies(
     groups: frozenset[str],
     operations: frozenset[str],
 ) -> bool:
-    declared_groups = frozenset(
-        group
-        for group in (spec.target_group, *spec.compiler_groups)
-        if group
-    )
+    if spec.internal_only:
+        return "pending_answer" in operations and (
+            "pending_answer" in spec.semantic_operations
+        )
     return any(
-        operation in spec.semantic_operations
-        and (
-            operation != "domain_request"
-            or bool(groups and groups.intersection(declared_groups))
+        any(
+            action_spec_serves_route(
+                spec,
+                operation=operation,
+                group=group,
+            )
+            for group in (groups or frozenset({""}))
         )
         for operation in operations
     )
@@ -2982,6 +3256,11 @@ def _stage_b_payload(
                 if str(unit.get("source_path") or "")
                 else {}
             ),
+            **(
+                {"registered_intake": dict(unit["registered_intake"])}
+                if isinstance(unit.get("registered_intake"), Mapping)
+                else {}
+            ),
         }
         for unit in partition
         if str(unit["unit_id"]) in unit_ids
@@ -3023,6 +3302,13 @@ def _stage_b_payload(
     }
 
 
+def _stage_b_output_token_budget(payload: Mapping[str, Any]) -> int:
+    """Bound owner compilation output by its required semantic-unit bindings."""
+
+    unit_count = len(payload.get("semantic_units") or ())
+    return min(12000, max(3200, 2200 + (900 * unit_count)))
+
+
 def _compile_owner_document(
     state: AgentGraphState,
     owner: str,
@@ -3055,12 +3341,14 @@ def _compile_owner_document(
     }
     expected_sources = {
         str(unit["unit_id"]): tuple(
-            value
-            for value in (
-                str(unit.get("source_text") or ""),
-                str(unit.get("resolution_evidence") or ""),
+            dict.fromkeys(
+                value
+                for value in (
+                    _semantic_source_for_unit(unit),
+                    str(unit.get("resolution_evidence") or ""),
+                )
+                if value
             )
-            if value
         )
         for unit in partition
         if str(unit["unit_id"]) in unit_ids
@@ -3097,7 +3385,7 @@ def _compile_owner_document(
             provider,
             system_prompt=request_prompt,
             request_payload=request_payload,
-            max_tokens=3200,
+            max_tokens=_stage_b_output_token_budget(payload),
             reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
         document, errors = _validate_owner_document(
@@ -3191,6 +3479,18 @@ def _stage_b_semantic_review_prompt(owner: str) -> str:
     )
 
 
+def _stage_b_review_output_token_budget(
+    payload: Mapping[str, Any],
+    document: Mapping[str, Any],
+) -> int:
+    """Bound semantic review output by required unit and action verdict rows."""
+
+    verdict_rows = len(payload.get("semantic_units") or ()) + len(
+        document.get("actions") or ()
+    )
+    return min(12000, max(1800, 1400 + (600 * verdict_rows)))
+
+
 def _review_owner_document_semantics(
     provider: Any,
     payload: Mapping[str, Any],
@@ -3221,7 +3521,7 @@ def _review_owner_document_semantics(
         provider,
         system_prompt=prompt,
         request_payload=review_payload,
-        max_tokens=1800,
+        max_tokens=_stage_b_review_output_token_budget(payload, document),
         reasoning_mode=STRICT_JSON_REASONING_MODE,
     )
     request_size = _wire_size(prompt, review_payload)
@@ -3486,16 +3786,17 @@ def _bind_registered_intake_source_evidence(
             if isinstance(index, int) and not isinstance(index, bool):
                 sources_by_action.setdefault(index, set()).update(sources)
     for index, action in enumerate(normalized):
-        if not isinstance(action, dict) or action.get("source_evidence"):
+        if not isinstance(action, dict):
             continue
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
         bound_sources = sources_by_action.get(index, set())
+        if spec is None or len(bound_sources) != 1:
+            continue
         if (
-            spec is not None
-            and spec.incomplete_mutation_intake
+            spec.incomplete_mutation_intake
             and "source_evidence" in spec.required_arguments
-            and len(bound_sources) == 1
-        ):
+            and not action.get("source_evidence")
+        ) or spec.exact_source_value_arguments:
             action["source_evidence"] = next(iter(bound_sources))
     return normalized
 
@@ -3651,6 +3952,7 @@ def _merge_owner_documents(
             str(unit.get("parent_unit_id") or unit["unit_id"])
         ].append(unit)
     semantic_units: list[dict[str, Any]] = []
+    semantic_support_unit_ids: list[str] = []
     for unit in source_partition:
         unit_id = str(unit["unit_id"])
         operation = str(unit["operation"])
@@ -3675,6 +3977,8 @@ def _merge_owner_documents(
             if unresolved
             else "action"
         )
+        if unit.get("_admission_support") is True:
+            semantic_support_unit_ids.append(unit_id)
         semantic_units.append({
             "unit_id": unit_id,
             "clause_id": str(unit["clause_id"]),
@@ -3718,6 +4022,7 @@ def _merge_owner_documents(
     return {
         "actions": actions,
         "semantic_units": semantic_units,
+        "semantic_support_unit_ids": semantic_support_unit_ids,
         "reason": "hierarchical Stage A/Stage B compilation",
     }
 

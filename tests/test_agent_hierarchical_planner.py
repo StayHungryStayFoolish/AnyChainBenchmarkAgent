@@ -45,6 +45,164 @@ def _closed_enum_review_response(payload: dict) -> dict:
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_stage_a_output_budget_scales_with_structured_atom_count(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_a_output_token_budget,
+            _stage_a_review_output_token_budget,
+            _stage_b_output_token_budget,
+            _stage_b_review_output_token_budget,
+        )
+
+        self.assertEqual(_stage_a_output_token_budget({}), 2600)
+        self.assertEqual(
+            _stage_a_output_token_budget({
+                "structured_candidates": [{
+                    "field_candidates": [{} for _item in range(9)],
+                }],
+            }),
+            10300,
+        )
+        self.assertEqual(
+            _stage_a_output_token_budget({
+                "structured_candidates": [{
+                    "field_candidates": [{} for _item in range(100)],
+                }],
+            }),
+            12000,
+        )
+        self.assertEqual(_stage_a_review_output_token_budget([], []), 2200)
+        self.assertEqual(
+            _stage_a_review_output_token_budget([{} for _ in range(5)], [{}]),
+            5800,
+        )
+        self.assertEqual(
+            _stage_a_review_output_token_budget([{} for _ in range(100)], [{}]),
+            12000,
+        )
+        self.assertEqual(_stage_b_review_output_token_budget({}, {}), 1800)
+        self.assertEqual(_stage_b_output_token_budget({}), 3200)
+        self.assertEqual(
+            _stage_b_output_token_budget({
+                "semantic_units": [{} for _ in range(4)],
+            }),
+            5800,
+        )
+        self.assertEqual(
+            _stage_b_review_output_token_budget(
+                {"semantic_units": [{} for _ in range(4)]},
+                {"actions": [{} for _ in range(4)]},
+            ),
+            6200,
+        )
+
+    def test_registered_composite_structured_intake_owns_its_subtree(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _semantic_structured_input_candidates,
+        )
+
+        candidates = _semantic_structured_input_candidates(json.dumps({
+            "chain": "Flow-EVM",
+            "protocol_family": "jsonrpc",
+            "validation_endpoint": "http://127.0.0.1:8545",
+            "rpc_request": {
+                "jsonrpc": "2.0",
+                "method": "eth_chainId",
+                "params": [],
+                "id": 1,
+            },
+        }))
+
+        self.assertEqual(
+            [
+                candidate["source_path"]
+                for candidate in candidates["field_candidates"]
+            ],
+            [
+                "chain",
+                "protocol_family",
+                "validation_endpoint",
+                "rpc_request",
+            ],
+        )
+        self.assertIsInstance(
+            candidates["field_candidates"][-1]["raw_value"],
+            dict,
+        )
+        self.assertEqual(
+            candidates["field_candidates"][-1]["source_evidence"],
+            '{"jsonrpc": "2.0", "method": "eth_chainId", '
+            '"params": [], "id": 1}',
+        )
+
+    def test_structured_grounding_compares_objects_by_json_value(self) -> None:
+        from agent.harness.semantic_compiler import (
+            _grounding_quote_contains_value,
+        )
+
+        value = {
+            "jsonrpc": "2.0",
+            "method": "eth_chainId",
+            "params": [],
+            "id": 1,
+        }
+        self.assertTrue(_grounding_quote_contains_value(
+            value,
+            '{\n  "jsonrpc": "2.0", "method": "eth_chainId", '
+            '"params": [], "id": 1\n}',
+        ))
+        self.assertFalse(_grounding_quote_contains_value(
+            value,
+            '{"jsonrpc":"2.0","method":"eth_blockNumber",'
+            '"params":[],"id":1}',
+        ))
+
+    def test_structured_protocol_family_reaches_its_registered_owner(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        source = 'protocol_family: "jsonrpc"'
+        clauses = (TurnClause("clause-1", source, "structured"),)
+        unit = {
+            "unit_id": "__harness_structured_clause-1_1",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "structured adapter family",
+        }
+
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "complete"}),
+            clauses,
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(partition[0]["registered_intake"], {
+            "action_type": "choose_adapter_family",
+            "owner": "chain_rpc",
+            "target_group": "chain_identity",
+            "alias": "protocol_family",
+            "fixed_arguments": {},
+            "value_semantics": "direct_value",
+            "value_argument": "adapter_family",
+        })
+        payload = _stage_b_payload(
+            new_state("structured-protocol-family", language="en"),
+            "chain_rpc",
+            frozenset({"chain_identity"}),
+            partition,
+            (partition[0]["unit_id"],),
+        )
+        self.assertEqual(
+            payload["semantic_units"][0]["semantic_value"],
+            "jsonrpc",
+        )
+
     def test_receipt_attachment_rejection_becomes_typed_unresolved_work(
         self,
     ) -> None:
@@ -220,7 +378,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         document = {
             "semantic_units": [
                 {
-                    "unit_id": "chain-atom",
+                    "unit_id": "__harness_structured_clause-1_1",
                     "clause_id": clauses[0].clause_id,
                     "source_text": text,
                     "source_path": "CHAIN",
@@ -232,7 +390,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     "reason": "answers the active chain question",
                 },
                 {
-                    "unit_id": "region-atom",
+                    "unit_id": "__harness_structured_clause-1_2",
                     "clause_id": clauses[0].clause_id,
                     "source_text": text,
                     "source_path": "CLOUD_REGION",
@@ -262,11 +420,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "coordinator",
             frozenset({"chain_identity"}),
             partition,
-            ("chain-atom",),
+            ("__harness_structured_clause-1_1",),
         )
         self.assertEqual(
             payload["semantic_units"][0]["semantic_source"],
-            '{"CHAIN": "Flow"}',
+            '"Flow"',
         )
         self.assertEqual(
             payload["semantic_units"][0]["semantic_value"],
@@ -583,7 +741,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             },
         }
         unresolved = [{
-            "unit_id": "unit-1",
+            "unit_id": "__harness_structured_clause-1_1",
             "source_text": "standard",
             "operation": "unresolved",
             "owner_routes": [],
@@ -1705,7 +1863,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ("unit-1",),
         )
         self.assertIn(
-            "reset_session",
+            "request_session_reset",
             {row["type"] for row in payload["owner_action_schema"]},
         )
 
@@ -1822,7 +1980,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertIn("would not change state", prompt)
         self.assertIn("promise to supply a value later", prompt)
 
-    def test_stage_a_rejects_route_without_registered_compiler_action(
+    def test_stage_a_preserves_route_without_compiler_as_unresolved_atom(
         self,
     ) -> None:
         from agent.harness.hierarchical_planner import (
@@ -1847,16 +2005,14 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "reason": "invalid route",
         }
 
-        _partition, errors = _validate_partition_document(
+        partition, errors = _validate_partition_document(
             json.dumps(document),
             clauses,
         )
 
-        self.assertIn(
-            "Stage A route has no registered compiler action: "
-            "unit-1/domain_request/orientation/endpoint_process",
-            errors,
-        )
+        self.assertEqual(errors, ())
+        self.assertEqual(partition[0]["operation"], "unresolved")
+        self.assertEqual(partition[0]["owner_routes"], [])
 
     def test_stage_a_payload_projects_authoritative_operation_purposes(
         self,
@@ -1876,7 +2032,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             dict(SEMANTIC_OPERATION_PURPOSES),
         )
 
-    def test_production_partition_fails_closed_when_stage_a_admission_rejects(
+    def test_production_partition_rechecks_when_stage_a_admission_rejects(
         self,
     ) -> None:
         from agent.harness.hierarchical_planner import begin_semantic_partition
@@ -1916,6 +2072,35 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             }],
             "reason": "the candidate partition is not semantically admissible",
         }
+        independent = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "If I reset, what would be cleared?",
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "opening",
+                }],
+                "reason": "read-only reset consequence question",
+            }],
+            "reason": "independent consultation partition",
+        }
+        admitted = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the consultation preserves the complete question",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the complete question has a safe read-only route",
+            }],
+            "reason": "independent proposal is admissible",
+        }
         state = {
             "language": "en",
             "active_group": "opening",
@@ -1936,7 +2121,12 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
-                side_effect=[json.dumps(stage_a), json.dumps(rejected)],
+                side_effect=[
+                    json.dumps(stage_a),
+                    json.dumps(rejected),
+                    json.dumps(independent),
+                    json.dumps(admitted),
+                ],
             ) as compiler,
         ):
             result = begin_semantic_partition(
@@ -1944,17 +2134,14 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "If I reset, what would be cleared?",
             )
 
-        self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(compiler.call_count, 4)
         self.assertIn(
             "Stage A coverage authority",
             compiler.call_args_list[1].kwargs["system_prompt"],
         )
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["admission_calls"], 1)
-        self.assertTrue(
-            any("unresolved" in error for error in result["errors"]),
-            result["errors"],
-        )
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(result["source_partition"][0]["operation"], "consultation")
 
     def test_inconsistent_wrapper_verdict_gets_one_admission_repair(
         self,
@@ -2208,6 +2395,21 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             }],
             "reason": "semantic rejection",
         }
+        admitted = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the source is a complete read-only question",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the consultation route preserves the clause",
+            }],
+            "reason": "independent semantic review admits the route",
+        }
         state = {
             "active_group": "chain_identity",
             "pending_question": {
@@ -2226,15 +2428,20 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
-                side_effect=[json.dumps(partition), json.dumps(rejected)],
+                side_effect=[
+                    json.dumps(partition),
+                    json.dumps(rejected),
+                    json.dumps(partition),
+                    json.dumps(admitted),
+                ],
             ) as compiler,
         ):
             result = begin_semantic_partition(state, text)
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["stage_a_calls"], 1)
-        self.assertEqual(result["admission_calls"], 1)
-        self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(compiler.call_count, 4)
 
     def test_independent_unresolved_demand_reaches_draft_compilation(
         self,
@@ -2641,7 +2848,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "reason": "wrong first proposal",
         }
         corrected = {
-            "actions": [{"type": "reset_session"}],
+            "actions": [{"type": "request_session_reset"}],
             "bindings": [{
                 "unit_id": "reset-unit",
                 "action_indexes": [0],
@@ -2704,7 +2911,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             )
 
         self.assertEqual(errors, ())
-        self.assertEqual(document["actions"], [{"type": "reset_session"}])
+        self.assertEqual(
+            document["actions"],
+            [{"type": "request_session_reset"}],
+        )
         self.assertEqual(len(document["semantic_review_receipts"]), 2)
         self.assertEqual(len(sizes), 4)
         self.assertEqual(compiler.call_count, 4)
@@ -3611,7 +3821,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             TurnClause("clause-1", "QPS_MODE: quick", "structured"),
         )
         unit = {
-            "unit_id": "unit-1",
+            "unit_id": "__harness_structured_clause-1_1",
             "clause_id": "clause-1",
             "source_text": "QPS_MODE: quick",
             "operation": "domain_request",
@@ -3631,6 +3841,90 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [{"owner": "performance", "group": "qps_profile"}],
         )
         self.assertEqual(errors, ())
+
+    def test_stage_a_binds_omitted_structured_provenance_from_atom_id(self) -> None:
+        from agent.harness.hierarchical_planner import _validate_partition_document
+        from agent.harness.plan_coverage import TurnClause
+
+        source = "QPS_MODE: quick"
+        unit = {
+            "unit_id": "__harness_structured_clause-1_1",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "performance",
+                "group": "qps_profile",
+            }],
+            "reason": "structured workflow value",
+        }
+
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "complete"}),
+            (TurnClause("clause-1", source, "structured"),),
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(partition[0]["clause_id"], "clause-1")
+        self.assertEqual(partition[0]["source_text"], source)
+        self.assertEqual(partition[0]["source_path"], "QPS_MODE")
+
+    def test_structured_rpc_intake_reaches_stage_b_as_registry_authority(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        source = 'validation_endpoint: "http://127.0.0.1:8545"'
+        clauses = (TurnClause("clause-1", source, "structured"),)
+        unit = {
+            "unit_id": "__harness_structured_clause-1_1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "endpoint_process",
+            }],
+            "reason": "structured RPC endpoint",
+        }
+
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "complete"}),
+            clauses,
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(
+            partition[0]["registered_intake"],
+            {
+                "action_type": "rpc_catalog_command",
+                "owner": "chain_rpc",
+                "target_group": "endpoint_process",
+                "alias": "validation_endpoint",
+                "fixed_arguments": {"catalog_command": "set_endpoint"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_endpoint",
+            },
+        )
+        payload = _stage_b_payload(
+            new_state("structured-rpc-intake", language="en"),
+            "chain_rpc",
+            frozenset({"endpoint_process"}),
+            partition,
+            (partition[0]["unit_id"],),
+        )
+        semantic_unit = payload["semantic_units"][0]
+        self.assertEqual(
+            semantic_unit["registered_intake"],
+            partition[0]["registered_intake"],
+        )
+        self.assertEqual(
+            semantic_unit["semantic_value"],
+            "http://127.0.0.1:8545",
+        )
 
     def test_stage_a_rejects_invalid_structured_route_without_reassigning_owner(
         self,
@@ -3942,6 +4236,62 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "keep Solana and configure a real-node benchmark.",
         )
         self.assertEqual(source[0]["end"], source[1]["start"])
+
+    def test_uncompilable_sibling_route_does_not_erase_contract_option_unit(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_partition_document
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = "N, because I want to tune the CPU bottleneck threshold."
+        clauses = segment_user_turn(text)
+        state = new_state("uncompilable-option-sibling", language="en")
+        state["active_group"] = "advanced_tuning"
+        state["pending_question"] = {
+            "id": "advanced_tuning_confirm",
+            "group": "advanced_tuning",
+            "owner": "performance",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "value": True},
+                {"id": "no", "value": False},
+            ],
+        }
+        document = json.dumps({
+            "semantic_units": [{
+                "unit_id": "stage-a-whole-clause",
+                "clause_id": clauses[0].clause_id,
+                "start": 0,
+                "end": len(text),
+                "source_text": text,
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "performance",
+                    "group": "advanced_tuning",
+                }],
+                "reason": "The user wants to tune an advanced threshold.",
+            }],
+            "reason": "one compound pending-answer turn",
+        })
+
+        partition, errors = _validate_partition_document(
+            document,
+            clauses,
+            state=state,
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(
+            [unit["operation"] for unit in partition],
+            ["pending_answer", "unresolved"],
+        )
+        self.assertEqual(partition[0]["source_text"], "N, ")
+        self.assertEqual(
+            partition[1]["source_text"],
+            "because I want to tune the CPU bottleneck threshold.",
+        )
 
     def test_option_prefix_never_silently_converts_absorbed_sibling_to_context(
         self,
@@ -7583,6 +7933,152 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             coordinator.hierarchical_planner,
             hierarchical_planner,
         )
+
+    def test_registry_route_projection_is_identical_across_planner_stages(self) -> None:
+        from agent.harness.action_registry import (
+            ACTION_SPECS,
+            action_route_groups,
+            project_action_specs,
+        )
+        from agent.harness.hierarchical_planner import _action_spec_applies
+
+        for spec in ACTION_SPECS:
+            if spec.internal_only:
+                continue
+            for group in action_route_groups(spec):
+                projected = project_action_specs(groups=frozenset({group}))
+                self.assertIn(spec, projected, (spec.action_type, group))
+                for operation in spec.semantic_operations:
+                    self.assertTrue(
+                        _action_spec_applies(
+                            spec,
+                            groups=frozenset({group}),
+                            operations=frozenset({operation}),
+                        ),
+                        (spec.action_type, operation, group),
+                    )
+
+    def test_manual_pending_claim_must_satisfy_signed_value_contract(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _pending_answer_contract_errors,
+        )
+
+        state = {
+            "pending_question": {
+                "id": "duration",
+                "group": "sync_observe",
+                "owner": "sync_observe",
+                "manual_input_allowed": True,
+                "validation": {"value_type": "positive_integer"},
+            }
+        }
+        rejected = [{
+            "unit_id": "unit-1",
+            "source_text": "Do not continue this observation.",
+            "operation": "pending_answer",
+        }]
+        accepted = [{
+            "unit_id": "unit-1",
+            "source_text": "120",
+            "operation": "pending_answer",
+        }]
+
+        self.assertTrue(_pending_answer_contract_errors(rejected, state))
+        self.assertEqual(_pending_answer_contract_errors(accepted, state), ())
+
+    def test_structured_literal_validation_uses_atom_value_not_schema_key(self) -> None:
+        from agent.harness.plan_coverage import _structured_atom_source
+
+        source = json.dumps({
+            "validation_endpoint": "http://127.0.0.1:8545",
+            "rpc_request": {
+                "jsonrpc": "2.0",
+                "method": "eth_chainId",
+                "params": [],
+                "id": 1,
+            },
+        })
+        endpoint_atom = _structured_atom_source(
+            {"source_path": "validation_endpoint"},
+            source,
+        )
+        request_atom = _structured_atom_source(
+            {"source_path": "rpc_request.method"},
+            source,
+        )
+
+        self.assertNotIn("validation_endpoint", endpoint_atom)
+        self.assertIn("127.0.0.1:8545", endpoint_atom)
+        self.assertNotIn("rpc_request", request_atom)
+        self.assertIn("eth_chainId", request_atom)
+
+    def test_hierarchical_support_receipt_survives_candidate_normalization(self) -> None:
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        source = '{"target_mode":"fake-node"}'
+        clauses = segment_user_turn(source)
+        support_id = "__harness_structured_clause-1_1"
+        candidate = {
+            "actions": [],
+            "semantic_units": [{
+                "unit_id": support_id,
+                "clause_id": "clause-1",
+                "source_text": source,
+                "source_path": "target_mode",
+                "disposition": "context",
+                "action_indexes": [],
+                "reason": "duplicate selection support",
+            }],
+        }
+
+        prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            new_state("trusted-structured-support", language="en"),
+            clauses,
+            pending_choice_unit_ids=frozenset(),
+            semantic_support_unit_ids=frozenset({support_id}),
+        )
+
+        self.assertEqual(
+            json.loads(prepared)["semantic_support_unit_ids"],
+            [support_id],
+        )
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_nested_rpc_evidence_preserves_wire_method_literal(self) -> None:
+        from agent.harness.plan_coverage import segment_user_turn, validate_plan_coverage
+
+        source = '{"rpc_request":{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}}'
+        clauses = segment_user_turn(source)
+        action = {
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "rpc_schema_evidence": {
+                "jsonrpc": "2.0",
+                "method": "eth_chainId",
+                "params": [],
+                "id": 1,
+            },
+        }
+        result = validate_plan_coverage(
+            {
+                "actions": [action],
+                "semantic_units": [{
+                    "unit_id": "rpc-request",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "source_path": "rpc_request.method",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "complete request evidence",
+                }],
+            },
+            clauses,
+        )
+
+        self.assertTrue(result.valid, result.errors)
 
 
 if __name__ == "__main__":

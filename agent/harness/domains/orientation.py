@@ -170,6 +170,33 @@ def _resume_option_label(value: str):
     return question_text(f"question.orientation.resume.option.{value}")
 
 
+def session_reset_confirmation_question() -> dict[str, Any]:
+    """Build the sole user-facing authority for destructive session reset."""
+
+    return choice_question(
+        "opening",
+        "session_reset_confirm",
+        question_text("question.orientation.session_reset_confirm.prompt"),
+        field="session_reset_confirm",
+        options=[
+            {
+                "id": "yes",
+                "label": question_text("question.common.option.yes"),
+                "value": True,
+                "expected_patch": {"confirmed_config": {}},
+            },
+            {
+                "id": "no",
+                "label": question_text("question.common.option.no"),
+                "value": False,
+                "expected_patch": {},
+                "return_policy": "stop_after_response",
+            },
+        ],
+        queue_barrier=True,
+    )
+
+
 def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
     """Build the typed destination selector for a resumed configuration.
 
@@ -333,9 +360,20 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
             stop_after_response=True,
             completion="unchanged",
         )
+    if action_type == "request_session_reset":
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            pending_question=session_reset_confirmation_question(),
+            next_group="opening",
+            completion="blocked",
+            stop_after_response=True,
+        )
     if action_type == "reset_session":
         return HandlerResult(
-            checkpoint_command=CheckpointCommand("reset"),
+            checkpoint_command=CheckpointCommand(
+                "reset",
+                preserve_remaining_actions=True,
+            ),
             consumed_action_ids=(action.action_id,),
             response_fragments=(
                 ResponseFragment(
@@ -917,6 +955,36 @@ def apply_orientation_answer(
     """Apply opening/session answers without performing global routing."""
 
     question_id = str(question.get("id") or "")
+    if question_id == "session_reset_confirm":
+        if value is True:
+            return HandlerResult(
+                checkpoint_command=CheckpointCommand(
+                    "reset",
+                    preserve_remaining_actions=True,
+                ),
+                response_fragments=(
+                    ResponseFragment(
+                        kind="message",
+                        message_id="harness.orientation.session_reset",
+                        source=__name__,
+                    ),
+                ),
+                clear_pending=True,
+                completion="completed",
+                stop_after_response=True,
+            )
+        return HandlerResult(
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.orientation.session_reset_cancelled",
+                    source=__name__,
+                ),
+            ),
+            clear_pending=True,
+            completion="completed",
+            stop_after_response=False,
+        )
     if question_id == "resume_harness_session":
         recovery = state.get("checkpoint_recovery") or {}
         if value == "inspect_quarantine":

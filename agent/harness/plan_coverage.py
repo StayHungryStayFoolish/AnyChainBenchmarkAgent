@@ -83,16 +83,6 @@ def segment_user_turn(text: str) -> tuple[TurnClause, ...]:
                 continue
             split = [item.strip() for item in _SENTENCE_BOUNDARY_RE.split(line) if item.strip()]
             prose_parts.extend(split)
-        if (
-            prose_parts
-            and index + 1 < len(regions)
-            and regions[index + 1][1] == "structured"
-            and prose_parts[-1].endswith((":", "："))
-        ):
-            parts.extend((item, "prose") for item in prose_parts[:-1])
-            parts.append((f"{prose_parts[-1]}\n{regions[index + 1][0]}", "structured"))
-            index += 2
-            continue
         parts.extend((item, "prose") for item in prose_parts)
         index += 1
     if not parts:
@@ -174,6 +164,11 @@ def validate_plan_coverage(
         for unit_id in payload.get("pending_support_unit_ids", [])
         if str(unit_id)
     }
+    semantic_support_unit_ids = {
+        str(unit_id)
+        for unit_id in payload.get("semantic_support_unit_ids", [])
+        if str(unit_id)
+    }
     units_by_clause: dict[str, list[Mapping[str, Any]]] = {
         clause_id: [] for clause_id in expected
     }
@@ -249,6 +244,7 @@ def validate_plan_coverage(
             if (
                 expected[clause_id].input_shape != "prose"
                 and unit_id not in pending_support_unit_ids
+                and unit_id not in semantic_support_unit_ids
             ):
                 errors.append(f"context semantic unit is not prose: {unit_id}")
             if not str(raw.get("reason") or "").strip():
@@ -367,6 +363,10 @@ def validate_plan_coverage(
     errors.extend(
         f"pending support receipt references an unknown semantic unit: {unit_id}"
         for unit_id in sorted(pending_support_unit_ids - seen_unit_ids)
+    )
+    errors.extend(
+        f"semantic support receipt references an unknown semantic unit: {unit_id}"
+        for unit_id in sorted(semantic_support_unit_ids - seen_unit_ids)
     )
     return PlanCoverageResult(
         valid=not errors and not unresolved,
@@ -728,7 +728,7 @@ def _structured_atom_source(
     if len(matching) != 1:
         return source_text
     return json.dumps(
-        {source_path: matching[0].get("raw_value")},
+        matching[0].get("raw_value"),
         ensure_ascii=False,
         sort_keys=True,
         default=str,
@@ -777,7 +777,12 @@ def _mapped_action_preserves_wire_method(
             "subject",
         ):
             value = action.get(key)
-            if isinstance(value, str) and method in value:
+            if value is not None and method in json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ):
                 return True
         if (
             allow_pending_answer

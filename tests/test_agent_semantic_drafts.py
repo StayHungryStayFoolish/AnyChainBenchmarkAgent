@@ -1850,7 +1850,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
             "source_evidence": "change QPS",
         }
         siblings = (
-            {"type": "reset_session"},
+            {"type": "request_session_reset"},
             {
                 "type": "change_group",
                 "group": "observability",
@@ -1897,7 +1897,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
                 "resolution": "change QPS",
                 "source_evidence": "change QPS",
             },
-            {"type": "reset_session"},
+            {"type": "request_session_reset"},
         ]
         before = {
             "confirmed_config": deepcopy(state["confirmed_config"]),

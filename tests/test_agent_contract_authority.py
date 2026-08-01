@@ -127,7 +127,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
             spec for spec in ACTION_SPECS
             if spec.action_type == "rpc_catalog_command"
         )
-        self.assertEqual(len(rpc_spec.structured_intake), 1)
+        self.assertEqual(len(rpc_spec.structured_intake), 3)
         intake = rpc_spec.structured_intake[0]
         self.assertEqual(intake.alias, "custom_rpc")
         self.assertEqual(
@@ -135,20 +135,53 @@ class ActionContractAuthorityTest(unittest.TestCase):
             {"catalog_command": "enter"},
         )
         self.assertEqual(intake.value_semantics, "boolean_true")
+        self.assertEqual(intake.value_argument, "")
 
         rendered = {
             item["type"]: item["structured_intake"]
             for item in action_schema()
         }
-        self.assertEqual(rendered["rpc_catalog_command"], [{
-            "alias": "custom_rpc",
-            "fixed_arguments": {"catalog_command": "enter"},
-            "value_semantics": "boolean_true",
-        }])
+        self.assertEqual(rendered["rpc_catalog_command"], [
+            {
+                "alias": "custom_rpc",
+                "fixed_arguments": {"catalog_command": "enter"},
+                "value_semantics": "boolean_true",
+                "value_argument": "",
+            },
+            {
+                "alias": "validation_endpoint",
+                "fixed_arguments": {"catalog_command": "set_endpoint"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_endpoint",
+            },
+            {
+                "alias": "rpc_request",
+                "fixed_arguments": {"catalog_command": "append_evidence"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_schema_evidence",
+            },
+        ])
+        self.assertEqual(rendered["choose_adapter_family"], [
+            {
+                "alias": "protocol_family",
+                "fixed_arguments": {},
+                "value_semantics": "direct_value",
+                "value_argument": "adapter_family",
+            },
+            {
+                "alias": "adapter_family",
+                "fixed_arguments": {},
+                "value_semantics": "direct_value",
+                "value_argument": "adapter_family",
+            },
+        ])
         self.assertTrue(all(
             not metadata
             for action_type, metadata in rendered.items()
-            if action_type != "rpc_catalog_command"
+            if action_type not in {
+                "choose_adapter_family",
+                "rpc_catalog_command",
+            }
         ))
 
     def test_structured_intake_registry_validation_is_centralized(self) -> None:

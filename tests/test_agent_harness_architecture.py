@@ -5264,5 +5264,38 @@ class HarnessStateInvariantTest(unittest.TestCase):
             ["lifecycle_incompatible"],
         )
 
+    def test_replayed_confirmed_adapter_family_selection_is_idempotent(self) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_action
+        from agent.harness.state import new_state
+
+        state = new_state("adapter-family-idempotence", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "Flow-EVM",
+            "canonical": "Flow-EVM",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_endpoint",
+            "case": "case2",
+            "identity_confirmed": True,
+        }
+
+        result = apply_chain_rpc_action(
+            state,
+            ActionProposal(
+                "family-replay",
+                "choose_adapter_family",
+                {"adapter_family": "jsonrpc"},
+                "high",
+            ),
+        )
+
+        committed = _commit_result(state, result, owner="chain_rpc")
+        self.assertEqual(result.completion, "unchanged")
+        self.assertEqual(committed["chain_identity"], state["chain_identity"])
+        self.assertEqual(committed["active_group"], "endpoint_process")
+
 if __name__ == "__main__":
     unittest.main()

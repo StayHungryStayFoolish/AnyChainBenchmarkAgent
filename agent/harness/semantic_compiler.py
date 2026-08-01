@@ -823,8 +823,15 @@ def request_whole_plan_admission(
 def _requires_grounded_mutation_consensus(
     plan: ImmutableSemanticPlan,
 ) -> bool:
-    """Return whether one immutable plan can directly commit product state."""
+    """Return whether one immutable plan needs a second semantic authority."""
 
+    actions = [
+        record
+        for record in plan.request_payload().get("actions") or ()
+        if isinstance(record, Mapping)
+    ]
+    if len({str(record.get("registry_owner") or "") for record in actions}) > 1:
+        return True
     return any(
         isinstance(record, Mapping)
         and str(record.get("registry_effect") or "") in {
@@ -833,7 +840,7 @@ def _requires_grounded_mutation_consensus(
             "execution",
         }
         and bool(record.get("required_value_grounding_arguments"))
-        for record in plan.request_payload().get("actions") or ()
+        for record in actions
     )
 
 
@@ -1026,8 +1033,13 @@ def validate_whole_plan_admission(
                 errors.append(f"whole-plan grounded argument is undeclared: {action_id}/{argument or '<missing>'}")
             if not quote or not any(quote in source for source in owned_sources):
                 errors.append(f"whole-plan grounded argument evidence is not exact: {action_id}/{argument or '<missing>'}")
-            exact_value = str(operation_arguments.get(argument) or "").strip()
-            if argument in exact_grounding and exact_value and exact_value not in quote:
+            operation_value = operation_arguments.get(argument)
+            exact_value = str(operation_value or "").strip()
+            if (
+                argument in exact_grounding
+                and operation_value not in (None, "")
+                and not _grounding_quote_contains_value(operation_value, quote)
+            ):
                 errors.append(
                     f"whole-plan exact grounded argument quote does not contain its immutable value: "
                     f"{action_id}/{argument}"
@@ -1363,6 +1375,17 @@ def validate_whole_plan_admission(
         unit_verdicts=tuple(valid_unit_rows),
         response=payload,
     )
+
+
+def _grounding_quote_contains_value(value: Any, quote: str) -> bool:
+    """Compare structured grounding by value and scalar grounding by text."""
+
+    if isinstance(value, (dict, list)):
+        try:
+            return json.loads(quote) == value
+        except (json.JSONDecodeError, TypeError):
+            return False
+    return str(value).strip() in quote
 
 
 def _canonicalize_admission_receipts(

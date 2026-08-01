@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from agent.knowledge.chain_identity import canonical_chain_aliases, repo_chain_names
-from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
+from agent.workflows.group_registry import GROUP_SPEC_BY_NAME, USER_NAVIGABLE_GROUPS
 
 from .input_values import (
     extract_json_object_or_array,
@@ -36,6 +36,7 @@ StateTransitionResolver = Callable[
 ]
 STRUCTURED_INTAKE_VALUE_SEMANTICS = frozenset({
     "boolean_true",
+    "direct_value",
 })
 
 SEMANTIC_SUPPORT_RELATIONS = frozenset({
@@ -379,6 +380,7 @@ class StructuredIntakeSpec:
     alias: str
     fixed_arguments: tuple[tuple[str, Any], ...]
     value_semantics: str
+    value_argument: str = ""
 
 
 @dataclass(frozen=True)
@@ -391,6 +393,7 @@ class ActionSpec:
     target_group: str = ""
     target_field_argument: str = ""
     compiler_groups: tuple[str, ...] = ()
+    route_groups: tuple[str, ...] = ()
     semantic_operations: tuple[str, ...] = ("domain_request",)
     merge_identity: tuple[str, ...] = ()
     preserve_pending: bool = False
@@ -404,6 +407,8 @@ class ActionSpec:
     effect: ActionEffect = "configuration_mutation"
     turn_local_result_roots: tuple[str, ...] = ()
     crosses_pending_barrier: bool = False
+    interrupts_pending: bool = False
+    replaces_deferred_queue: bool = False
     requires_specific_change: bool = False
     incomplete_mutation_intake: bool = False
     incomplete_read_intake: bool = False
@@ -479,7 +484,31 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_operations=("unresolved",),
         required_arguments=("clauses",),
     ),
-    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation", crosses_pending_barrier=True, semantic_operations=("administrative",)),
+    ActionSpec(
+        "request_session_reset",
+        "orientation",
+        "Request a signed confirmation before clearing workflow configuration; startup discovery and historical jobs remain external read models.",
+        execution_phase=0,
+        effect="workflow_navigation",
+        preserve_pending=True,
+        crosses_pending_barrier=True,
+        interrupts_pending=True,
+        replaces_deferred_queue=True,
+        semantic_operations=("administrative",),
+        route_groups=("opening",),
+    ),
+    ActionSpec(
+        "reset_session",
+        "orientation",
+        "Clear workflow configuration after a typed confirmation contract has authorized the destructive transition.",
+        execution_phase=0,
+        effect="workflow_state_mutation",
+        crosses_pending_barrier=True,
+        interrupts_pending=True,
+        replaces_deferred_queue=True,
+        internal_only=True,
+        typed_option_only=True,
+    ),
     ActionSpec(
         "prepare_session_entry",
         "orientation",
@@ -627,6 +656,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ),
         validator=_validate_group_navigation,
         semantic_operations=("navigation",),
+        route_groups=tuple(USER_NAVIGABLE_GROUPS),
     ),
     ActionSpec(
         "request_config_field_input",
@@ -647,6 +677,11 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ),
         validator=_validate_config_field_intake,
         semantic_operations=("navigation",),
+        route_groups=tuple(
+            group_name
+            for group_name, group in GROUP_SPEC_BY_NAME.items()
+            if group.reconfiguration_questions
+        ),
     ),
     ActionSpec(
         "resume_current_flow",
@@ -672,6 +707,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("source_evidence",),
         effect="workflow_navigation",
         crosses_pending_barrier=True,
+        interrupts_pending=True,
         semantic_recovery_source_argument="source_evidence",
         semantic_operations=("navigation",),
         semantic_support_relations=(
@@ -737,7 +773,30 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("rpc_mode",),
     ),
-    ActionSpec("choose_adapter_family", "chain_rpc", "Confirm the adapter family for an already identified unknown chain.", ("adapter_family",), 22, "chain_identity", required_arguments=("adapter_family",), semantic_value_grounding_arguments=("adapter_family",)),
+    ActionSpec(
+        "choose_adapter_family",
+        "chain_rpc",
+        "Confirm the adapter family for an already identified unknown chain.",
+        ("adapter_family",),
+        22,
+        "chain_identity",
+        required_arguments=("adapter_family",),
+        structured_intake=(
+            StructuredIntakeSpec(
+                alias="protocol_family",
+                fixed_arguments=(),
+                value_semantics="direct_value",
+                value_argument="adapter_family",
+            ),
+            StructuredIntakeSpec(
+                alias="adapter_family",
+                fixed_arguments=(),
+                value_semantics="direct_value",
+                value_argument="adapter_family",
+            ),
+        ),
+        semantic_value_grounding_arguments=("adapter_family",),
+    ),
     ActionSpec(
         "rpc_catalog_command",
         "chain_rpc",
@@ -760,6 +819,18 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
                 alias="custom_rpc",
                 fixed_arguments=(("catalog_command", "enter"),),
                 value_semantics="boolean_true",
+            ),
+            StructuredIntakeSpec(
+                alias="validation_endpoint",
+                fixed_arguments=(("catalog_command", "set_endpoint"),),
+                value_semantics="direct_value",
+                value_argument="rpc_endpoint",
+            ),
+            StructuredIntakeSpec(
+                alias="rpc_request",
+                fixed_arguments=(("catalog_command", "append_evidence"),),
+                value_semantics="direct_value",
+                value_argument="rpc_schema_evidence",
             ),
         ),
         invalidates_groups=("workload_rpc",),
@@ -885,6 +956,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("evidence", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "append_evidence_collection",
@@ -901,6 +973,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         state_transition_resolver=_evidence_append_transition,
         validator=_validate_evidence_collection_append,
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "finish_evidence_collection",
@@ -917,6 +990,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         state_transition_path=("evidence_collection", "status"),
         state_transition_value=None,
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "pause_evidence_collection",
@@ -933,6 +1007,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         state_transition_path=("evidence_collection", "status"),
         state_transition_value="paused",
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "resume_evidence_collection",
@@ -949,6 +1024,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         state_transition_path=("evidence_collection", "status"),
         state_transition_value="active",
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "cancel_evidence_collection",
@@ -965,6 +1041,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         state_transition_path=("evidence_collection", "status"),
         state_transition_value=None,
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "analyze_evidence",
@@ -980,6 +1057,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_recovery_source_argument="evidence",
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_operations=("evidence_analysis",),
+        route_groups=("error_evidence_analysis",),
     ),
     ActionSpec(
         "analyze_report",
@@ -992,6 +1070,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         effect="read_only",
         turn_local_result_roots=("report_context",),
         semantic_operations=("report_analysis",),
+        route_groups=("report_artifact_analysis",),
     ),
     ActionSpec("correct_failure", "recovery", "Reopen only the policy-declared affected configuration group.", compiler_groups=("failure_recovery",)),
     ActionSpec(
@@ -1183,6 +1262,42 @@ STATE_AUDIT_TOPICS = frozenset({"current_config", "current_context", "next_actio
 ACTION_BY_TYPE = {spec.action_type: spec for spec in ACTION_SPECS}
 
 
+def action_route_groups(spec: ActionSpec) -> frozenset[str]:
+    """Return the registry-authoritative groups one action can serve.
+
+    Planner stages must consume this projection instead of independently
+    inferring reachability from only a static target or compiler owner.
+    """
+
+    return frozenset(
+        group
+        for group in (
+            spec.target_group,
+            *spec.compiler_groups,
+            *spec.route_groups,
+        )
+        if group
+    )
+
+
+def action_spec_serves_route(
+    spec: ActionSpec,
+    *,
+    operation: str,
+    group: str = "",
+) -> bool:
+    """Resolve one semantic operation/group pair to an executable spec."""
+
+    if spec.internal_only or operation not in spec.semantic_operations:
+        return False
+    route_groups = action_route_groups(spec)
+    if not route_groups:
+        return operation != "domain_request"
+    if not group:
+        return operation != "domain_request"
+    return group in route_groups
+
+
 def project_action_specs(
     *,
     owners: frozenset[str] | None = None,
@@ -1199,8 +1314,7 @@ def project_action_specs(
         and not spec.internal_only
         and (
             groups is None
-            or spec.target_group in groups
-            or bool(groups.intersection(spec.compiler_groups))
+            or bool(groups.intersection(action_route_groups(spec)))
         )
         and (lifetimes is None or spec.lifetime in lifetimes)
         and (action_types is None or spec.action_type in action_types)
@@ -1208,6 +1322,12 @@ def project_action_specs(
 
 
 for _spec in ACTION_SPECS:
+    _unknown_route_groups = set(_spec.route_groups) - set(GROUP_SPEC_BY_NAME)
+    if _unknown_route_groups:
+        raise ValueError(
+            f"{_spec.action_type} declares unknown route groups: "
+            + ", ".join(sorted(_unknown_route_groups))
+        )
     _unknown_invalidated_groups = (
         set(_spec.invalidates_groups) - set(GROUP_SPEC_BY_NAME)
     )
@@ -1356,6 +1476,7 @@ def action_registry_contract_hash() -> str:
             "target_group": spec.target_group,
             "target_field_argument": spec.target_field_argument,
             "compiler_groups": list(spec.compiler_groups),
+            "route_groups": list(spec.route_groups),
             "semantic_operations": list(spec.semantic_operations),
             "merge_identity": list(spec.merge_identity),
             "preserve_pending": spec.preserve_pending,
@@ -1369,6 +1490,8 @@ def action_registry_contract_hash() -> str:
             "effect": spec.effect,
             "turn_local_result_roots": list(spec.turn_local_result_roots),
             "crosses_pending_barrier": spec.crosses_pending_barrier,
+            "interrupts_pending": spec.interrupts_pending,
+            "replaces_deferred_queue": spec.replaces_deferred_queue,
             "requires_specific_change": spec.requires_specific_change,
             "incomplete_mutation_intake": spec.incomplete_mutation_intake,
             "incomplete_read_intake": spec.incomplete_read_intake,
@@ -1389,6 +1512,7 @@ def action_registry_contract_hash() -> str:
                         for key, value in intake.fixed_arguments
                     ],
                     "value_semantics": intake.value_semantics,
+                    "value_argument": intake.value_argument,
                 }
                 for intake in spec.structured_intake
             ],
@@ -2828,6 +2952,16 @@ def validate_action_registry() -> None:
             raise RuntimeError(
                 f"turn-local result roots require turn-local lifetime: {spec.action_type}"
             )
+        if spec.interrupts_pending and not spec.crosses_pending_barrier:
+            raise RuntimeError(
+                "pending interruption requires barrier crossing authority: "
+                f"{spec.action_type}"
+            )
+        if spec.replaces_deferred_queue and spec.lifetime == "turn_local":
+            raise RuntimeError(
+                "turn-local action cannot replace the durable queue: "
+                f"{spec.action_type}"
+            )
         if spec.target_field_argument and spec.target_field_argument not in spec.required_arguments:
             raise RuntimeError(
                 f"dynamic target field must be a required argument: {spec.action_type}"
@@ -2959,9 +3093,26 @@ def validate_action_registry() -> None:
                         "invalid structured intake fixed argument for "
                         f"{spec.action_type}.{alias}: {exc}"
                     ) from exc
+            value_argument = intake.value_argument.strip()
+            if value_argument and value_argument not in spec.allowed_arguments:
+                raise RuntimeError(
+                    "structured intake value argument must be allowed for "
+                    f"{spec.action_type}.{alias}: {value_argument}"
+                )
+            if value_argument and value_argument in fixed_argument_names:
+                raise RuntimeError(
+                    "structured intake value argument overlaps fixed arguments: "
+                    f"{spec.action_type}.{alias}.{value_argument}"
+                )
+            if (intake.value_semantics == "direct_value") != bool(value_argument):
+                raise RuntimeError(
+                    "direct structured intake semantics require exactly one value argument: "
+                    f"{spec.action_type}.{alias}"
+                )
             uncovered_required = (
                 set(spec.required_arguments)
                 - set(fixed_argument_names)
+                - ({value_argument} if value_argument else set())
                 - {"source_evidence"}
             )
             if uncovered_required:
@@ -2973,6 +3124,10 @@ def validate_action_registry() -> None:
                 "type": spec.action_type,
                 **dict(intake.fixed_arguments),
             }
+            if value_argument:
+                probe[value_argument] = _entry_intake_probe_value(
+                    ACTION_ARGUMENT_SCHEMAS[value_argument]
+                )
             if "source_evidence" in spec.required_arguments:
                 probe["source_evidence"] = alias
             try:

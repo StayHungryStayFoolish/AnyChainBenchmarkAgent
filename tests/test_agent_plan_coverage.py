@@ -246,9 +246,16 @@ class PlanCoverageTest(unittest.TestCase):
 
         clauses = segment_user_turn(source)
 
-        self.assertEqual(len(clauses), 1)
-        self.assertEqual(clauses[0].input_shape, "structured")
-        self.assertEqual(clauses[0].text, source)
+        self.assertEqual(len(clauses), 2)
+        self.assertEqual(
+            [item.input_shape for item in clauses],
+            ["prose", "structured"],
+        )
+        self.assertEqual(clauses[0].text, "accounts disk:")
+        self.assertEqual(
+            clauses[1].text,
+            "  ACCOUNTS_VOL_TYPE: hyperdisk-balanced",
+        )
 
     def test_standalone_url_is_not_misclassified_as_a_yaml_key(self) -> None:
         clauses = segment_user_turn(
@@ -953,10 +960,13 @@ class PlanCoverageTest(unittest.TestCase):
             '{\n  "CLOUD_REGION": "asia-east1",\n  "LEDGER_DEVICE": "vda"\n}'
         )
 
-        self.assertEqual([item.input_shape for item in clauses], ["prose", "structured"])
+        self.assertEqual(
+            [item.input_shape for item in clauses],
+            ["prose", "prose", "structured"],
+        )
         self.assertEqual(
             clauses[-1].text,
-            '这是机器信息：\n{\n  "CLOUD_REGION": "asia-east1",\n  "LEDGER_DEVICE": "vda"\n}',
+            '{\n  "CLOUD_REGION": "asia-east1",\n  "LEDGER_DEVICE": "vda"\n}',
         )
 
     def test_structured_block_with_trailing_prose_preserves_both_shapes(self) -> None:
@@ -975,15 +985,15 @@ class PlanCoverageTest(unittest.TestCase):
 
         self.assertEqual(
             [item.input_shape for item in clauses],
-            ["structured", "structured"],
-        )
-        self.assertEqual(
-            clauses[0].text,
-            "Use these values:\nCLOUD_REGION=asia-east1\nCLOUD_ZONE=asia-east1-c",
+            ["prose", "structured", "prose", "structured"],
         )
         self.assertEqual(
             clauses[1].text,
-            "and verify this inventory:\ndevice: vda\nsize_gib: 926",
+            "CLOUD_REGION=asia-east1\nCLOUD_ZONE=asia-east1-c",
+        )
+        self.assertEqual(
+            clauses[3].text,
+            "device: vda\nsize_gib: 926",
         )
 
     def test_structured_url_must_be_present_in_mapped_action(self) -> None:
@@ -1232,7 +1242,7 @@ class PlanCoverageTest(unittest.TestCase):
             {
                 "type": "propose_config_values",
                 "config_values": {"CLOUD_REGION": "asia-east1"},
-                "source_evidence": clauses[0].text,
+                "source_evidence": clauses[1].text,
             },
             {
                 "type": "set_rpc_mode",
@@ -1245,17 +1255,27 @@ class PlanCoverageTest(unittest.TestCase):
                 "actions": actions,
                 "semantic_units": [
                     {
-                        "unit_id": "unit-1",
+                        "unit_id": "label",
                         "clause_id": "clause-1",
                         "source_text": clauses[0].text,
+                        "disposition": "context",
+                        "action_indexes": [],
+                        "reason": "structured block label",
+                    },
+                    {
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-2",
+                        "source_text": clauses[1].text,
+                        "source_path": "CLOUD_REGION",
                         "disposition": "action",
                         "action_indexes": [0],
                         "reason": "environment values",
                     },
                     {
                         "unit_id": "unit-2",
-                        "clause_id": "clause-1",
-                        "source_text": clauses[0].text,
+                        "clause_id": "clause-2",
+                        "source_text": clauses[1].text,
+                        "source_path": "RPC_MODE",
                         "disposition": "action",
                         "action_indexes": [1],
                         "reason": "workflow-owned RPC mode",
@@ -1343,24 +1363,33 @@ class PlanCoverageTest(unittest.TestCase):
 
     def test_atomic_structured_clause_rejects_action_and_unresolved_mix(self) -> None:
         clauses = segment_user_turn("Use values:\nCLOUD_REGION=asia-east1\nMYSTERY=value")
-        known_anchor = "Use values:\nCLOUD_REGION=asia-east1"
-        unknown_anchor = "MYSTERY=value"
+        structured_source = clauses[1].text
         result = validate_plan_coverage(
             {
                 "actions": [{"type": "propose_config_values", "config_values": {"CLOUD_REGION": "asia-east1"}}],
                 "semantic_units": [
                     {
-                        "unit_id": "unit-1",
+                        "unit_id": "label",
                         "clause_id": "clause-1",
-                        "source_text": known_anchor,
+                        "source_text": clauses[0].text,
+                        "disposition": "context",
+                        "action_indexes": [],
+                        "reason": "structured block label",
+                    },
+                    {
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-2",
+                        "source_text": structured_source,
+                        "source_path": "CLOUD_REGION",
                         "disposition": "action",
                         "action_indexes": [0],
                         "reason": "known value",
                     },
                     {
                         "unit_id": "unit-2",
-                        "clause_id": "clause-1",
-                        "source_text": unknown_anchor,
+                        "clause_id": "clause-2",
+                        "source_text": structured_source,
+                        "source_path": "MYSTERY",
                         "disposition": "unresolved",
                         "action_indexes": [],
                         "reason": "unknown value",
@@ -1371,7 +1400,7 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
         self.assertFalse(result.valid)
-        self.assertEqual(result.unresolved_clauses, (unknown_anchor,))
+        self.assertEqual(result.unresolved_clauses, (structured_source,))
 
     def test_consultation_scope_accepts_only_read_only_effects(self) -> None:
         clauses = segment_user_turn("I am only asking and do not change configuration")

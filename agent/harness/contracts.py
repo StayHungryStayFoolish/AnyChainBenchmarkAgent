@@ -139,6 +139,7 @@ class CheckpointCommand:
 
     command: Literal["reset", "retain_safe"]
     confirmed_config: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    preserve_remaining_actions: bool = False
 
 
 @dataclass(frozen=True)
@@ -816,6 +817,9 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
             {
                 "command": result.checkpoint_command.command,
                 "confirmed_config": deepcopy(dict(result.checkpoint_command.confirmed_config)),
+                "preserve_remaining_actions": (
+                    result.checkpoint_command.preserve_remaining_actions
+                ),
             }
             if result.checkpoint_command
             else None
@@ -932,6 +936,9 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
             CheckpointCommand(
                 command=str(checkpoint.get("command") or ""),  # type: ignore[arg-type]
                 confirmed_config=deepcopy(dict(checkpoint.get("confirmed_config") or {})),
+                preserve_remaining_actions=bool(
+                    checkpoint.get("preserve_remaining_actions")
+                ),
             )
             if isinstance(checkpoint, Mapping)
             else None
