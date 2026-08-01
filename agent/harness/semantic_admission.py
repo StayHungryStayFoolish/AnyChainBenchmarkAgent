@@ -503,11 +503,7 @@ def _validate_action_source_grounding(
                 )
             continue
         units = _source_units_for_action(payload, index)
-        if not any(
-            source in evidence_source
-            for unit in units
-            for evidence_source in _semantic_unit_evidence_sources(unit)
-        ):
+        if not _source_evidence_is_grounded(source, units):
             errors.append(f"action {index} source_evidence is not an exact mapped-unit quote")
             continue
         for value_argument in exact_arguments:
@@ -545,6 +541,26 @@ def _semantic_unit_evidence_sources(
             str(unit.get("resolution_evidence") or ""),
         )
         if value
+    )
+
+
+def _source_evidence_is_grounded(
+    source: str,
+    units: list[dict[str, Any]],
+) -> bool:
+    """Accept one unit quote or the exact ordered span of all bound units."""
+
+    if any(
+        source in evidence_source
+        for unit in units
+        for evidence_source in _semantic_unit_evidence_sources(unit)
+    ):
+        return True
+    original_sources = [str(unit.get("source_text") or "") for unit in units]
+    return bool(
+        len(original_sources) > 1
+        and all(original_sources)
+        and source == "".join(original_sources)
     )
 
 

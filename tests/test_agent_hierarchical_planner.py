@@ -1367,6 +1367,72 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             validation.errors,
         )
 
+    def test_multi_unit_action_accepts_exact_ordered_source_span(self) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "region 是 us-1，zone 是 us-1-z；"
+        region_source = "region 是 us-1，"
+        zone_source = "zone 是 us-1-z；"
+        candidate = {
+            "actions": [{
+                "type": "propose_config_values",
+                "source_format": "prose",
+                "config_values": {
+                    "CLOUD_REGION": "us-1",
+                    "CLOUD_ZONE": "us-1-z",
+                },
+                "source_evidence": text,
+            }],
+            "semantic_units": [
+                {
+                    "unit_id": "region-unit",
+                    "clause_id": "clause-1",
+                    "start": 0,
+                    "end": len(region_source),
+                    "source_text": region_source,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "region value",
+                },
+                {
+                    "unit_id": "zone-unit",
+                    "clause_id": "clause-1",
+                    "start": len(region_source),
+                    "end": len(text),
+                    "source_text": zone_source,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "zone value",
+                },
+            ],
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate, ensure_ascii=False),
+            new_state("multi-unit-source-span", language="zh"),
+            segment_user_turn(text),
+            pending_choice_unit_ids=frozenset(),
+        )
+
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_multi_unit_source_span_rejects_foreign_or_reordered_text(self) -> None:
+        from agent.harness.semantic_admission import _source_evidence_is_grounded
+
+        units = [
+            {"unit_id": "one", "source_text": "alpha;"},
+            {"unit_id": "two", "source_text": "beta"},
+        ]
+
+        self.assertTrue(_source_evidence_is_grounded("alpha;beta", units))
+        self.assertFalse(
+            _source_evidence_is_grounded("alpha;foreign;beta", units)
+        )
+        self.assertFalse(_source_evidence_is_grounded("betaalpha;", units))
+        self.assertFalse(_source_evidence_is_grounded("alpha;", units[1:]))
+
     def test_final_admission_allows_structured_rpc_endpoint_and_evidence(self) -> None:
         from agent.harness.domains.chain_rpc_questions import (
             _endpoint_validation_question,
