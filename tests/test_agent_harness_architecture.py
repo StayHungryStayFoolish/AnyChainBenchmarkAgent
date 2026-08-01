@@ -541,6 +541,50 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertEqual(spec.required_state_path, ())
         self.assertNotIn("change_chain", ACTION_BY_TYPE)
 
+    def test_stage_b_chain_context_does_not_expose_canonical_alias_catalog(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _stage_b_payload
+
+        source = "我需要换成 BNB"
+        payload = _stage_b_payload(
+            {
+                "chain_identity": {
+                    "raw": "solana",
+                    "canonical": "solana",
+                    "status": "confirmed",
+                },
+                "pending_question": {},
+            },
+            "chain_rpc",
+            frozenset({"chain_identity"}),
+            ({
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "reason": "source-grounded chain selection",
+            },),
+            ("unit-1",),
+        )
+
+        self.assertNotIn("registered_semantic_value_domains", payload)
+        self.assertEqual(payload["semantic_units"][0]["source_text"], source)
+        choose_chain = next(
+            row
+            for row in payload["owner_action_schema"]
+            if row["type"] == "choose_chain"
+        )
+        self.assertIn("exact user-supplied raw chain identity", choose_chain["purpose"])
+        self.assertEqual(
+            choose_chain["open_identity_grounding_arguments"],
+            ["chain_text", "chain_candidates"],
+        )
+
     def test_grounded_mutation_requires_three_member_semantic_jury(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission

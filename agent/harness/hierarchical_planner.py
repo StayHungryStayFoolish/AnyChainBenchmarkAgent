@@ -3368,9 +3368,6 @@ def _stage_b_payload(
             for row in group_schema()
             if row["name"] in groups
         ],
-        "registered_semantic_value_domains": list(
-            registered_semantic_value_domains()
-        ),
         "pending_question": dict(state.get("pending_question") or {}),
         "owner_state": owner_workflow_snapshot(state, owner, groups=groups),
     }
