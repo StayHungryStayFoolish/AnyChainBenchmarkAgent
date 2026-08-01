@@ -1556,11 +1556,7 @@ def _semantic_action_purpose(
         ]
         if len(candidates) > 1:
             return "Ask the user to resolve the exact finite chain candidate set supplied in this source unit."
-        return (
-            "Select the exact source-supplied chain as the current benchmark "
-            "target; authoritative workflow state decides whether this is the "
-            "first selection or a replacement requiring confirmation."
-        )
+        return "Select the exact source-supplied named chain identity as the current benchmark target."
     if str(action.get("type") or "") == "rpc_catalog_command":
         command = str(action.get("catalog_command") or "")
         return {

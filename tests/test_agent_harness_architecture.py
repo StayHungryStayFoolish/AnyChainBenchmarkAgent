@@ -515,6 +515,32 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertTrue(admission.consensus_required)
         self.assertEqual(provider.complete.call_count, 2)
 
+    def test_canonical_chain_selection_purpose_is_lifecycle_neutral(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.semantic_admission import _semantic_action_purpose
+
+        action = {
+            "type": "choose_chain",
+            "chain_text": "BNB",
+            "source_evidence": "BNB",
+        }
+        spec = ACTION_BY_TYPE["choose_chain"]
+        initial_state = {"chain_identity": {}}
+        replacement_state = {
+            "chain_identity": {
+                "raw": "solana",
+                "canonical": "solana",
+                "status": "confirmed",
+            },
+        }
+
+        self.assertEqual(
+            _semantic_action_purpose(action, spec.purpose, initial_state),
+            _semantic_action_purpose(action, spec.purpose, replacement_state),
+        )
+        self.assertEqual(spec.required_state_path, ())
+        self.assertNotIn("change_chain", ACTION_BY_TYPE)
+
     def test_grounded_mutation_requires_two_independent_admissions(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission

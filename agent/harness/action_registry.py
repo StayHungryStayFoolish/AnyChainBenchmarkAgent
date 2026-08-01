@@ -560,7 +560,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "choose_chain",
         "chain_rpc",
-        "Select a user-supplied raw chain as the current benchmark target, whether this is the first selection or a replacement, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, replacement confirmation, invalidation, and protocol research belong to the chain-identity domain after this action.",
+        "Select the exact user-supplied raw chain identity as the current benchmark target, or preserve multiple user-supplied candidates for typed disambiguation without choosing silently.",
         ("chain_text", "chain_candidates", "source_evidence"),
         20,
         "chain_identity",
@@ -574,7 +574,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         semantic_value_representative=True,
         entry_intake=True,
-        entry_intake_purpose="Enter chain identity selection or replacement from any active workflow group.",
+        entry_intake_purpose="Enter source-grounded chain target selection from any active workflow group.",
         entry_intake_value_arguments=("chain_text", "chain_candidates"),
         validator=_validate_chain_selection,
     ),
