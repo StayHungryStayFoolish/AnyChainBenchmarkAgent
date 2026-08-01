@@ -3666,6 +3666,43 @@ def _stage_b_review_output_token_budget(
     return min(12000, max(1800, 1400 + (600 * verdict_rows)))
 
 
+def _stage_b_semantic_review_projection(
+    payload: Mapping[str, Any],
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project typed evidence without model-authored explanatory rationales."""
+
+    semantic_units = [
+        {
+            key: value
+            for key, value in dict(unit).items()
+            if key != "reason"
+        }
+        for unit in payload.get("semantic_units") or []
+        if isinstance(unit, Mapping)
+    ]
+    bindings = [
+        {
+            key: value
+            for key, value in dict(binding).items()
+            if key != "reason"
+        }
+        for binding in document.get("bindings") or []
+        if isinstance(binding, Mapping)
+    ]
+    return {
+        "semantic_units": semantic_units,
+        "candidate": {
+            "actions": [
+                dict(action)
+                for action in document.get("actions") or []
+                if isinstance(action, Mapping)
+            ],
+            "bindings": bindings,
+        },
+    }
+
+
 def _review_owner_document_semantics(
     provider: Any,
     payload: Mapping[str, Any],
@@ -3680,15 +3717,14 @@ def _review_owner_document_semantics(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    projection = _stage_b_semantic_review_projection(payload, document)
     review_payload = {
         "owner": owner,
-        "semantic_units": [
-            dict(unit) for unit in payload.get("semantic_units") or []
-        ],
+        "semantic_units": projection["semantic_units"],
         "owner_action_schema": [
             dict(row) for row in payload.get("owner_action_schema") or []
         ],
-        "candidate": dict(document),
+        "candidate": projection["candidate"],
         "proposal_hash": proposal_hash,
     }
     prompt = _stage_b_semantic_review_prompt(owner)

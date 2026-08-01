@@ -3332,6 +3332,92 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertIn("changed proposal hash", "; ".join(errors))
         self.assertFalse(receipt["valid"])
 
+    def test_stage_b_semantic_review_excludes_model_authored_rationales(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_owner_document_semantics,
+        )
+
+        payload = {
+            "owner": "chain_rpc",
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "do not use alpha",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+                "reason": "incorrectly claims choose_target_mode",
+            }],
+            "owner_action_schema": [{
+                "type": "request_target_mode_selection",
+                "purpose": "registry-owned typed intake",
+            }],
+        }
+        document = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "do not use alpha",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "untrusted binding rationale",
+            }],
+            "reason": "untrusted document rationale",
+        }
+        captured: dict[str, object] = {}
+
+        def review(*_args, **kwargs):
+            captured.update(kwargs["request_payload"])
+            return json.dumps({
+                "proposal_hash": kwargs["request_payload"]["proposal_hash"],
+                "unit_verdicts": [{
+                    "unit_id": "unit-1",
+                    "verdict": "admit",
+                    "reason": "typed source and route authorize the intake",
+                }],
+                "action_verdicts": [{
+                    "action_index": 0,
+                    "verdict": "admit",
+                    "reason": "typed candidate matches the registry purpose",
+                }],
+                "reason": "admitted",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            errors, _size, receipt = _review_owner_document_semantics(
+                object(), payload, document
+            )
+
+        self.assertEqual(errors, ())
+        self.assertTrue(receipt["valid"])
+        self.assertNotIn("reason", captured["semantic_units"][0])
+        self.assertEqual(
+            captured["semantic_units"][0]["source_text"],
+            "do not use alpha",
+        )
+        self.assertEqual(
+            captured["semantic_units"][0]["owner_routes"],
+            payload["semantic_units"][0]["owner_routes"],
+        )
+        candidate = captured["candidate"]
+        self.assertNotIn("reason", candidate)
+        self.assertNotIn("reason", candidate["bindings"][0])
+        self.assertEqual(candidate["actions"], document["actions"])
+        self.assertEqual(candidate["bindings"][0]["action_indexes"], [0])
+        self.assertEqual(
+            captured["owner_action_schema"],
+            payload["owner_action_schema"],
+        )
+        self.assertEqual(len(captured["proposal_hash"]), 64)
+
     def test_single_reachable_stage_b_action_needs_no_extra_review(self) -> None:
         from agent.harness.hierarchical_planner import (
             _owner_document_requires_semantic_review,
