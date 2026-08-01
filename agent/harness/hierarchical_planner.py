@@ -2887,10 +2887,15 @@ def _pending_entailment_prompt() -> str:
         "question irrelevant. A natural-language answer is valid only when it "
         "commits to one declared option or directly authorizes the pending effect. "
         "Return exactly one JSON object with exactly claim_hash, verdict, "
-        "evidence_quote, and reason. Copy claim_hash exactly. verdict must be "
+        "selected_value, evidence_quote, and reason. Copy claim_hash exactly. "
+        "verdict must be "
         "answers, different_request, or uncertain. For answers, evidence_quote "
         "must be the shortest non-empty exact substring that commits to the pending "
-        "answer. When the pending question accepts a manual value, the quote must "
+        "answer, and selected_value must copy the exact JSON value of the one "
+        "declared pending_question option selected by that source. Do not return "
+        "an option id, label, number, or paraphrase as selected_value. For "
+        "different_request or uncertain, selected_value must be null. When the "
+        "pending question accepts a manual value, the quote must "
         "be the shortest exact source substring containing only the proposed value "
         "that can be validated against that question; do not include its field "
         "label or sibling demands. For other verdicts it must be an exact non-empty substring showing "
@@ -3080,7 +3085,7 @@ def _review_stage_a_pending_entailment(
             ).encode("utf-8")
         ).hexdigest()
         payload = {"claim_hash": claim_hash, **claim_payload}
-        admitted_members = 0
+        option_votes: dict[str, int] = defaultdict(int)
         for _member in range(3):
             request_sizes.append(_wire_size(prompt, payload))
             response = request_semantic_compilation(
@@ -3097,29 +3102,31 @@ def _review_stage_a_pending_entailment(
             if not isinstance(verdict, Mapping) or set(verdict) != {
                 "claim_hash",
                 "verdict",
+                "selected_value",
                 "evidence_quote",
                 "reason",
             }:
                 continue
             evidence = str(verdict.get("evidence_quote") or "")
+            verdict_name = str(verdict.get("verdict") or "")
+            selected_value = verdict.get("selected_value")
             if (
                 str(verdict.get("claim_hash") or "") != claim_hash
-                or str(verdict.get("verdict") or "")
-                not in {"answers", "different_request", "uncertain"}
+                or verdict_name not in {"answers", "different_request", "uncertain"}
                 or not evidence
                 or evidence not in claim["proposed_source"]
                 or not str(verdict.get("reason") or "").strip()
             ):
                 continue
-            if (
-                str(verdict.get("verdict") or "") == "answers"
-                and (
-                    pending.get("manual_input_allowed") is not True
-                    or value_satisfies_pending_contract(evidence, pending)
-                )
-            ):
-                admitted_members += 1
-        if admitted_members < 2:
+            if verdict_name != "answers":
+                if selected_value is not None:
+                    continue
+                continue
+            selected_identity = pending_value_identity(selected_value, pending)
+            if not selected_identity.startswith("option:"):
+                continue
+            option_votes[selected_identity] += 1
+        if max(option_votes.values(), default=0) < 2:
             errors.append(
                 "Stage A pending-answer entailment quorum rejected unit: "
                 f"{claim['unit_id']}"

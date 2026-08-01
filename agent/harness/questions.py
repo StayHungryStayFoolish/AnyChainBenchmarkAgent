@@ -1262,20 +1262,33 @@ def action_settles_pending_contract(
     return False
 
 
+def _json_wire_identity(value: Any) -> str | None:
+    """Preserve JSON wire type when comparing signed contract values."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def pending_value_identity(value: Any, question: dict[str, Any]) -> str:
     """Return one contract-owned identity for an already valid value."""
 
     if not value_satisfies_pending_contract(value, question):
         return ""
+    candidate = _json_wire_identity(value)
     for option in question.get("options") or []:
-        if isinstance(option, dict) and option.get("value") == value:
-            return "option:" + json.dumps(
-                option.get("value"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+        if (
+            candidate is not None
+            and isinstance(option, dict)
+            and _json_wire_identity(option.get("value")) == candidate
+        ):
+            return "option:" + candidate
     validation = dict(question.get("validation") or {})
     value_type = str(validation.get("value_type") or "")
     raw = _strip_scalar(str(value))
@@ -1548,7 +1561,13 @@ def coerce_pending_answer(text: str, question: dict[str, Any]) -> Any:
 
 
 def pending_option_value_exists(value: Any, question: dict[str, Any]) -> bool:
-    return any(option.get("value") == value for option in question.get("options") or [])
+    candidate = _json_wire_identity(value)
+    return any(
+        candidate is not None
+        and isinstance(option, dict)
+        and _json_wire_identity(option.get("value")) == candidate
+        for option in question.get("options") or []
+    )
 
 
 def render_question(question: dict[str, Any], language: str) -> str:

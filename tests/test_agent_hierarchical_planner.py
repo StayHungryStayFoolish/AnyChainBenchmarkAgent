@@ -6466,6 +6466,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             return json.dumps({
                 "claim_hash": claim_hash,
                 "verdict": "different_request",
+                "selected_value": None,
                 "evidence_quote": "different chain",
                 "reason": "the source requests another workflow",
             })
@@ -6510,9 +6511,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         votes = iter(("answers", "different_request", "answers"))
 
         def response(*_args, **kwargs):
+            verdict = next(votes)
             return json.dumps({
                 "claim_hash": kwargs["request_payload"]["claim_hash"],
-                "verdict": next(votes),
+                "verdict": verdict,
+                "selected_value": True if verdict == "answers" else None,
                 "evidence_quote": "clear the workflow",
                 "reason": "independent entailment verdict",
             })
@@ -6618,6 +6621,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             return json.dumps({
                 "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
+                "selected_value": True,
                 "evidence_quote": "clear the workflow",
                 "reason": "the option effect is explicit",
             })
@@ -6633,6 +6637,116 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(compiler.call_count, 3)
         self.assertEqual(len(sizes), 3)
+
+    def test_pending_entailment_jury_admits_paraphrase_for_one_signed_value(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "不再添加 method"
+        payload = {
+            "pending_question": {
+                "id": "new_chain_method_continue",
+                "group": "chain_rpc_configuration",
+                "options": [
+                    {"id": "add", "value": "add_another"},
+                    {"id": "finish", "value": "finish"},
+                ],
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_rpc_configuration",
+            }],
+        }]
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "selected_value": "finish",
+                "evidence_quote": source,
+                "reason": "the user declines another method",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+
+    def test_pending_entailment_jury_rejects_conflicting_or_invented_values(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "Proceed with one of those choices."
+        payload = {
+            "pending_question": {
+                "id": "choice",
+                "group": "opening",
+                "options": [
+                    {"id": "yes", "value": True},
+                    {"id": "one", "value": 1},
+                ],
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+        }]
+
+        for name, selected_values in (
+            ("conflicting", (True, 1, None)),
+            ("invented", ("yes", "yes", "yes")),
+        ):
+            votes = iter(selected_values)
+
+            def response(*_args, **kwargs):
+                selected = next(votes)
+                return json.dumps({
+                    "claim_hash": kwargs["request_payload"]["claim_hash"],
+                    "verdict": "uncertain" if selected is None else "answers",
+                    "selected_value": selected,
+                    "evidence_quote": source,
+                    "reason": "independent entailment verdict",
+                })
+
+            with self.subTest(name=name), patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=response,
+            ):
+                errors, sizes = _review_stage_a_pending_entailment(
+                    object(), payload, partition
+                )
+
+            self.assertTrue(any("quorum rejected" in error for error in errors))
+            self.assertEqual(len(sizes), 3)
+
+    def test_pending_option_identity_preserves_json_wire_type(self) -> None:
+        from agent.harness.questions import pending_option_value_exists
+
+        pending = {"options": [{"id": "one", "value": 1}]}
+
+        self.assertTrue(pending_option_value_exists(1, pending))
+        self.assertFalse(pending_option_value_exists(True, pending))
 
     def test_explicit_scope_jury_rejects_business_retry_as_session_reset(self) -> None:
         from agent.harness.hierarchical_planner import (
