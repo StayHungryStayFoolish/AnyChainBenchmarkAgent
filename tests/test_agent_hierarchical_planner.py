@@ -45,6 +45,262 @@ def _closed_enum_review_response(payload: dict) -> dict:
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_registered_cross_group_mutation_requires_independent_proposal(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_requires_independent_proposal,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+            },
+            {
+                "unit_id": "unit-2",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+            },
+        ]
+        payload = {
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{
+                "target_group": "target_mode",
+                "value": "fake-node",
+            }],
+        }
+
+        self.assertTrue(
+            _partition_requires_independent_proposal(partition, payload)
+        )
+
+    def test_registered_value_consultation_does_not_require_mutation_consensus(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_requires_independent_proposal,
+        )
+
+        payload = {
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{
+                "target_group": "target_mode",
+                "value": "fake-node",
+            }],
+        }
+        consultation = [{
+            "unit_id": "unit-1",
+            "operation": "consultation",
+            "owner_routes": [{"owner": "orientation", "group": "target_mode"}],
+        }]
+        same_group_mutation = [{
+            "unit_id": "unit-2",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+        }]
+
+        self.assertFalse(
+            _partition_requires_independent_proposal(consultation, payload)
+        )
+        self.assertFalse(
+            _partition_requires_independent_proposal(same_group_mutation, payload)
+        )
+
+    def test_stage_a_convergence_receives_registered_value_authority(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _select_stage_a_proposal
+
+        primary = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "fake-node",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "chain_rpc", "group": "target_mode"}],
+            "reason": "registered mode request",
+        }]
+        secondary = [{
+            **primary[0],
+            "reason": "independent registered mode request",
+        }]
+        stage_a_payload = {
+            "user_text": "fake-node test",
+            "clauses": [{"clause_id": "clause-1", "text": "fake-node test"}],
+            "pending_question": {"group": "chain_identity"},
+            "pending_barrier_contract": {},
+            "pending_typed_candidates": [],
+            "contract_proven_pending_prefixes": [],
+            "registered_semantic_value_domains": [{
+                "target_group": "target_mode",
+                "value": "fake-node",
+            }],
+            "registered_value_mentions": [{
+                "target_group": "target_mode",
+                "value": "fake-node",
+            }],
+            "groups": [],
+            "universal_operations": ["domain_request"],
+            "universal_operation_purposes": {"domain_request": "mutate"},
+            "universal_owner_action_purposes": {},
+        }
+        captured: dict = {}
+
+        def converge(_provider, *, request_payload, **_kwargs):
+            captured.update(request_payload)
+            return json.dumps({
+                "selected_proposal": "primary",
+                "primary_hash": request_payload["primary"]["hash"],
+                "secondary_hash": request_payload["secondary"]["hash"],
+                "reason": "the primary preserves registered value ownership",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=converge,
+        ):
+            selected, errors, _sizes, receipt = _select_stage_a_proposal(
+                object(), stage_a_payload, primary, secondary
+            )
+
+        self.assertEqual(selected, primary)
+        self.assertEqual(errors, ())
+        self.assertTrue(receipt["valid"])
+        self.assertEqual(
+            captured["registered_value_mentions"],
+            stage_a_payload["registered_value_mentions"],
+        )
+        self.assertEqual(
+            captured["registered_semantic_value_domains"],
+            stage_a_payload["registered_semantic_value_domains"],
+        )
+
+    def test_cross_group_registered_value_arbitrates_competing_open_identity(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "fake-node test"
+        wrong = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "fake-node ",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "target_mode",
+                    }],
+                    "reason": "registered mode request",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "test",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "chain_identity",
+                    }],
+                    "reason": "incorrect open identity",
+                },
+            ],
+            "reason": "competing interpretation",
+        }
+        corrected = {
+            "semantic_units": [
+                wrong["semantic_units"][0],
+                {
+                    **wrong["semantic_units"][1],
+                    "operation": "context",
+                    "owner_routes": [],
+                    "reason": "operation framing supports the mode request",
+                },
+            ],
+            "reason": "framing interpretation",
+        }
+
+        def admission(units, *, support: bool):
+            return {
+                "unit_verdicts": [
+                    {
+                        "unit_id": "unit-1",
+                        "verdict": "complete",
+                        "supports_unit_id": "",
+                        "reason": "registered mode request is complete",
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "verdict": "redundant" if support else "complete",
+                        "supports_unit_id": "unit-1" if support else "",
+                        "reason": "framing support" if support else "named identity",
+                    },
+                ],
+                "clause_verdicts": [{
+                    "clause_id": "clause-1",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "the complete clause is represented",
+                }],
+                "reason": "reviewed",
+            }
+
+        outputs = iter((
+            json.dumps(wrong),
+            json.dumps(admission(wrong["semantic_units"], support=False)),
+            json.dumps(corrected),
+            json.dumps(admission(corrected["semantic_units"], support=True)),
+        ))
+
+        def compile_semantics(_provider, *, system_prompt, request_payload, **_kwargs):
+            if "proposal convergence authority" in system_prompt:
+                return json.dumps({
+                    "selected_proposal": "secondary",
+                    "primary_hash": request_payload["primary"]["hash"],
+                    "secondary_hash": request_payload["secondary"]["hash"],
+                    "reason": "generic framing is not an independently named identity",
+                })
+            return next(outputs)
+
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=compile_semantics,
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(result["admission_calls"], 3)
+        self.assertEqual(compiler.call_count, 5)
+        self.assertEqual(
+            [row["groups"] for row in result["owner_requests"]],
+            [["target_mode"]],
+        )
+
     def test_stage_a_output_budget_scales_with_structured_atom_count(self) -> None:
         from agent.harness.hierarchical_planner import (
             _stage_a_output_token_budget,

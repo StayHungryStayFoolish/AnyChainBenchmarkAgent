@@ -503,13 +503,60 @@ def _partition_requires_independent_proposal(
         for unit in partition
     ):
         return True
+    payload = stage_a_payload or {}
+    pending_group = str(
+        (payload.get("pending_question") or {}).get("group") or ""
+    )
+    registered_cross_group_mutation_groups = {
+        str(mention.get("target_group") or "")
+        for mention in payload.get("registered_value_mentions") or ()
+        if isinstance(mention, Mapping)
+        and str(mention.get("target_group") or "")
+        and str(mention.get("target_group") or "") != pending_group
+    }
+    has_registered_cross_group_mutation = bool(
+        registered_cross_group_mutation_groups
+    ) and any(
+        str(unit.get("operation") or "") == "domain_request"
+        and any(
+            isinstance(route, Mapping)
+            and str(route.get("group") or "")
+            in registered_cross_group_mutation_groups
+            for route in unit.get("owner_routes") or ()
+        )
+        for unit in partition
+    )
+    has_competing_open_identity = any(
+        str(unit.get("operation") or "") == "domain_request"
+        and any(
+            isinstance(route, Mapping)
+            and str(route.get("group") or "") == pending_group
+            and any(
+                spec.owner == str(route.get("owner") or "")
+                and spec.open_identity_grounding_arguments
+                and action_spec_serves_route(
+                    spec,
+                    operation="domain_request",
+                    group=pending_group,
+                )
+                for spec in ACTION_SPECS
+            )
+            for route in unit.get("owner_routes") or ()
+        )
+        for unit in partition
+    )
+    if has_registered_cross_group_mutation and has_competing_open_identity:
+        # A registered value that interrupts another group's signed question
+        # is semantically high risk: neighboring framing can otherwise be
+        # mistaken for a manual value owned by the pending group. Require a
+        # second complete proposal before either interpretation is executable.
+        return True
     has_semantic_pending_claim = any(
         str(unit.get("operation") or "") == "pending_answer"
         for unit in partition
     )
     if not has_semantic_pending_claim:
         return False
-    payload = stage_a_payload or {}
     return not (
         payload.get("contract_proven_pending_prefixes")
         or payload.get("pending_typed_candidates")
@@ -552,6 +599,13 @@ def _stage_a_convergence_prompt() -> str:
         "complete. When an operation has several registered owners, compare each "
         "proposal's owner with universal_owner_action_purposes and reject a route "
         "whose owner has no action purpose matching the exact source demand. A "
+        "registered_value_mentions row proves the exact value and its owner, but "
+        "not mutation intent. When a proposal routes that registered value as a "
+        "present domain request, adjacent operation framing is support unless it "
+        "independently supplies another named identity, value, question, "
+        "navigation, analysis request, or mutation. Do not reinterpret generic "
+        "framing as an open identity merely because an identity question is "
+        "pending. Conversely, preserve a genuinely named sibling identity. A "
         "request to ingest, diagnose, or explain logs, errors, traces, diagnostics, "
         "failures, or other evidence is evidence_analysis rather than generic "
         "consultation even when the evidence has not been supplied yet. A "
@@ -641,7 +695,16 @@ def _select_stage_a_proposal(
         "contract_proven_pending_prefixes": list(
             stage_a_payload.get("contract_proven_pending_prefixes") or []
         ),
+        "registered_semantic_value_domains": list(
+            stage_a_payload.get("registered_semantic_value_domains") or []
+        ),
+        "registered_value_mentions": list(
+            stage_a_payload.get("registered_value_mentions") or []
+        ),
         "groups": stage_a_payload["groups"],
+        "universal_operations": list(
+            stage_a_payload.get("universal_operations") or []
+        ),
         "universal_operation_purposes": dict(
             stage_a_payload.get("universal_operation_purposes")
             or SEMANTIC_OPERATION_PURPOSES
