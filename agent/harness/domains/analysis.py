@@ -217,21 +217,26 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
             completion=result.completion,
             stop_after_response=result.stop_after_response,
         )
+    if action.action_type == "request_evidence_analysis":
+        return open_freeform_evidence_collection(
+            state,
+            question=str(
+                action.arguments.get("question")
+                or state.get("last_user_input")
+                or ""
+            ),
+            consumed_action_id=action.action_id,
+        )
     if action.action_type == "analyze_evidence":
         evidence = str(action.arguments.get("evidence") or "").strip()
         collecting = state.get("evidence_collection") or {}
         if collecting:
             evidence = "\n".join(str(item) for item in collecting.get("lines") or [] if str(item).strip())
         if not evidence:
-            return open_freeform_evidence_collection(
-                state,
-                question=str(
-                    action.arguments.get("question")
-                    or state.get("last_user_input")
-                    or ""
-                ),
-                consumed_action_id=action.action_id,
-            )
+            return HandlerResult(blocker=_collection_failure(
+                "analyze",
+                "completed_evidence_payload",
+            ))
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
         if not collecting:
             evidence_buffer.append({"text": evidence})

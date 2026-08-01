@@ -6419,7 +6419,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             (
                 "analysis",
                 "report_artifact_analysis",
-                {"type": "analyze_evidence"},
+                {
+                    "type": "analyze_evidence",
+                    "evidence": "RuntimeError: endpoint failed",
+                },
             ),
         )
         for owner, group, action in probes:
@@ -8094,7 +8097,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
 
         self.assertEqual(errors, ())
-        self.assertEqual(payload["actions"], [{"type": "analyze_evidence"}])
+        self.assertEqual(
+            payload["actions"],
+            [{"type": "request_evidence_analysis"}],
+        )
         self.assertEqual(
             payload["bindings"][0]["disposition"],
             "action",

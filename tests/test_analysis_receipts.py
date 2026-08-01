@@ -259,7 +259,7 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         state = self._state("analysis-help")
         action = ActionProposal(
             action_id="analysis-help",
-            action_type="analyze_evidence",
+            action_type="request_evidence_analysis",
             arguments={"question": "Can you analyze a log?"},
             confidence="high",
         )

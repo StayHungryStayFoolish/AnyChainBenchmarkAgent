@@ -558,6 +558,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
         for action_type in (
             "greeting",
             "answer_opening_question",
+            "request_evidence_analysis",
             "analyze_evidence",
             "analyze_report",
         ):

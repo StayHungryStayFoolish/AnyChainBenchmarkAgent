@@ -15369,7 +15369,7 @@ response:
         state["last_user_input"] = "这是日志，你可以帮我分析么？"
 
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
-            resolver.return_value = {"actions": [{"type": "analyze_evidence", "confidence": "high"}]}
+            resolver.return_value = {"actions": [{"type": "request_evidence_analysis", "confidence": "high"}]}
             result = process_turn(state)
 
         text = "\n".join(result.get("visible_response") or [])
@@ -15393,7 +15393,7 @@ response:
         state["last_user_input"] = "这是日志，请分析。"
         with patch(
             "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
-            return_value={"actions": [{"type": "analyze_evidence", "confidence": "high"}]},
+            return_value={"actions": [{"type": "request_evidence_analysis", "confidence": "high"}]},
         ):
             opened = process_turn(state)
 
@@ -18449,8 +18449,15 @@ response:
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "turn_local")
         for action_type in ("choose_target_mode", "set_qps_mode", "propose_config_values"):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "durable")
-        for action_type in ("analyze_evidence", "inspect_failure"):
+        for action_type in (
+            "request_evidence_analysis",
+            "analyze_evidence",
+            "inspect_failure",
+        ):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "turn_local")
+        self.assertTrue(
+            ACTION_BY_TYPE["request_evidence_analysis"].crosses_pending_barrier
+        )
         self.assertTrue(ACTION_BY_TYPE["analyze_evidence"].crosses_pending_barrier)
 
     def test_inferred_review_consultation_is_same_turn_and_preserves_exact_question(self) -> None:

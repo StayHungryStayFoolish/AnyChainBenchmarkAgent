@@ -713,7 +713,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         clauses = tuple(segment_user_turn(text))
         candidate = json.dumps({
             "actions": [{
-                "type": "analyze_evidence",
+                "type": "request_evidence_analysis",
             }],
             "semantic_units": [{
                 "unit_id": "unit-1",
