@@ -420,6 +420,7 @@ class ActionSpec:
     semantic_value_grounding_arguments: tuple[str, ...] = ()
     open_identity_grounding_arguments: tuple[str, ...] = ()
     semantic_value_representative: bool = False
+    explicit_scope_authorization: bool = False
     exact_source_value_arguments: tuple[str, ...] = ()
     pending_option_semantic: str = ""
     option_navigation_groups: tuple[str, ...] = ()
@@ -496,6 +497,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         replaces_deferred_queue=True,
         semantic_operations=("administrative",),
         route_groups=("opening",),
+        explicit_scope_authorization=True,
     ),
     ActionSpec(
         "reset_session",
@@ -1503,6 +1505,7 @@ def action_registry_contract_hash() -> str:
                 spec.open_identity_grounding_arguments
             ),
             "semantic_value_representative": spec.semantic_value_representative,
+            "explicit_scope_authorization": spec.explicit_scope_authorization,
             "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_option_semantic": spec.pending_option_semantic,
             "option_navigation_groups": list(spec.option_navigation_groups),

@@ -6474,6 +6474,184 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(sizes, ())
 
+    def test_explicit_scope_jury_rejects_business_retry_as_session_reset(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_explicit_scope_authorization,
+        )
+
+        source = "I need to benchmark a different chain."
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+        }]
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "not_authorized",
+                "evidence_quote": "different chain",
+                "reason": "one business target is changing, not the session",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ) as compiler:
+            errors, sizes, rejected = (
+                _review_stage_a_explicit_scope_authorization(
+                    object(), partition
+                )
+            )
+
+        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(any("quorum rejected" in error for error in errors))
+        self.assertEqual(rejected[0]["operation"], "administrative")
+        self.assertNotIn("protected_action_purposes", rejected[0])
+
+    def test_explicit_scope_jury_admits_explicit_complete_session_reset(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_explicit_scope_authorization,
+        )
+
+        source = "Clear the complete workflow session and start over."
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+        }]
+        votes = iter(("authorized", "not_authorized", "authorized"))
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": next(votes),
+                "evidence_quote": "complete workflow session",
+                "reason": "independent complete-scope verdict",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes, rejected = (
+                _review_stage_a_explicit_scope_authorization(
+                    object(), partition
+                )
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(rejected, ())
+
+    def test_stage_a_replans_after_protected_scope_rejection(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("scope-replan", language="en")
+        state["pending_question"] = {
+            "id": "reset_confirm",
+            "group": "opening",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "value": True},
+                {"id": "no", "value": False},
+            ],
+        }
+        source = "I need to benchmark a different chain."
+        primary = [{
+            "unit_id": "unit-primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+        }]
+        destructive = [{
+            "unit_id": "unit-destructive",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+        }]
+        replacement = [{
+            "unit_id": "unit-replacement",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+        }]
+        rejected_claim = ({
+            "unit_id": "unit-destructive",
+            "clause_id": "clause-1",
+            "proposed_source": source,
+            "operation": "administrative",
+            "owner": "orientation",
+            "group": "opening",
+        },)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                side_effect=[
+                    (primary, (), (101,)),
+                    (destructive, (), (102,)),
+                    (replacement, (), (103,)),
+                ],
+            ) as proposals,
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_partition",
+                side_effect=[
+                    ((), (201,), frozenset(), True),
+                    ((), (202,), frozenset(), True),
+                    ((), (203,), frozenset(), True),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_stage_a_pending_entailment",
+                side_effect=[
+                    (("pending claim rejected",), (301, 302, 303)),
+                    ((), ()),
+                    ((), ()),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_stage_a_explicit_scope_authorization",
+                side_effect=[
+                    (("scope rejected",), (401, 402, 403), rejected_claim),
+                    ((), (), ()),
+                ],
+            ),
+        ):
+            document = begin_semantic_partition(state, source)
+
+        self.assertEqual(document["status"], "compile_owner")
+        self.assertEqual(document["source_partition"], replacement)
+        self.assertEqual(proposals.call_count, 3)
+        self.assertEqual(
+            proposals.call_args_list[2].kwargs["rejected_semantic_claims"],
+            rejected_claim,
+        )
+        self.assertEqual(document["owner_requests"], [{
+            "owner": "chain_rpc",
+            "unit_ids": ["unit-replacement"],
+            "groups": ["chain_identity"],
+        }])
+
     def test_stage_a_selects_counterfactual_request_after_pending_claim_rejected(
         self,
     ) -> None:

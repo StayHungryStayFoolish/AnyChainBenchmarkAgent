@@ -228,31 +228,14 @@ def begin_semantic_partition(
             stage_a_admission_sizes,
             redundant_unit_ids,
             primary_review_contract_valid,
-        ) = _stage_a_review_result(
-            _review_stage_a_partition(
-                provider,
-                stage_a_payload,
-                partition,
-                include_contract_valid=True,
-            )
+            _primary_scope_rejections,
+        ) = _review_stage_a_candidate(
+            provider,
+            stage_a_payload,
+            partition,
         )
         document["request_sizes"].extend(stage_a_admission_sizes)
         document["admission_calls"] += len(stage_a_admission_sizes)
-        if not admission_errors:
-            (
-                pending_entailment_errors,
-                pending_entailment_sizes,
-            ) = _review_stage_a_pending_entailment(
-                provider,
-                stage_a_payload,
-                partition,
-            )
-            document["request_sizes"].extend(pending_entailment_sizes)
-            document["admission_calls"] += len(pending_entailment_sizes)
-            admission_errors = tuple(dict.fromkeys((
-                *admission_errors,
-                *pending_entailment_errors,
-            )))
         primary_review_valid = not admission_errors
         if primary_review_valid:
             source_partition, compilation_partition = (
@@ -298,31 +281,60 @@ def begin_semantic_partition(
                 independent_admission_sizes,
                 independent_redundant_unit_ids,
                 _independent_review_contract_valid,
-            ) = _stage_a_review_result(
-                _review_stage_a_partition(
-                    provider,
-                    stage_a_payload,
-                    independent_partition,
-                    include_contract_valid=True,
-                )
+                independent_scope_rejections,
+            ) = _review_stage_a_candidate(
+                provider,
+                stage_a_payload,
+                independent_partition,
             )
             document["request_sizes"].extend(independent_admission_sizes)
             document["admission_calls"] += len(independent_admission_sizes)
-            if not independent_admission_errors:
+            if independent_admission_errors and independent_scope_rejections:
                 (
-                    independent_pending_errors,
-                    independent_pending_sizes,
-                ) = _review_stage_a_pending_entailment(
+                    replacement_partition,
+                    replacement_errors,
+                    replacement_sizes,
+                ) = _request_stage_a_proposal(
                     provider,
                     stage_a_payload,
-                    independent_partition,
+                    clauses,
+                    state,
+                    stage_a_prompt,
+                    independent=True,
+                    rejected_semantic_claims=independent_scope_rejections,
                 )
-                document["request_sizes"].extend(independent_pending_sizes)
-                document["admission_calls"] += len(independent_pending_sizes)
-                independent_admission_errors = tuple(dict.fromkeys((
-                    *independent_admission_errors,
-                    *independent_pending_errors,
-                )))
+                document["request_sizes"].extend(replacement_sizes)
+                document["stage_a_calls"] += len(replacement_sizes)
+                if not replacement_errors:
+                    (
+                        replacement_admission_errors,
+                        replacement_admission_sizes,
+                        replacement_redundant_unit_ids,
+                        _replacement_review_contract_valid,
+                        _replacement_scope_rejections,
+                    ) = _review_stage_a_candidate(
+                        provider,
+                        stage_a_payload,
+                        replacement_partition,
+                    )
+                    document["request_sizes"].extend(replacement_admission_sizes)
+                    document["admission_calls"] += len(replacement_admission_sizes)
+                    if not replacement_admission_errors:
+                        independent_partition = replacement_partition
+                        independent_redundant_unit_ids = (
+                            replacement_redundant_unit_ids
+                        )
+                        independent_admission_errors = ()
+                    else:
+                        independent_admission_errors = tuple(dict.fromkeys((
+                            *independent_admission_errors,
+                            *replacement_admission_errors,
+                        )))
+                else:
+                    independent_admission_errors = tuple(dict.fromkeys((
+                        *independent_admission_errors,
+                        *replacement_errors,
+                    )))
             if independent_admission_errors:
                 document["status"] = "failed"
                 document["errors"] = list(dict.fromkeys((
@@ -442,6 +454,7 @@ def _request_stage_a_proposal(
     prompt: str,
     *,
     independent: bool = False,
+    rejected_semantic_claims: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[dict[str, Any]], tuple[str, ...], tuple[int, ...]]:
     """Build one structurally valid proposal without seeing another proposal."""
 
@@ -461,8 +474,23 @@ def _request_stage_a_proposal(
             "question's effect; otherwise preserve the standalone request under "
             "its registered operation and owner."
         )
+    if rejected_semantic_claims:
+        role_prompt = (
+            f"{role_prompt} The Harness rejected the semantic claims listed in "
+            "rejected_semantic_claims because their registered operation purpose "
+            "and complete scope were not explicitly authorized by the immutable "
+            "source. Return a complete replacement partition of the original "
+            "source. Do not repeat an exact rejected operation/owner/group claim. "
+            "Use another registered purpose only when the source supports it; "
+            "otherwise emit unresolved. The rejection does not authorize you to "
+            "invent a value, route, action, or omitted demand."
+        )
     for attempt in range(2):
         request_payload = dict(stage_a_payload)
+        if rejected_semantic_claims:
+            request_payload["rejected_semantic_claims"] = [
+                dict(claim) for claim in rejected_semantic_claims
+            ]
         request_prompt = role_prompt
         if attempt:
             request_payload["contract_repair"] = {
@@ -2757,6 +2785,55 @@ def _stage_a_review_result(
     return errors, sizes, redundant, not errors
 
 
+def _review_stage_a_candidate(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    frozenset[str],
+    bool,
+    tuple[dict[str, Any], ...],
+]:
+    """Apply the one authoritative Stage A review pipeline to a proposal."""
+
+    errors, sizes, redundant, contract_valid = _stage_a_review_result(
+        _review_stage_a_partition(
+            provider,
+            stage_a_payload,
+            partition,
+            include_contract_valid=True,
+        )
+    )
+    request_sizes = list(sizes)
+    if not errors:
+        pending_errors, pending_sizes = _review_stage_a_pending_entailment(
+            provider,
+            stage_a_payload,
+            partition,
+        )
+        request_sizes.extend(pending_sizes)
+        errors = tuple(dict.fromkeys((*errors, *pending_errors)))
+    rejected_scope_claims: tuple[dict[str, Any], ...] = ()
+    if not errors:
+        scope_errors, scope_sizes, rejected_scope_claims = (
+            _review_stage_a_explicit_scope_authorization(
+                provider,
+                partition,
+            )
+        )
+        request_sizes.extend(scope_sizes)
+        errors = tuple(dict.fromkeys((*errors, *scope_errors)))
+    return (
+        errors,
+        tuple(request_sizes),
+        redundant,
+        contract_valid,
+        rejected_scope_claims,
+    )
+
+
 def _pending_entailment_prompt() -> str:
     """Return the reject-only contract for one semantic pending-answer claim."""
 
@@ -2779,6 +2856,141 @@ def _pending_entailment_prompt() -> str:
         "why the source is not an answer. Never infer an answer from consequence or "
         "convenience."
     )
+
+
+def _explicit_scope_authorization_prompt() -> str:
+    """Return the reject-only contract for protected operation scope."""
+
+    return (
+        "You are the independent explicit-scope authorization auditor for "
+        "AnyChain. You are not a planner and cannot create, choose, route, "
+        "rename, repair, or execute an action. Judge only whether the exact "
+        "proposed_source explicitly authorizes the complete purpose and scope "
+        "of at least one supplied protected_action_purpose. A request to retry, "
+        "replace, reconfigure, or revisit one business domain does not authorize "
+        "clearing or resetting the complete workflow/session. Consequence, "
+        "convenience, current state, and the existence of a pending reset "
+        "question are not authorization. Return exactly one JSON object with "
+        "exactly claim_hash, verdict, evidence_quote, and reason. Copy claim_hash "
+        "exactly. verdict must be authorized, not_authorized, or uncertain. For "
+        "authorized, evidence_quote must be the shortest non-empty exact "
+        "substring that authorizes the complete protected scope. For other "
+        "verdicts it must be an exact non-empty substring showing why that scope "
+        "is not authorized."
+    )
+
+
+def _explicit_scope_claims(
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Project Stage A claims that can reach a protected registry purpose."""
+
+    claims: list[dict[str, Any]] = []
+    for unit in partition:
+        operation = str(unit.get("operation") or "")
+        source = str(unit.get("source_text") or "")
+        for route in unit.get("owner_routes") or ():
+            if not isinstance(route, Mapping):
+                continue
+            owner = str(route.get("owner") or "")
+            group = str(route.get("group") or "")
+            protected = [
+                {
+                    "action_type": spec.action_type,
+                    "purpose": spec.purpose,
+                }
+                for spec in ACTION_SPECS
+                if spec.owner == owner
+                and spec.explicit_scope_authorization
+                and action_spec_serves_route(
+                    spec,
+                    operation=operation,
+                    group=group,
+                )
+            ]
+            if protected:
+                claims.append({
+                    "unit_id": str(unit.get("unit_id") or ""),
+                    "clause_id": str(unit.get("clause_id") or ""),
+                    "proposed_source": source,
+                    "operation": operation,
+                    "owner": owner,
+                    "group": group,
+                    "protected_action_purposes": protected,
+                })
+    return tuple(claims)
+
+
+def _review_stage_a_explicit_scope_authorization(
+    provider: Any,
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[dict[str, Any], ...]]:
+    """Require quorum for a Stage A claim that reaches protected scope."""
+
+    prompt = _explicit_scope_authorization_prompt()
+    request_sizes: list[int] = []
+    errors: list[str] = []
+    rejected: list[dict[str, Any]] = []
+    for claim in _explicit_scope_claims(partition):
+        claim_hash = hashlib.sha256(
+            json.dumps(
+                claim,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {"claim_hash": claim_hash, **claim}
+        admitted_members = 0
+        for _member in range(3):
+            request_sizes.append(_wire_size(prompt, payload))
+            response = request_semantic_compilation(
+                provider,
+                system_prompt=prompt,
+                request_payload=payload,
+                max_tokens=700,
+                reasoning_mode=STRICT_JSON_REASONING_MODE,
+            )
+            try:
+                verdict = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(verdict, Mapping) or set(verdict) != {
+                "claim_hash",
+                "verdict",
+                "evidence_quote",
+                "reason",
+            }:
+                continue
+            evidence = str(verdict.get("evidence_quote") or "")
+            if (
+                str(verdict.get("claim_hash") or "") != claim_hash
+                or str(verdict.get("verdict") or "")
+                not in {"authorized", "not_authorized", "uncertain"}
+                or not evidence
+                or evidence not in claim["proposed_source"]
+                or not str(verdict.get("reason") or "").strip()
+            ):
+                continue
+            if str(verdict.get("verdict") or "") == "authorized":
+                admitted_members += 1
+        if admitted_members < 2:
+            errors.append(
+                "Stage A explicit-scope authorization quorum rejected unit: "
+                f"{claim['unit_id']}"
+            )
+            rejected.append({
+                key: claim[key]
+                for key in (
+                    "unit_id",
+                    "clause_id",
+                    "proposed_source",
+                    "operation",
+                    "owner",
+                    "group",
+                )
+            })
+    return tuple(errors), tuple(request_sizes), tuple(rejected)
 
 
 def _review_stage_a_pending_entailment(

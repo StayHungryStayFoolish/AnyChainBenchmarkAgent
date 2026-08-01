@@ -101,6 +101,7 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "semantic_value_grounding_arguments": list(
             spec.semantic_value_grounding_arguments
         ),
+        "explicit_scope_authorization": spec.explicit_scope_authorization,
         "open_identity_grounding_arguments": list(
             spec.open_identity_grounding_arguments
         ),
