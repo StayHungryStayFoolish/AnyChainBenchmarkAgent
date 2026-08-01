@@ -7382,6 +7382,139 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             for error in repair_errors
         ))
 
+    def test_stage_b_exhausted_enum_repair_preserves_valid_sibling(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-compound-enum-fallback", language="zh")
+        state["target_mode"] = "fake-node"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "我需要换成 eth，",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "reason": "explicit chain replacement",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "source_text": "不使用 fake-node 模式",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+                "reason": "rejects the current mode without selecting another",
+            },
+        ]
+        guessed = {
+            "actions": [
+                {
+                    "type": "change_chain",
+                    "chain_text": "eth",
+                    "source_evidence": "eth",
+                },
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "real-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                },
+            ],
+            "bindings": [
+                {
+                    "unit_id": "unit-1",
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "grounded chain replacement",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "action_indexes": [1],
+                    "disposition": "action",
+                    "reason": "unguarded remaining-mode guess",
+                },
+            ],
+            "reason": "one valid sibling and one ungrounded enum guess",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(guessed), json.dumps(guessed)],
+            ),
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "chain_rpc",
+                frozenset({"chain_identity", "target_mode"}),
+                partition,
+                ("unit-1", "unit-2"),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 2)
+        self.assertEqual(document["actions"][0], guessed["actions"][0])
+        self.assertEqual(
+            document["actions"][1],
+            {
+                "type": "request_target_mode_selection",
+                "source_evidence": "不使用 fake-node 模式",
+            },
+        )
+        self.assertEqual(
+            [binding["action_indexes"] for binding in document["bindings"]],
+            [[0], [1]],
+        )
+
+    def test_stage_b_enum_fallback_refuses_unrelated_validation_error(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _repair_stage_b_closed_enum_intakes,
+        )
+
+        document = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "fake-node",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "unguarded guess",
+            }],
+        }
+
+        repaired = _repair_stage_b_closed_enum_intakes(
+            document,
+            (
+                "Stage B closed-enum grounding quote names only competing "
+                "values: unit-1/choose_target_mode/target_mode",
+                "Stage B chain_rpc binding order or cardinality mismatch",
+            ),
+            owner="chain_rpc",
+            expected_sources={"unit-1": ("不使用 fake-node 模式",)},
+        )
+
+        self.assertIsNone(repaired)
+
     def test_stage_b_accepts_minimal_natural_language_enum_grounding(self) -> None:
         from agent.harness.hierarchical_planner import _validate_owner_document
 

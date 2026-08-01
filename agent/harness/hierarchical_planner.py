@@ -1252,16 +1252,11 @@ def _conservative_closed_enum_intake_repair(
         ]
         if not closed_enum_arguments:
             continue
-        intake_specs = [
-            candidate_spec
-            for candidate_spec in ACTION_SPECS
-            if candidate_spec.incomplete_mutation_intake
-            and candidate_spec.target_group == spec.target_group
-            and set(candidate_spec.required_arguments).issubset(
-                {"source_evidence"}
-            )
-        ]
-        if len(intake_specs) != 1:
+        intake_spec = _unique_incomplete_mutation_intake(
+            owner=spec.owner,
+            target_group=spec.target_group,
+        )
+        if intake_spec is None:
             continue
         owned_units = [
             unit
@@ -1274,7 +1269,7 @@ def _conservative_closed_enum_intake_repair(
         if len(owned_units) != 1:
             continue
         replacement = {
-            "type": intake_specs[0].action_type,
+            "type": intake_spec.action_type,
             "source_evidence": str(
                 owned_units[0].get("source_text") or ""
             ).strip(),
@@ -1285,6 +1280,22 @@ def _conservative_closed_enum_intake_repair(
             continue
         changed = True
     return payload if changed else None
+
+
+def _unique_incomplete_mutation_intake(
+    *,
+    owner: str,
+    target_group: str,
+) -> Any | None:
+    candidates = [
+        spec
+        for spec in ACTION_SPECS
+        if spec.owner == owner
+        and spec.incomplete_mutation_intake
+        and spec.target_group == target_group
+        and set(spec.required_arguments).issubset({"source_evidence"})
+    ]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _turn_clauses(
@@ -3477,9 +3488,113 @@ def _compile_owner_document(
             errors = semantic_errors
         if not errors:
             break
+    if errors:
+        repaired_document = _repair_stage_b_closed_enum_intakes(
+            document,
+            errors,
+            owner=owner,
+            expected_sources=expected_sources,
+        )
+        if repaired_document is not None:
+            document, errors = _validate_owner_document(
+                json.dumps(
+                    repaired_document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                owner,
+                unit_ids,
+                expected_groups=expected_groups,
+                expected_operations=expected_operations,
+                expected_sources=expected_sources,
+                pending_question=dict(state.get("pending_question") or {}),
+            )
     if semantic_receipts:
         document["semantic_review_receipts"] = semantic_receipts
     return document, errors, tuple(request_sizes)
+
+
+def _repair_stage_b_closed_enum_intakes(
+    document: Mapping[str, Any],
+    errors: Sequence[str],
+    *,
+    owner: str,
+    expected_sources: Mapping[str, Sequence[str]],
+) -> dict[str, Any] | None:
+    """Lower only exhausted, ungrounded enum guesses to typed intake.
+
+    The semantic partition already proves that each bound unit is a present
+    mutation request. It does not authorize a concrete enum value that the
+    source names only as a rejected competitor. After bounded model repair is
+    exhausted, the registry's unique intake preserves that request without
+    discarding independently valid sibling actions or guessing an alternative.
+    """
+
+    prefix = "Stage B closed-enum grounding quote names only competing values:"
+    if not errors or any(not str(error).startswith(prefix) for error in errors):
+        return None
+    payload = json.loads(json.dumps(document, ensure_ascii=False, sort_keys=True))
+    actions = payload.get("actions")
+    bindings = payload.get("bindings")
+    if not isinstance(actions, list) or not isinstance(bindings, list):
+        return None
+    units_by_action: dict[int, set[str]] = defaultdict(set)
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            return None
+        unit_id = str(binding.get("unit_id") or "")
+        for index in binding.get("action_indexes") or ():
+            if isinstance(index, int) and not isinstance(index, bool):
+                units_by_action[index].add(unit_id)
+    changed = False
+    for index, raw_action in enumerate(actions):
+        if not isinstance(raw_action, Mapping):
+            continue
+        action = dict(raw_action)
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        owned_units = units_by_action.get(index, set())
+        if spec is None or spec.owner != owner or len(owned_units) != 1:
+            continue
+        unit_id = next(iter(owned_units))
+        sources = tuple(
+            str(source)
+            for source in expected_sources.get(unit_id, ())
+            if str(source)
+        )
+        evidence = str(action.get("source_evidence") or "")
+        quote = next(
+            (source for source in sources if evidence and evidence in source),
+            sources[0] if sources else "",
+        )
+        violates_grounding = any(
+            isinstance(
+                (ACTION_ARGUMENT_SCHEMAS.get(argument) or {}).get("enum"),
+                list,
+            )
+            and closed_enum_quote_names_only_competing_values(
+                exact_value=action.get(argument),
+                enum_values=(ACTION_ARGUMENT_SCHEMAS[argument]["enum"]),
+                quote=quote,
+            )
+            for argument in semantic_grounding_arguments(action)
+        )
+        if not violates_grounding:
+            continue
+        intake_spec = _unique_incomplete_mutation_intake(
+            owner=owner,
+            target_group=spec.target_group,
+        )
+        if intake_spec is None or not quote:
+            return None
+        replacement = {"type": intake_spec.action_type}
+        if "source_evidence" in intake_spec.allowed_arguments:
+            replacement["source_evidence"] = quote
+        try:
+            actions[index] = validate_action_contract(replacement)
+        except ValueError:
+            return None
+        changed = True
+    return payload if changed else None
 
 
 def _owner_document_requires_semantic_review(
