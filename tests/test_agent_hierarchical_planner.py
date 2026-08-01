@@ -3122,7 +3122,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             if "Stage B semantic review authority" in system:
                 reviewer_calls += 1
                 payload = kwargs["request_payload"]
-                verdict = "reject" if reviewer_calls <= 3 else "admit"
+                verdict = "reject"
                 return json.dumps({
                     "proposal_hash": payload["proposal_hash"],
                     "unit_verdicts": [{
@@ -3171,9 +3171,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             document["actions"],
             [{"type": "request_session_reset"}],
         )
-        self.assertEqual(len(document["semantic_review_receipts"]), 2)
-        self.assertEqual(len(sizes), 8)
-        self.assertEqual(compiler.call_count, 8)
+        self.assertEqual(len(document["semantic_review_receipts"]), 1)
+        self.assertEqual(len(sizes), 5)
+        self.assertEqual(compiler.call_count, 5)
+        self.assertEqual(reviewer_calls, 3)
 
     def test_stage_b_semantic_reviewer_malformed_twice_fails_closed(self) -> None:
         from agent.harness.hierarchical_planner import _compile_owner_document

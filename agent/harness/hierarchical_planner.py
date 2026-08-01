@@ -3429,7 +3429,6 @@ def _compile_owner_document(
     document: dict[str, Any] = {}
     errors: tuple[str, ...] = ()
     semantic_receipts: list[dict[str, Any]] = []
-    semantic_review_started = False
     for attempt in range(2):
         request_payload = payload
         request_prompt = prompt
@@ -3468,11 +3467,10 @@ def _compile_owner_document(
             expected_sources=expected_sources,
             pending_question=dict(state.get("pending_question") or {}),
         )
-        if not errors and (
-            semantic_review_started
-            or _owner_document_requires_semantic_review(payload, document)
+        if not errors and _owner_document_requires_semantic_review(
+            payload,
+            document,
         ):
-            semantic_review_started = True
             semantic_errors, semantic_sizes, semantic_receipt = (
                 _review_owner_document_semantics(
                     provider,
