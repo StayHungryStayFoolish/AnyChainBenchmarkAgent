@@ -1537,7 +1537,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             turn_index=5,
             admitted_actions=(
                 {
-                    "type": "change_chain",
+                    "type": "choose_chain",
                     "action_id": "chain-action",
                     "owner": "chain_rpc",
                 },
@@ -3624,7 +3624,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
 
         route_without_intake = _event(
             admitted_actions=({
-                "type": "change_chain",
+                "type": "choose_chain",
                 "action_id": "chain-change",
                 "owner": "chain_rpc",
                 "effect": "state_mutation",
@@ -3634,7 +3634,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         route_without_intake = replace(
             route_without_intake,
-            admitted_action_types=("change_chain",),
+            admitted_action_types=("choose_chain",),
         )
         route_only, route_only_details = POSTCONDITION_EVALUATORS[
             "new_chain_request_routed"

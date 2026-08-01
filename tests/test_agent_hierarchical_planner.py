@@ -1627,7 +1627,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         }
         owner_document = {
             "actions": [{
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "BNB",
                 "source_evidence": "BNB",
             }],
@@ -1676,7 +1676,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner._admitted_action_queue",
-                return_value={"actions": [{"type": "change_chain"}]},
+                return_value={"actions": [{"type": "choose_chain"}]},
             ),
         ):
             result = resolve_product_action_queue(state, text)
@@ -1693,7 +1693,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             owner_compiler.call_args.args[1:3],
             ("chain_rpc", frozenset({"chain_identity"})),
         )
-        self.assertEqual(result["actions"], [{"type": "change_chain"}])
+        self.assertEqual(result["actions"], [{"type": "choose_chain"}])
         self.assertEqual(result["planner_metrics"]["stage_a_calls"], 2)
 
     def test_environment_pending_rejects_known_chain_identity_prose(self) -> None:
@@ -7421,7 +7421,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         guessed = {
             "actions": [
                 {
-                    "type": "change_chain",
+                    "type": "choose_chain",
                     "chain_text": "eth",
                     "source_evidence": "eth",
                 },
@@ -7560,7 +7560,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         candidate = {
             "actions": [
                 {
-                    "type": "change_chain",
+                    "type": "choose_chain",
                     "chain_text": "eth",
                     "source_evidence": "eth",
                 },
@@ -7618,7 +7618,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         candidate = {
             "actions": [{
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "eth",
                 "source_evidence": "eth",
             }],
@@ -8106,7 +8106,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             captured["allowed"],
             frozenset({
-                "change_chain",
                 "choose_adapter_family",
                 "choose_chain",
                 "request_chain_selection",

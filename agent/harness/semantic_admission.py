@@ -955,7 +955,7 @@ def _admitted_action_queue(
         row = action_rows.get(action_ids[index])
         if row is None:
             raise ValueError("admitted immutable plan is missing an action verdict")
-        if action_type in {"choose_chain", "change_chain"}:
+        if action_type == "choose_chain":
             chain_indexes.append(index)
         if action_type in {"choose_target_mode", "queue_workflow_goal"}:
             target_indexes.append(index)
@@ -1548,7 +1548,7 @@ def _semantic_action_purpose(
             f"Answer only the user's independent read-only consultation topic {topic!r}"
             f"{subject_scope}: {topic_purpose} This purpose does not answer a different consultation topic."
         )
-    if action_type in {"choose_chain", "change_chain"}:
+    if action_type == "choose_chain":
         candidates = [
             str(item).strip()
             for item in action.get("chain_candidates") or []
@@ -1556,9 +1556,11 @@ def _semantic_action_purpose(
         ]
         if len(candidates) > 1:
             return "Ask the user to resolve the exact finite chain candidate set supplied in this source unit."
-        if action_type == "change_chain":
-            return "Select the exact source-supplied chain as the requested replacement for the current chain."
-        return "Select the exact source-supplied chain as the benchmark target when no chain is confirmed."
+        return (
+            "Select the exact source-supplied chain as the current benchmark "
+            "target; authoritative workflow state decides whether this is the "
+            "first selection or a replacement requiring confirmation."
+        )
     if str(action.get("type") or "") == "rpc_catalog_command":
         command = str(action.get("catalog_command") or "")
         return {

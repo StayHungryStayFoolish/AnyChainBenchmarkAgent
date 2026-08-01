@@ -51,7 +51,6 @@ CHAIN_RPC_ACTIONS = frozenset(
     {
         "choose_target_mode",
         "choose_chain",
-        "change_chain",
         "choose_adapter_family",
         "set_rpc_mode",
         "rpc_catalog_command",
@@ -421,7 +420,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
         next_state['pending_question'] = {}
         mark_group_reconfigured(next_state, "target_mode")
         return _result(state, next_state, action, response_fragments=tuple(responses))
-    if action_type in {"choose_chain", "change_chain"}:
+    if action_type == "choose_chain":
         raw = normalize_scalar(arguments.get("chain_text"))
         candidate_values = [
             normalize_scalar(item)
@@ -458,7 +457,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
             _preserve_same_chain(next_state, current, responses=responses)
             return _result(state, next_state, action, completion="unchanged", response_fragments=tuple(responses))
         resolution = _resolution_from_arguments(arguments)
-        if action_type == "change_chain" or current:
+        if current:
             _request_chain_change(next_state, raw, arguments, resolution=resolution, responses=responses)
             return _result(state, next_state, action, completion="blocked" if next_state.get("pending_question") else "completed", response_fragments=tuple(responses))
         _apply_chain_candidate(next_state, raw, resolution=resolution, responses=responses)

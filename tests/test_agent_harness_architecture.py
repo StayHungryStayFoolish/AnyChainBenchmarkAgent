@@ -378,7 +378,7 @@ def _confirmation_proposal_admission_fixture() -> tuple[Any, dict[str, Any]]:
 
     source = "Change the chain to BNB."
     action = {
-        "type": "change_chain",
+        "type": "choose_chain",
         "chain_text": "BNB",
         "source_evidence": "BNB",
     }
@@ -389,7 +389,7 @@ def _confirmation_proposal_admission_fixture() -> tuple[Any, dict[str, Any]]:
         "disposition": "action",
         "action_indexes": [0],
     }
-    spec = ACTION_BY_TYPE["change_chain"]
+    spec = ACTION_BY_TYPE["choose_chain"]
     plan = freeze_semantic_plan(
         {"actions": [action], "semantic_units": [unit]},
         action_records=[{
@@ -489,7 +489,7 @@ def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
 
 
 class BoundedSemanticAdmissionTest(unittest.TestCase):
-    def test_confirmation_proposal_uses_one_admission_before_typed_confirmation(
+    def test_canonical_chain_selection_uses_mutation_consensus(
         self,
     ) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
@@ -509,11 +509,11 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             allowed_action_types=ALLOWED_ACTION_TYPES,
         )
 
-        self.assertEqual(ACTION_BY_TYPE["change_chain"].effect, "workflow_navigation")
+        self.assertNotIn("change_chain", ACTION_BY_TYPE)
         self.assertEqual(ACTION_BY_TYPE["choose_chain"].effect, "configuration_mutation")
         self.assertTrue(admission.valid, admission.errors)
-        self.assertFalse(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 1)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 2)
 
     def test_grounded_mutation_requires_two_independent_admissions(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
@@ -824,7 +824,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         source = "Switch to ethereum and do not use fake-node."
         actions = [
             {
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "ethereum",
                 "source_evidence": "Switch to ethereum",
                 "semantic_purpose_verified": True,
@@ -857,7 +857,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertEqual(result.status, "accepted", result.rejections)
         self.assertEqual(
             [action["type"] for action in result.actions],
-            ["change_chain", "request_target_mode_selection"],
+            ["choose_chain", "request_target_mode_selection"],
         )
 
     def test_replacement_intake_receipt_survives_durable_queue_round_trip(
@@ -3015,7 +3015,7 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "confidence": "high",
             },
             {
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "ethereum",
                 "source_evidence": "ethereum",
                 "confidence": "high",
@@ -3300,7 +3300,6 @@ class HarnessArchitectureTest(unittest.TestCase):
             "answer_opening_question": {"topic": "identity"},
             "choose_target_mode": {"target_mode": "fake-node"},
             "choose_chain": {"chain_text": "bsc"},
-            "change_chain": {"chain_text": "bsc"},
             "change_group": {"group": "opening"},
             "set_rpc_mode": {"rpc_mode": "single"},
             "set_qps_mode": {"qps_mode": "quick"},
@@ -4221,7 +4220,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
                         },
                         ActionProposal(
                             "chain-change",
-                            "change_chain",
+                            "choose_chain",
                             {"chain_text": "ethereum"},
                             "high",
                         ),

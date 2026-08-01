@@ -1897,7 +1897,7 @@ def _bound_unknown_chain_resolutions(
             action
             for action in admitted_actions
             if str(action.get("type") or "")
-            in {"choose_chain", "change_chain"}
+            == "choose_chain"
             and dict(action.get("argument_value_hashes") or {}).get(
                 "chain_text"
             )
@@ -2027,10 +2027,7 @@ def _chain_mode_change_confirmed(context: Any) -> PredicateResult:
         chain_actions = {
             str(action["action_id"]): str(action["type"])
             for action in provenance
-            if str(action.get("type") or "") in {
-                "change_chain",
-                "choose_chain",
-            }
+            if str(action.get("type") or "") == "choose_chain"
         }
         mode_actions = {
             str(action["action_id"]): str(action["type"])
@@ -2507,7 +2504,6 @@ def _new_chain_request_routed(context: Any) -> PredicateResult:
         identities_by_turn[int(item["turn_index"])].append(item)
     route_action_types_requiring_identity = {
         "set_chain_candidate",
-        "change_chain",
         "choose_chain",
         "select_chain",
     }
@@ -2548,7 +2544,6 @@ def _new_chain_request_routed(context: Any) -> PredicateResult:
             is_chain_route = (
                 action_type in {
                     "set_chain_candidate",
-                    "change_chain",
                     "choose_chain",
                     "request_chain_selection",
                     "select_chain",

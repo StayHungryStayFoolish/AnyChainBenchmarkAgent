@@ -323,7 +323,7 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             semantic_classes,
         )
         for edge in replacement_edges:
-            self.assertEqual(edge["action_type"], "change_chain")
+            self.assertEqual(edge["action_type"], "choose_chain")
             self.assertEqual(
                 edge["expected_postcondition"]["path"],
                 "chain_identity.change_candidate.canonical",

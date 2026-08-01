@@ -60,7 +60,7 @@ class ActionQueueOrderingTests(unittest.TestCase):
                 "_plan_scope": "turn-8",
             },
             {
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "ethereum",
                 "_plan_index": 1,
                 "_plan_scope": "turn-8",
@@ -71,7 +71,7 @@ class ActionQueueOrderingTests(unittest.TestCase):
 
         self.assertEqual(
             _types(ordered),
-            ["change_chain", "set_rpc_mode"],
+            ["choose_chain", "set_rpc_mode"],
         )
 
     def test_catalog_intake_precedes_same_transaction_workload_replacement(

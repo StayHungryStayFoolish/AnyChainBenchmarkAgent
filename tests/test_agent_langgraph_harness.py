@@ -120,7 +120,7 @@ def _admitted_mock_plan(state, text, payload):
         ):
             action.setdefault("source_evidence", str(text))
         action_type = str(action.get("type") or "")
-        if action_type in {"choose_chain", "change_chain"}:
+        if action_type == "choose_chain":
             action["chain_selection_semantic_verified"] = True
         if action_type == "choose_target_mode":
             action["target_mode_semantic_verified"] = True
@@ -3419,7 +3419,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             state,
             complex_request,
             [{
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "Flow",
                 "source_evidence": "改测 Flow",
                 "confidence": "high",
@@ -3427,7 +3427,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         )
         self.assertEqual(
             [action["type"] for action in detour["actions"]],
-            ["change_chain"],
+            ["choose_chain"],
         )
         self.assertNotIn(
             "answer_pending",
@@ -5139,7 +5139,7 @@ network:
             resolver.return_value = {
                 "actions": [
                     {"type": "choose_target_mode", "target_mode": "real-node", "target_mode_explicit": True, "source_evidence": "real-node", "confidence": "high"},
-                    {"type": "change_chain", "chain_text": "eth", "source_evidence": "eth", "confidence": "high"},
+                    {"type": "choose_chain", "chain_text": "eth", "source_evidence": "eth", "confidence": "high"},
                     {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "QPS quick", "confidence": "high"},
                 ]
             }
@@ -6956,7 +6956,7 @@ network:
 
         outcome = apply_chain_rpc_action(
             state,
-            ActionProposal("same-chain", "change_chain", {"chain_text": "bsc"}, "high"),
+            ActionProposal("same-chain", "choose_chain", {"chain_text": "bsc"}, "high"),
         )
         result = _commit_result(state, outcome, owner="chain_rpc")
         self.assertEqual(result["pending_question"]["id"], "benchmark_mode")
@@ -8866,7 +8866,7 @@ network:
             planner.return_value = {
                 "actions": [
                     {
-                        "type": "change_chain",
+                        "type": "choose_chain",
                         "chain_text": "another chain",
                         "source_evidence": "another chain",
                         "confidence": "high",
@@ -9398,7 +9398,7 @@ network:
         self.assertEqual(initial_result["pending_question"]["id"], "chain_change_input")
         self.assertEqual(
             set(initial_result["pending_question"]["accepted_action_types"]),
-            {"answer_pending", "choose_chain", "change_chain"},
+            {"answer_pending", "choose_chain"},
         )
         self.assertEqual(
             initial_result["pending_question"]["manual_action"],
@@ -9420,11 +9420,11 @@ network:
         self.assertIn("`bsc`", replacement_prompt)
         self.assertEqual(
             set(replacement_result["pending_question"]["accepted_action_types"]),
-            {"answer_pending", "choose_chain", "change_chain"},
+            {"answer_pending", "choose_chain"},
         )
         self.assertEqual(
             replacement_result["pending_question"]["manual_action"],
-            {"type": "change_chain", "value_argument": "chain_text"},
+            {"type": "choose_chain", "value_argument": "chain_text"},
         )
 
     def test_free_form_question_factories_declare_one_typed_manual_owner(self) -> None:
@@ -9620,7 +9620,7 @@ network:
         state["last_user_input"] = "change to ethereum"
 
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
-            resolver.return_value = {"actions": [{"type": "change_chain", "chain_text": "ethereum", "source_evidence": "change to ethereum", "confidence": "high"}]}
+            resolver.return_value = {"actions": [{"type": "choose_chain", "chain_text": "ethereum", "source_evidence": "change to ethereum", "confidence": "high"}]}
             result = process_turn(state)
 
         self.assertNotIn("CLOUD_REGION", result.get("confirmed_config", {}))
@@ -9879,7 +9879,7 @@ network:
         state["last_user_input"] = "change to ethereum"
 
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
-            resolver.return_value = {"actions": [{"type": "change_chain", "chain_text": "ethereum", "source_evidence": "change to ethereum", "confidence": "high"}]}
+            resolver.return_value = {"actions": [{"type": "choose_chain", "chain_text": "ethereum", "source_evidence": "change to ethereum", "confidence": "high"}]}
             result = process_turn(state)
 
         self.assertEqual(result["pending_question"]["id"], "chain_change_confirm")
@@ -9904,7 +9904,7 @@ network:
             state,
             [
                 {
-                    "type": "change_chain",
+                    "type": "choose_chain",
                     "chain_text": "ethereum",
                     "source_evidence": "switch to ethereum",
                 },
@@ -9946,7 +9946,7 @@ network:
         state = invoke_action(
             state,
             {
-                "type": "change_chain",
+                "type": "choose_chain",
                 "chain_text": "sola",
                 "canonical_chain_name": "sola",
                 "possible_known_chain": "solana",
@@ -13138,7 +13138,7 @@ response:
             patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as queue,
             patch("agent.harness.domains.chain_identity.resolve_unknown_chain_identity") as identify,
         ):
-            queue.return_value = {"actions": [{"type": "change_chain", "chain_text": "Sola", "source_evidence": "切换链到 Sola", "confidence": "high"}]}
+            queue.return_value = {"actions": [{"type": "choose_chain", "chain_text": "Sola", "source_evidence": "切换链到 Sola", "confidence": "high"}]}
             identify.return_value = {
                 "chain_exists": None,
                 "canonical_chain_name": "Sola",
@@ -13342,7 +13342,7 @@ response:
         self.assertIn("solana", rendered)
         self.assertIn("sola", rendered)
 
-    def test_pending_question_chain_detour_uses_typed_change_chain_action(self) -> None:
+    def test_pending_question_chain_detour_uses_canonical_chain_action(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -13361,7 +13361,7 @@ response:
         state["last_user_input"] = "先等一下，如果我说的其实是 Sola，不是 Solana，你应该怎么处理？"
 
         with (
-            patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER", return_value={"actions": [{"type": "change_chain", "chain_text": "Sola", "source_evidence": "Sola", "confidence": "high"}]}),
+            patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER", return_value={"actions": [{"type": "choose_chain", "chain_text": "Sola", "source_evidence": "Sola", "confidence": "high"}]}),
             patch("agent.harness.domains.chain_identity.resolve_unknown_chain_identity") as identify,
         ):
             identify.return_value = {
@@ -13412,7 +13412,7 @@ response:
             queue.return_value = {
                 "actions": [
                     {
-                        "type": "change_chain",
+                        "type": "choose_chain",
                         "chain_text": "abcd",
                         "source_evidence": "abcd，它是 EVM/jsonrpc 链",
                         "confidence": "high",
@@ -16942,7 +16942,7 @@ response:
 
         sweep): a single turn that both switches the real-node chain and asks
         to jump ahead (e.g. "switch to hedera, only have a real endpoint, ...")
-        can resolve into a compound action queue: `change_chain` (which pauses
+        can resolve into a compound action queue: `choose_chain` (which pauses
         on a `chain_change_confirm` interrupt) followed by a queued
         `change_group` targeting a later group (e.g. `workload_rpc`). Once the
         interrupt is confirmed, `_invalidate_for_chain_change` correctly clears
@@ -16999,7 +16999,7 @@ response:
         with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER") as resolver:
             resolver.return_value = {
                 "actions": [
-                    {"type": "change_chain", "chain_text": "hedera", "source_evidence": "换成 hedera", "confidence": "high"},
+                    {"type": "choose_chain", "chain_text": "hedera", "source_evidence": "换成 hedera", "confidence": "high"},
                     {"type": "change_group", "group": "workload_rpc", "navigation_explicit": True, "source_evidence": "回到 RPC workload 配置", "confidence": "high"},
                 ]
             }

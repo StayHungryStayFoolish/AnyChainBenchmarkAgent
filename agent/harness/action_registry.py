@@ -560,7 +560,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "choose_chain",
         "chain_rpc",
-        "Select a user-supplied raw chain name when none is confirmed, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.",
+        "Select a user-supplied raw chain as the current benchmark target, whether this is the first selection or a replacement, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, replacement confirmation, invalidation, and protocol research belong to the chain-identity domain after this action.",
         ("chain_text", "chain_candidates", "source_evidence"),
         20,
         "chain_identity",
@@ -574,31 +574,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         semantic_value_representative=True,
         entry_intake=True,
-        entry_intake_purpose="Enter initial chain identity selection from any active workflow group.",
-        entry_intake_value_arguments=("chain_text", "chain_candidates"),
-        validator=_validate_chain_selection,
-    ),
-    ActionSpec(
-        "change_chain",
-        "chain_rpc",
-        "Request a user-supplied raw replacement chain, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.",
-        ("chain_text", "chain_candidates", "source_evidence"),
-        20,
-        "chain_identity",
-        preserve_pending=True,
-        mutation_dimension="chain",
-        provides_capabilities=("chain_identity",),
-        crosses_pending_barrier=True,
-        effect="workflow_navigation",
-        required_arguments=("source_evidence",),
-        semantic_support_relations=(
-            *FRAMED_OPERATION_SUPPORT_RELATIONS,
-            "non_mutation_scope",
-        ),
-        semantic_value_grounding_arguments=("chain_text", "chain_candidates"),
-        open_identity_grounding_arguments=("chain_text", "chain_candidates"),
-        entry_intake=True,
-        entry_intake_purpose="Enter chain replacement from any active workflow group.",
+        entry_intake_purpose="Enter chain identity selection or replacement from any active workflow group.",
         entry_intake_value_arguments=("chain_text", "chain_candidates"),
         validator=_validate_chain_selection,
     ),
@@ -2796,11 +2772,10 @@ def action_merge_key(action: dict[str, Any]) -> tuple[Any, ...]:
     """Return the registry-declared semantic identity used across planner passes."""
 
     action_type = str(action.get("type") or "")
-    semantic_type = "chain_selection" if action_type in {"choose_chain", "change_chain"} else action_type
     spec = ACTION_BY_TYPE.get(action_type)
     if not spec or not spec.merge_identity:
-        return (semantic_type,)
-    return (semantic_type,) + tuple(
+        return (action_type,)
+    return (action_type,) + tuple(
         str(action.get(argument) or "").strip().casefold()
         for argument in spec.merge_identity
     )

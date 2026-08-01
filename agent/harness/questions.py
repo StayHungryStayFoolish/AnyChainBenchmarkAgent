@@ -561,10 +561,7 @@ def validate_pending_question_contract(
         value_domain = "closed_options"
     elif options:
         value_domain = "options_or_typed_value"
-    elif str(declared_manual.get("type") or "") in {
-        "choose_chain",
-        "change_chain",
-    }:
+    elif str(declared_manual.get("type") or "") == "choose_chain":
         value_domain = "researched_identity"
     else:
         value_domain = "typed_value"

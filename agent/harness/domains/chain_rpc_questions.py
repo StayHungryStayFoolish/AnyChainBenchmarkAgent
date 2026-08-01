@@ -403,7 +403,7 @@ def _chain_question(state: AgentGraphState) -> dict[str, Any]:
         ),
         field="chain",
         kind="chain",
-        accepted_action_types=("choose_chain", "change_chain"),
+        accepted_action_types=("choose_chain",),
         manual_action={
             "type": "choose_chain",
             "value_argument": "chain_text",
@@ -443,9 +443,9 @@ def _chain_selection_question(
         "chain_change_input",
         prompt,
         field="chain_change_input",
-        accepted_action_types=("choose_chain", "change_chain"),
+        accepted_action_types=("choose_chain",),
         manual_action={
-            "type": "change_chain" if current_chain else "choose_chain",
+            "type": "choose_chain",
             "value_argument": "chain_text",
         },
         queue_barrier=True,

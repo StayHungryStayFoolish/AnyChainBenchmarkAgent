@@ -481,7 +481,7 @@ def _request_chain_change(
         queue_barrier=True,
     )
     state["pending_question"]["interrupted_group"] = candidate["interrupted_group"]
-    state["pending_question"]["supersedes_action_types"] = ["choose_chain", "change_chain"]
+    state["pending_question"]["supersedes_action_types"] = ["choose_chain"]
 
 
 def _apply_chain_change_decision(
@@ -793,5 +793,5 @@ def _chain_ambiguity_question(
         options,
         queue_barrier=True,
     )
-    question["supersedes_action_types"] = ["choose_chain", "change_chain"]
+    question["supersedes_action_types"] = ["choose_chain"]
     return question

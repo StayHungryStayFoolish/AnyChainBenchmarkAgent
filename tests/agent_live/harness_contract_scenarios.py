@@ -1338,7 +1338,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     state = _compiled_action_state(
         state,
         {
-            "type": "change_chain",
+            "type": "choose_chain",
             "chain_text": "ethereum",
             "source_evidence": "ethereum",
             "confidence": "high",
@@ -1415,9 +1415,9 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             ),
         },
         manual_action_overrides={
-            "natural_language_answer": "change_chain",
-            "multiline_prose": "change_chain",
-            "structured_json_yaml_env_curl": "change_chain",
+            "natural_language_answer": "choose_chain",
+            "multiline_prose": "choose_chain",
+            "structured_json_yaml_env_curl": "choose_chain",
         },
     )
 
