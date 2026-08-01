@@ -31,6 +31,7 @@ from .action_registry import (
     pending_barrier_semantics,
     registered_semantic_value_domains,
     semantic_grounding_arguments,
+    semantic_grounding_values,
     semantic_value_domain_conflicts,
     action_spec_serves_route,
     lower_empty_entry_action_to_registered_intake,
@@ -3624,13 +3625,25 @@ def _owner_document_requires_semantic_review(
         if not isinstance(action, Mapping):
             continue
         sources = sources_by_action.get(index, [])
-        for argument in semantic_grounding_arguments(action):
-            value = str(action.get(argument) or "").strip()
-            if value and not any(
-                value.casefold() in source.casefold() for source in sources
+        for value in semantic_grounding_values(action):
+            if not any(
+                _source_contains_semantic_grounding_value(value, source)
+                for source in sources
             ):
                 return True
     return False
+
+
+def _source_contains_semantic_grounding_value(value: Any, source: str) -> bool:
+    """Match one registry-projected value against its bound source evidence."""
+
+    if isinstance(value, (Mapping, list)):
+        try:
+            return json.loads(source) == value
+        except (json.JSONDecodeError, TypeError):
+            return False
+    text = str(value).strip()
+    return bool(text) and text.casefold() in source.casefold()
 
 
 def _stage_b_semantic_review_prompt(owner: str) -> str:

@@ -2757,6 +2757,52 @@ def semantic_grounding_arguments(action: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
+def semantic_grounding_value_projection(
+    value: Any,
+    schema: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """Project one schema-owned argument into independently grounded values."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ()
+    if schema.get("type") == "array":
+        if not isinstance(value, Sequence) or isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return (value,)
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, Mapping):
+            item_schema = {}
+        return tuple(
+            projected
+            for item in value
+            for projected in semantic_grounding_value_projection(
+                item,
+                item_schema,
+            )
+        )
+    return (value,)
+
+
+def semantic_grounding_values(action: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Project registry-declared grounding arguments into concrete values.
+
+    Array arguments represent several independently grounded values, whereas
+    structured objects are one value whose identity is the complete object.
+    Keeping this projection beside the argument schemas prevents semantic
+    consumers from inventing their own string representations for containers.
+    """
+
+    return tuple(
+        value
+        for argument in semantic_grounding_arguments(action)
+        for value in semantic_grounding_value_projection(
+            action.get(argument),
+            ACTION_ARGUMENT_SCHEMAS.get(argument) or {},
+        )
+    )
+
+
 def semantic_scope_schema() -> list[dict[str, Any]]:
     """Expose the single semantic-scope contract to planners and validators."""
 

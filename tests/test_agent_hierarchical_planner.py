@@ -3574,6 +3574,97 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             _owner_document_requires_semantic_review(payload, document)
         )
 
+    def test_stage_b_risk_projects_array_grounding_values(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _owner_document_requires_semantic_review,
+        )
+
+        payload = {
+            "owner_action_schema": [
+                {"type": "choose_chain"},
+                {"type": "request_chain_selection"},
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "switch to eth",
+            }],
+        }
+
+        def document(candidates):
+            return {
+                "actions": [{
+                    "type": "choose_chain",
+                    "chain_text": "eth",
+                    "chain_candidates": candidates,
+                    "source_evidence": "eth",
+                    "confidence": "high",
+                }],
+                "bindings": [{
+                    "unit_id": "unit-1",
+                    "action_indexes": [0],
+                }],
+            }
+
+        self.assertFalse(
+            _owner_document_requires_semantic_review(payload, document(["eth"]))
+        )
+        self.assertTrue(
+            _owner_document_requires_semantic_review(
+                payload,
+                document(["eth", "bsc"]),
+            )
+        )
+
+    def test_stage_b_risk_preserves_scalar_and_structured_grounding(self) -> None:
+        from agent.harness.action_registry import (
+            semantic_grounding_value_projection,
+        )
+        from agent.harness.hierarchical_planner import (
+            _owner_document_requires_semantic_review,
+            _source_contains_semantic_grounding_value,
+        )
+
+        scalar_payload = {
+            "owner_action_schema": [
+                {"type": "set_qps_mode"},
+                {"type": "request_qps_mode_selection"},
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "use quick",
+            }],
+        }
+        scalar_document = {
+            "actions": [{
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+            }],
+            "bindings": [{"unit_id": "unit-1", "action_indexes": [0]}],
+        }
+        self.assertFalse(
+            _owner_document_requires_semantic_review(
+                scalar_payload,
+                scalar_document,
+            )
+        )
+        structured = {"chain_choice": "ethereum"}
+        self.assertEqual(
+            semantic_grounding_value_projection(structured, {"type": "object"}),
+            (structured,),
+        )
+        self.assertTrue(
+            _source_contains_semantic_grounding_value(
+                structured,
+                '{"chain_choice": "ethereum"}',
+            )
+        )
+        self.assertFalse(
+            _source_contains_semantic_grounding_value(
+                structured,
+                '{"chain_choice": "bsc"}',
+            )
+        )
+
     def test_admission_repair_preserves_independent_consultation(
         self,
     ) -> None:
