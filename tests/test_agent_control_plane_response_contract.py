@@ -224,9 +224,10 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                 "stage_b_semantic_reviews": [{
                     "owner": "orientation",
                     "proposal_hash": "4" * 64,
-                    "review_hash": "5" * 64,
-                    "request_count": 1,
-                    "request_sizes": [1024],
+                    "review_hashes": ["5" * 64, "6" * 64, "7" * 64],
+                    "member_validity": [True, False, False],
+                    "request_count": 3,
+                    "request_sizes": [1024, 1024, 1024],
                     "valid": False,
                 }],
             },
@@ -244,6 +245,15 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         ] = 2
         valid, reason = validate_coordinator_control_receipt(
             _signed_receipt(forged), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        forged_jury = json.loads(json.dumps(payload))
+        jury = forged_jury["authority_chain"]["stage_b_semantic_reviews"][0]
+        jury["member_validity"] = [True, True, False]
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged_jury), turn_index=3
         )
         self.assertFalse(valid)
         self.assertIn("semantics", reason)

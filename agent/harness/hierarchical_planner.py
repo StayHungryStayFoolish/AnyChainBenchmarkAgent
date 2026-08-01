@@ -3473,14 +3473,14 @@ def _compile_owner_document(
             or _owner_document_requires_semantic_review(payload, document)
         ):
             semantic_review_started = True
-            semantic_errors, semantic_size, semantic_receipt = (
+            semantic_errors, semantic_sizes, semantic_receipt = (
                 _review_owner_document_semantics(
                     provider,
                     payload,
                     document,
                 )
             )
-            request_sizes.append(semantic_size)
+            request_sizes.extend(semantic_sizes)
             semantic_receipts.append(semantic_receipt)
             errors = semantic_errors
         if not errors:
@@ -3707,7 +3707,7 @@ def _review_owner_document_semantics(
     provider: Any,
     payload: Mapping[str, Any],
     document: Mapping[str, Any],
-) -> tuple[tuple[str, ...], int, dict[str, Any]]:
+) -> tuple[tuple[str, ...], tuple[int, ...], dict[str, Any]]:
     owner = str(payload.get("owner") or "")
     proposal_hash = hashlib.sha256(
         json.dumps(
@@ -3728,14 +3728,61 @@ def _review_owner_document_semantics(
         "proposal_hash": proposal_hash,
     }
     prompt = _stage_b_semantic_review_prompt(owner)
-    response = request_semantic_compilation(
-        provider,
-        system_prompt=prompt,
-        request_payload=review_payload,
-        max_tokens=_stage_b_review_output_token_budget(payload, document),
-        reasoning_mode=STRICT_JSON_REASONING_MODE,
-    )
     request_size = _wire_size(prompt, review_payload)
+    review_hashes: list[str] = []
+    member_validity: list[bool] = []
+    member_errors: list[tuple[str, ...]] = []
+    for _member_index in range(3):
+        response = request_semantic_compilation(
+            provider,
+            system_prompt=prompt,
+            request_payload=review_payload,
+            max_tokens=_stage_b_review_output_token_budget(payload, document),
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
+        )
+        review_hashes.append(
+            hashlib.sha256(response.encode("utf-8")).hexdigest()
+        )
+        errors = _validate_stage_b_semantic_review_response(
+            response,
+            owner=owner,
+            proposal_hash=proposal_hash,
+            units=payload.get("semantic_units") or (),
+            actions=document.get("actions") or (),
+        )
+        member_errors.append(errors)
+        member_validity.append(not errors)
+    quorum = sum(member_validity) >= 2
+    errors = () if quorum else tuple(dict.fromkeys(
+        error
+        for member in member_errors
+        for error in member
+    ))
+    if not quorum:
+        errors = (
+            *errors,
+            f"Stage B {owner} semantic review quorum was not reached",
+        )
+    request_sizes = (request_size, request_size, request_size)
+    receipt = {
+        "proposal_hash": proposal_hash,
+        "review_hashes": review_hashes,
+        "member_validity": member_validity,
+        "request_count": 3,
+        "request_sizes": list(request_sizes),
+        "valid": quorum,
+    }
+    return tuple(dict.fromkeys(errors)), request_sizes, receipt
+
+
+def _validate_stage_b_semantic_review_response(
+    response: str,
+    *,
+    owner: str,
+    proposal_hash: str,
+    units: Sequence[Any],
+    actions: Sequence[Any],
+) -> tuple[str, ...]:
     errors: list[str] = []
     try:
         verdict = json.loads(response)
@@ -3752,16 +3799,18 @@ def _review_owner_document_semantics(
         verdict = {}
     if str(verdict.get("proposal_hash") or "") != proposal_hash:
         errors.append(f"Stage B {owner} semantic review changed proposal hash")
-    units = [dict(unit) for unit in payload.get("semantic_units") or []]
     unit_verdicts = verdict.get("unit_verdicts")
-    expected_unit_ids = [str(unit.get("unit_id") or "") for unit in units]
+    expected_unit_ids = [
+        str(unit.get("unit_id") or "")
+        for unit in units
+        if isinstance(unit, Mapping)
+    ]
     if not isinstance(unit_verdicts, list) or [
         str(row.get("unit_id") or "") if isinstance(row, Mapping) else ""
         for row in unit_verdicts
     ] != expected_unit_ids:
         errors.append(f"Stage B {owner} semantic review unit cardinality is invalid")
         unit_verdicts = []
-    actions = [dict(action) for action in document.get("actions") or []]
     action_verdicts = verdict.get("action_verdicts")
     if not isinstance(action_verdicts, list) or [
         row.get("action_index") if isinstance(row, Mapping) else None
@@ -3791,14 +3840,7 @@ def _review_owner_document_semantics(
                 )
     if not str(verdict.get("reason") or "").strip():
         errors.append(f"Stage B {owner} semantic review has no reason")
-    receipt = {
-        "proposal_hash": proposal_hash,
-        "review_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
-        "request_count": 1,
-        "request_size": request_size,
-        "valid": not errors,
-    }
-    return tuple(dict.fromkeys(errors)), request_size, receipt
+    return tuple(dict.fromkeys(errors))
 
 
 def _validate_owner_document(

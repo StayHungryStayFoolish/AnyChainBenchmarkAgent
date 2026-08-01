@@ -530,7 +530,8 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         if not isinstance(review, Mapping) or set(review) != {
             "owner",
             "proposal_hash",
-            "review_hash",
+            "review_hashes",
+            "member_validity",
             "request_count",
             "request_sizes",
             "valid",
@@ -539,12 +540,18 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         if (
             not str(review.get("owner") or "")
             or not _valid_hash(review.get("proposal_hash"))
-            or not _valid_hash(review.get("review_hash"))
+            or not isinstance(review.get("review_hashes"), list)
+            or not all(_valid_hash(value) for value in review["review_hashes"])
+            or not isinstance(review.get("member_validity"), list)
+            or not all(isinstance(value, bool) for value in review["member_validity"])
             or not _valid_nonnegative_integer(review.get("request_count"))
             or not _valid_request_sizes(review.get("request_sizes"))
             or int(review["request_count"]) != len(review["request_sizes"])
-            or int(review["request_count"]) == 0
+            or int(review["request_count"]) != 3
+            or len(review["review_hashes"]) != 3
+            or len(review["member_validity"]) != 3
             or not isinstance(review.get("valid"), bool)
+            or review["valid"] != (sum(review["member_validity"]) >= 2)
         ):
             return False
     return True

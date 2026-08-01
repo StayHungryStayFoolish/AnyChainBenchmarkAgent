@@ -3122,7 +3122,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             if "Stage B semantic review authority" in system:
                 reviewer_calls += 1
                 payload = kwargs["request_payload"]
-                verdict = "reject" if reviewer_calls == 1 else "admit"
+                verdict = "reject" if reviewer_calls <= 3 else "admit"
                 return json.dumps({
                     "proposal_hash": payload["proposal_hash"],
                     "unit_verdicts": [{
@@ -3172,8 +3172,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [{"type": "request_session_reset"}],
         )
         self.assertEqual(len(document["semantic_review_receipts"]), 2)
-        self.assertEqual(len(sizes), 4)
-        self.assertEqual(compiler.call_count, 4)
+        self.assertEqual(len(sizes), 8)
+        self.assertEqual(compiler.call_count, 8)
 
     def test_stage_b_semantic_reviewer_malformed_twice_fails_closed(self) -> None:
         from agent.harness.hierarchical_planner import _compile_owner_document
@@ -3223,7 +3223,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertTrue(errors)
         self.assertEqual(len(document["semantic_review_receipts"]), 2)
-        self.assertEqual(len(sizes), 4)
+        self.assertEqual(len(sizes), 8)
 
     def test_stage_b_semantic_second_rejection_fails_closed(self) -> None:
         from agent.harness.hierarchical_planner import _compile_owner_document
@@ -3287,7 +3287,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertTrue(any("rejected action" in error for error in errors))
         self.assertEqual(len(document["semantic_review_receipts"]), 2)
-        self.assertEqual(len(sizes), 4)
+        self.assertEqual(len(sizes), 8)
 
     def test_stage_b_semantic_review_rejects_hash_substitution(self) -> None:
         from agent.harness.hierarchical_planner import (
@@ -3417,6 +3417,134 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             payload["owner_action_schema"],
         )
         self.assertEqual(len(captured["proposal_hash"]), 64)
+
+    def test_stage_b_semantic_jury_is_order_independent(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_owner_document_semantics,
+        )
+
+        payload = {
+            "owner": "chain_rpc",
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "choose another mode",
+            }],
+            "owner_action_schema": [{
+                "type": "request_target_mode_selection",
+                "purpose": "open typed selection",
+            }],
+        }
+        document = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "choose another mode",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "compiled",
+            }],
+            "reason": "compiled",
+        }
+
+        def response(verdict: str, proposal_hash: str) -> str:
+            return json.dumps({
+                "proposal_hash": proposal_hash,
+                "unit_verdicts": [{
+                    "unit_id": "unit-1",
+                    "verdict": verdict,
+                    "reason": "member verdict",
+                }],
+                "action_verdicts": [{
+                    "action_index": 0,
+                    "verdict": verdict,
+                    "reason": "member verdict",
+                }],
+                "reason": "reviewed",
+            })
+
+        verdicts = iter(("admit", "reject", "admit"))
+
+        def review(*_args, **kwargs):
+            return response(
+                next(verdicts),
+                kwargs["request_payload"]["proposal_hash"],
+            )
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ) as reviewer:
+            errors, sizes, receipt = _review_owner_document_semantics(
+                object(), payload, document
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(reviewer.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(receipt["request_count"], 3)
+        self.assertEqual(receipt["member_validity"], [True, False, True])
+        self.assertEqual(len(receipt["review_hashes"]), 3)
+        self.assertTrue(receipt["valid"])
+
+    def test_stage_b_semantic_jury_requires_two_admissions(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_owner_document_semantics,
+        )
+
+        payload = {
+            "owner": "orientation",
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "clear it",
+            }],
+            "owner_action_schema": [{
+                "type": "request_session_reset",
+                "purpose": "clear session",
+            }],
+        }
+        document = {
+            "actions": [{"type": "request_session_reset"}],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "compiled",
+            }],
+        }
+        verdicts = iter(("reject", "admit", "reject"))
+
+        def review(*_args, **kwargs):
+            verdict = next(verdicts)
+            return json.dumps({
+                "proposal_hash": kwargs["request_payload"]["proposal_hash"],
+                "unit_verdicts": [{
+                    "unit_id": "unit-1",
+                    "verdict": verdict,
+                    "reason": "member verdict",
+                }],
+                "action_verdicts": [{
+                    "action_index": 0,
+                    "verdict": verdict,
+                    "reason": "member verdict",
+                }],
+                "reason": "reviewed",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ) as reviewer:
+            errors, sizes, receipt = _review_owner_document_semantics(
+                object(), payload, document
+            )
+
+        self.assertEqual(reviewer.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertIn("quorum was not reached", "; ".join(errors))
+        self.assertEqual(receipt["member_validity"], [False, True, False])
+        self.assertFalse(receipt["valid"])
 
     def test_single_reachable_stage_b_action_needs_no_extra_review(self) -> None:
         from agent.harness.hierarchical_planner import (

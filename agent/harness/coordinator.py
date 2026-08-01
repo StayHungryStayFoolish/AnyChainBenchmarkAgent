@@ -2020,9 +2020,19 @@ def _planner_authority_chain(
             owner_reviews.append({
                 "owner": str(owner),
                 "proposal_hash": str(receipt.get("proposal_hash") or ""),
-                "review_hash": str(receipt.get("review_hash") or ""),
+                "review_hashes": [
+                    str(value)
+                    for value in receipt.get("review_hashes") or ()
+                ],
+                "member_validity": [
+                    value is True
+                    for value in receipt.get("member_validity") or ()
+                ],
                 "request_count": int(receipt.get("request_count") or 0),
-                "request_sizes": [int(receipt.get("request_size") or 0)],
+                "request_sizes": [
+                    int(value)
+                    for value in receipt.get("request_sizes") or ()
+                ],
                 "valid": receipt.get("valid") is True,
             })
     return {
