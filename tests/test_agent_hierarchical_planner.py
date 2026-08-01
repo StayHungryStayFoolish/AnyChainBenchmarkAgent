@@ -5121,12 +5121,30 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 session_id="hierarchical-e2e",
                 submitted_turn_index=0,
             )
+            receipt = action["_semantic_consensus_receipt"]
+            self.assertEqual(receipt["request_count"], 7)
+            self.assertEqual(
+                receipt["review_ids"],
+                [
+                    "jury_1/attempt_1",
+                    "jury_1/attempt_2",
+                    "jury_2/attempt_1",
+                    "jury_2/attempt_2",
+                    "jury_3/attempt_1",
+                    "jury_3/attempt_2",
+                    "closed_enum_grounding",
+                ],
+            )
+            self.assertEqual(
+                len(receipt["review_hashes"]),
+                receipt["request_count"],
+            )
         self.assertEqual(
             whole_plan_attempts,
-            [False, True, False, True],
+            [False, True, False, True, False, True],
         )
-        self.assertEqual(result["planner_metrics"]["model_calls"], 9)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 6)
+        self.assertEqual(result["planner_metrics"]["model_calls"], 11)
+        self.assertEqual(result["planner_metrics"]["admission_calls"], 8)
 
     def test_semantic_draft_recompiles_clarification_through_real_admission(
         self,

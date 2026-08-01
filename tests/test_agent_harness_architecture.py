@@ -513,7 +513,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertEqual(ACTION_BY_TYPE["choose_chain"].effect, "configuration_mutation")
         self.assertTrue(admission.valid, admission.errors)
         self.assertTrue(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
 
     def test_canonical_chain_selection_purpose_is_lifecycle_neutral(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
@@ -541,13 +541,14 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertEqual(spec.required_state_path, ())
         self.assertNotIn("change_chain", ACTION_BY_TYPE)
 
-    def test_grounded_mutation_requires_two_independent_admissions(self) -> None:
+    def test_grounded_mutation_requires_three_member_semantic_jury(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission
 
         plan, valid = _grounded_mutation_admission_fixture()
         provider = Mock()
         provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(
@@ -567,9 +568,9 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         self.assertTrue(admission.valid, admission.errors)
         self.assertTrue(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 3)
-        self.assertEqual(admission.request_count, 3)
-        self.assertEqual(len(admission.review_hashes), 3)
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(admission.request_count, 4)
+        self.assertEqual(len(admission.review_hashes), 4)
 
     def test_closed_enum_negation_fails_closed_after_whole_plan_consensus(
         self,
@@ -588,6 +589,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         provider.complete.side_effect = [
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(rejected, ensure_ascii=False)),
         ]
 
@@ -599,8 +601,8 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
 
         self.assertFalse(admission.valid)
-        self.assertEqual(provider.complete.call_count, 3)
-        self.assertEqual(admission.request_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(admission.request_count, 4)
         self.assertEqual(admission.action_verdicts[0]["verdict"], "reject")
         self.assertIn(
             "independent closed-enum grounding rejected",
@@ -616,6 +618,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         provider.complete.side_effect = [
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text="{}"),
         ]
 
@@ -627,10 +630,10 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
 
         self.assertFalse(admission.valid)
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual(admission.action_verdicts[0]["verdict"], "reject")
 
-    def test_grounded_mutation_consensus_rejection_is_atomic(self) -> None:
+    def test_grounded_mutation_jury_rejection_is_atomic(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission
 
@@ -644,6 +647,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         provider.complete.side_effect = [
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
             SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
         ]
 
         admission = request_whole_plan_admission(
@@ -656,24 +660,95 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertFalse(admission.valid)
         self.assertTrue(admission.consensus_required)
         self.assertIn(
-            "grounded mutation consensus review rejected",
+            "grounded mutation semantic jury did not reach admission quorum",
             "; ".join(admission.errors),
         )
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
 
-    def test_primary_grounded_mutation_rejection_short_circuits(self) -> None:
+    def test_one_grounded_mutation_rejection_cannot_veto_two_admissions(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission
 
-        plan, rejected = _grounded_mutation_admission_fixture()
+        plan, valid = _grounded_mutation_admission_fixture()
+        rejected = deepcopy(valid)
         rejected["action_verdicts"][0]["verdict"] = "reject"
         rejected["action_verdicts"][0]["reason"] = (
             "the immutable value is not affirmatively selected"
         )
+        verdicts = (rejected, valid, valid)
+        for rejected_index in range(3):
+            ordered = list(verdicts[1:])
+            ordered.insert(rejected_index, verdicts[0])
+            provider = Mock()
+            provider.complete.side_effect = [
+                SimpleNamespace(text=json.dumps(item, sort_keys=True))
+                for item in ordered
+            ] + [SimpleNamespace(
+                text=json.dumps(
+                    _closed_enum_grounding_payload(plan),
+                    sort_keys=True,
+                )
+            )]
+
+            admission = request_whole_plan_admission(
+                provider,
+                plan,
+                semantic_policy="preserve the immutable plan",
+                allowed_action_types=ALLOWED_ACTION_TYPES,
+            )
+
+            with self.subTest(rejected_index=rejected_index):
+                self.assertTrue(admission.valid, admission.errors)
+                self.assertTrue(admission.consensus_required)
+                self.assertEqual(provider.complete.call_count, 4)
+                self.assertEqual(len(admission.review_hashes), 4)
+
+    def test_one_malformed_jury_member_cannot_veto_two_admissions(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(
-            text=json.dumps(rejected, sort_keys=True),
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text="{}"),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(
+                text=json.dumps(
+                    _closed_enum_grounding_payload(plan),
+                    sort_keys=True,
+                )
+            ),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
         )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 4)
+
+    def test_closed_enum_rejection_uses_quorum_admission_verdicts(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
+        rejected_grounding = _closed_enum_grounding_payload(
+            plan,
+            status="rejected",
+            evidence_quote="not fake-node",
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text="{}"),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(rejected_grounding, sort_keys=True)),
+        ]
 
         admission = request_whole_plan_admission(
             provider,
@@ -683,11 +758,86 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
 
         self.assertFalse(admission.valid)
-        self.assertTrue(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 1)
-        self.assertEqual(len(admission.review_hashes), 1)
+        self.assertEqual(len(admission.action_verdicts), 1)
+        self.assertEqual(admission.action_verdicts[0]["verdict"], "reject")
+        self.assertIn(
+            "independent closed-enum grounding",
+            admission.action_verdicts[0]["reason"],
+        )
 
-    def test_malformed_grounded_mutation_consensus_fails_closed(self) -> None:
+    def test_legacy_two_reviewer_consensus_receipt_fails_closed(self) -> None:
+        from agent.harness.action_registry import (
+            build_semantic_consensus_receipt,
+            validate_semantic_consensus_receipt,
+        )
+
+        receipt = build_semantic_consensus_receipt(
+            thread_id="thread-1",
+            session_id="session-1",
+            submitted_turn_index=3,
+            transaction_hash="transaction-1",
+            plan_hash="plan-1",
+            admission_action_ids=("action-1",),
+            review_hashes=("review-1", "review-2", "review-3"),
+            review_ids=(
+                "jury_1/attempt_1",
+                "jury_2/attempt_1",
+                "jury_3/attempt_1",
+            ),
+            request_count=3,
+            request_sizes=(10, 10, 10),
+        )
+        legacy = dict(receipt)
+        legacy.update({
+            "version": 3,
+            "review_hashes": ["review-1", "review-2"],
+            "review_ids": ["jury_1/attempt_1", "jury_2/attempt_1"],
+            "request_count": 2,
+            "request_sizes": [10, 10],
+        })
+        action = {
+            "_semantic_consensus_receipt": legacy,
+            "_plan_transaction_hash": "transaction-1",
+            "_admission_action_id": "action-1",
+        }
+
+        with self.assertRaisesRegex(ValueError, "receipt is incomplete"):
+            validate_semantic_consensus_receipt(action)
+
+    def test_tampered_semantic_jury_receipt_fails_closed(self) -> None:
+        from agent.harness.action_registry import (
+            build_semantic_consensus_receipt,
+            validate_semantic_consensus_receipt,
+        )
+
+        receipt = build_semantic_consensus_receipt(
+            thread_id="thread-1",
+            session_id="session-1",
+            submitted_turn_index=3,
+            transaction_hash="transaction-1",
+            plan_hash="plan-1",
+            admission_action_ids=("action-1",),
+            review_hashes=("review-1", "review-2", "review-3"),
+            review_ids=(
+                "jury_1/attempt_1",
+                "jury_2/attempt_1",
+                "jury_3/attempt_1",
+            ),
+            request_count=3,
+            request_sizes=(10, 10, 10),
+        )
+        tampered = deepcopy(receipt)
+        tampered["review_ids"][1] = "primary"
+        action = {
+            "_semantic_consensus_receipt": tampered,
+            "_plan_transaction_hash": "transaction-1",
+            "_admission_action_id": "action-1",
+        }
+
+        with self.assertRaisesRegex(ValueError, "receipt is incomplete"):
+            validate_semantic_consensus_receipt(action)
+
+    def test_two_malformed_jury_members_fail_closed(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission
 
@@ -695,6 +845,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         provider = Mock()
         provider.complete.side_effect = [
             SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text="{}"),
             SimpleNamespace(text="{}"),
         ]
 
@@ -707,7 +858,11 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         self.assertFalse(admission.valid)
         self.assertTrue(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertIn(
+            "semantic jury did not reach admission quorum",
+            "; ".join(admission.errors),
+        )
+        self.assertEqual(provider.complete.call_count, 3)
 
     def test_strict_json_compilation_disables_provider_reasoning(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES

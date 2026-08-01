@@ -253,6 +253,7 @@ class WholePlanAdmission:
     request_sizes: tuple[int, ...] = ()
     consensus_required: bool = False
     review_hashes: tuple[str, ...] = ()
+    review_ids: tuple[str, ...] = ()
 
     def repair_context(self) -> dict[str, Any]:
         return {
@@ -682,6 +683,7 @@ def request_whole_plan_admission(
     base_payload = plan.request_payload()
     request_sizes: list[int] = []
     review_hashes: list[str] = []
+    review_ids: list[str] = []
     consensus_required = _requires_grounded_mutation_consensus(plan)
 
     def run_review(*, consensus_index: int) -> WholePlanAdmission:
@@ -739,35 +741,55 @@ def request_whole_plan_admission(
                 plan,
                 allowed_action_types=allowed_action_types,
             )
+            reviewer_id = (
+                f"jury_{consensus_index + 1}"
+                if consensus_required
+                else "primary"
+            )
+            review_ids.append(f"{reviewer_id}/attempt_{attempt + 1}")
+            review_hashes.append(
+                _content_hash(admission.response or previous_output)
+            )
             if admission.valid or _is_explicit_semantic_rejection(admission):
                 break
             previous_errors = admission.errors
-        review_hashes.append(_content_hash(admission.response or previous_output))
         return admission
 
     primary = run_review(consensus_index=0)
-    if not primary.valid or not consensus_required:
+    if not consensus_required:
         return replace(
             primary,
             request_count=len(request_sizes),
             request_sizes=tuple(request_sizes),
             consensus_required=consensus_required,
             review_hashes=tuple(review_hashes),
+            review_ids=tuple(review_ids),
         )
 
-    consensus = run_review(consensus_index=1)
-    if not consensus.valid:
+    jury = (
+        primary,
+        run_review(consensus_index=1),
+        run_review(consensus_index=2),
+    )
+    admitted = tuple(review for review in jury if review.valid)
+    if len(admitted) < 2:
+        rejected = next(
+            (review for review in jury if not review.valid),
+            primary,
+        )
         return replace(
-            consensus,
+            rejected,
             errors=tuple(dict.fromkeys([
-                "grounded mutation consensus review rejected the immutable plan",
-                *consensus.errors,
+                "grounded mutation semantic jury did not reach admission quorum",
+                *rejected.errors,
             ])),
             request_count=len(request_sizes),
             request_sizes=tuple(request_sizes),
             consensus_required=True,
             review_hashes=tuple(review_hashes),
+            review_ids=tuple(review_ids),
         )
+    quorum_admission = admitted[0]
     grounding_request = _closed_enum_grounding_request(plan)
     if grounding_request is not None:
         prompt = closed_enum_grounding_prompt()
@@ -794,29 +816,32 @@ def request_whole_plan_admission(
         review_hashes.append(
             _content_hash(grounding_payload or str(response.text or ""))
         )
+        review_ids.append("closed_enum_grounding")
         if not grounding_valid:
             return replace(
-                primary,
+                quorum_admission,
                 valid=False,
                 errors=tuple(dict.fromkeys([
                     "independent closed-enum grounding rejected the immutable plan",
                     *grounding_errors,
                 ])),
                 action_verdicts=_reject_closed_enum_actions(
-                    primary,
+                    quorum_admission,
                     rejected_ids,
                 ),
                 request_count=len(request_sizes),
                 request_sizes=tuple(request_sizes),
                 consensus_required=True,
                 review_hashes=tuple(review_hashes),
+                review_ids=tuple(review_ids),
             )
     return replace(
-        primary,
+        quorum_admission,
         request_count=len(request_sizes),
         request_sizes=tuple(request_sizes),
         consensus_required=True,
         review_hashes=tuple(review_hashes),
+        review_ids=tuple(review_ids),
     )
 
 

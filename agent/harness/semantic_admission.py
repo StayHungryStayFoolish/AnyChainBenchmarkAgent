@@ -1029,6 +1029,7 @@ def _admitted_action_queue(
         semantic_consensus={
             "plan_hash": plan.plan_hash,
             "review_hashes": list(admission.review_hashes),
+            "review_ids": list(admission.review_ids),
             "request_count": admission.request_count,
             "request_sizes": list(admission.request_sizes),
         }
@@ -1916,6 +1917,7 @@ def _attach_semantic_admission_receipts(
             plan_hash=str(semantic_consensus.get("plan_hash") or ""),
             admission_action_ids=admission_action_ids,
             review_hashes=semantic_consensus.get("review_hashes") or (),
+            review_ids=semantic_consensus.get("review_ids") or (),
             request_count=int(semantic_consensus.get("request_count") or 0),
             request_sizes=semantic_consensus.get("request_sizes") or (),
         )

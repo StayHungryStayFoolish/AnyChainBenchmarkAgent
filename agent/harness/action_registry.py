@@ -1435,7 +1435,7 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "_merged_origin_texts",
 })
 
-SEMANTIC_ADMISSION_RECEIPT_VERSION = 3
+SEMANTIC_ADMISSION_RECEIPT_VERSION = 4
 
 
 def action_registry_contract_hash() -> str:
@@ -1878,6 +1878,7 @@ def build_semantic_consensus_receipt(
     plan_hash: str,
     admission_action_ids: Sequence[str],
     review_hashes: Sequence[str],
+    review_ids: Sequence[str],
     request_count: int,
     request_sizes: Sequence[int],
 ) -> dict[str, Any]:
@@ -1888,9 +1889,11 @@ def build_semantic_consensus_receipt(
         for value in review_hashes
         if str(value).strip()
     ]
-    review_ids = ["primary", "consensus"]
-    if len(normalized_review_hashes) == 3:
-        review_ids.append("closed_enum_grounding")
+    normalized_review_ids = [
+        str(value).strip()
+        for value in review_ids
+        if str(value).strip()
+    ]
 
     payload = {
         "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
@@ -1906,7 +1909,7 @@ def build_semantic_consensus_receipt(
             if str(value).strip()
         ],
         "review_hashes": normalized_review_hashes,
-        "review_ids": review_ids,
+        "review_ids": normalized_review_ids,
         "request_count": int(request_count),
         "request_sizes": [int(value) for value in request_sizes],
         "action_contract_hash": action_registry_contract_hash(),
@@ -1922,15 +1925,39 @@ def build_semantic_consensus_receipt(
                 "plan_hash",
             )
         )
-        or len(payload["review_hashes"]) not in {2, 3}
+        or len(payload["review_hashes"]) < 3
         or len(payload["review_ids"]) != len(payload["review_hashes"])
         or not payload["admission_action_ids"]
         or payload["request_count"] != len(payload["request_sizes"])
-        or payload["request_count"] < 2
+        or payload["request_count"] != len(payload["review_hashes"])
+        or payload["request_count"] < 3
         or any(size <= 0 for size in payload["request_sizes"])
+        or not _valid_semantic_jury_review_ids(payload["review_ids"])
     ):
         raise ValueError("semantic consensus receipt is incomplete")
     return {**payload, "receipt_id": _content_hash(payload)}
+
+
+def _valid_semantic_jury_review_ids(review_ids: Sequence[str]) -> bool:
+    """Require complete, ordered evidence for all jury members and attempts."""
+
+    ids = [str(value) for value in review_ids]
+    if ids and ids[-1] == "closed_enum_grounding":
+        ids = ids[:-1]
+    members: dict[int, list[int]] = {1: [], 2: [], 3: []}
+    observed_members: list[int] = []
+    for review_id in ids:
+        match = re.fullmatch(r"jury_([123])/attempt_([12])", review_id)
+        if match is None:
+            return False
+        member = int(match.group(1))
+        attempt = int(match.group(2))
+        observed_members.append(member)
+        members[member].append(attempt)
+    return (
+        observed_members == sorted(observed_members)
+        and all(members[member] in ([1], [1, 2]) for member in (1, 2, 3))
+    )
 
 
 def validate_semantic_consensus_receipt(
@@ -1953,6 +1980,7 @@ def validate_semantic_consensus_receipt(
         plan_hash=str(receipt.get("plan_hash") or ""),
         admission_action_ids=receipt.get("admission_action_ids") or (),
         review_hashes=receipt.get("review_hashes") or (),
+        review_ids=receipt.get("review_ids") or (),
         request_count=int(receipt.get("request_count") or 0),
         request_sizes=receipt.get("request_sizes") or (),
     )
