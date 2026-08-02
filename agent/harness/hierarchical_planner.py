@@ -226,6 +226,22 @@ def begin_semantic_partition(
             document["unit_count"] = len(partition)
             return document
         (
+            partition,
+            _primary_relation_errors,
+            primary_relation_sizes,
+            primary_relation_receipt,
+        ) = _review_competing_open_identity_relations(
+            provider,
+            partition,
+            stage_a_payload,
+        )
+        document["request_sizes"].extend(primary_relation_sizes)
+        document["admission_calls"] += len(primary_relation_sizes)
+        if primary_relation_receipt:
+            document["stage_a_relation_reviews"].append(
+                primary_relation_receipt
+            )
+        (
             admission_errors,
             stage_a_admission_sizes,
             redundant_unit_ids,
@@ -240,22 +256,6 @@ def begin_semantic_partition(
         document["admission_calls"] += len(stage_a_admission_sizes)
         primary_review_valid = not admission_errors
         if primary_review_valid:
-            (
-                partition,
-                _primary_relation_errors,
-                primary_relation_sizes,
-                primary_relation_receipt,
-            ) = _review_competing_open_identity_relations(
-                provider,
-                partition,
-                stage_a_payload,
-            )
-            document["request_sizes"].extend(primary_relation_sizes)
-            document["admission_calls"] += len(primary_relation_sizes)
-            if primary_relation_receipt:
-                document["stage_a_relation_reviews"].append(
-                    primary_relation_receipt
-                )
             source_partition, compilation_partition = (
                 _partition_after_stage_a_admission(
                     partition,
@@ -295,6 +295,22 @@ def begin_semantic_partition(
                 document["unit_count"] = len(source_partition)
                 return document
             (
+                independent_partition,
+                _independent_relation_errors,
+                independent_relation_sizes,
+                independent_relation_receipt,
+            ) = _review_competing_open_identity_relations(
+                provider,
+                independent_partition,
+                stage_a_payload,
+            )
+            document["request_sizes"].extend(independent_relation_sizes)
+            document["admission_calls"] += len(independent_relation_sizes)
+            if independent_relation_receipt:
+                document["stage_a_relation_reviews"].append(
+                    independent_relation_receipt
+                )
+            (
                 independent_admission_errors,
                 independent_admission_sizes,
                 independent_redundant_unit_ids,
@@ -324,6 +340,22 @@ def begin_semantic_partition(
                 document["request_sizes"].extend(replacement_sizes)
                 document["stage_a_calls"] += len(replacement_sizes)
                 if not replacement_errors:
+                    (
+                        replacement_partition,
+                        _replacement_relation_errors,
+                        replacement_relation_sizes,
+                        replacement_relation_receipt,
+                    ) = _review_competing_open_identity_relations(
+                        provider,
+                        replacement_partition,
+                        stage_a_payload,
+                    )
+                    document["request_sizes"].extend(replacement_relation_sizes)
+                    document["admission_calls"] += len(replacement_relation_sizes)
+                    if replacement_relation_receipt:
+                        document["stage_a_relation_reviews"].append(
+                            replacement_relation_receipt
+                        )
                     (
                         replacement_admission_errors,
                         replacement_admission_sizes,
@@ -361,22 +393,6 @@ def begin_semantic_partition(
                 )))
                 document["unit_count"] = len(source_partition)
                 return document
-            (
-                independent_partition,
-                _independent_relation_errors,
-                independent_relation_sizes,
-                independent_relation_receipt,
-            ) = _review_competing_open_identity_relations(
-                provider,
-                independent_partition,
-                stage_a_payload,
-            )
-            document["request_sizes"].extend(independent_relation_sizes)
-            document["admission_calls"] += len(independent_relation_sizes)
-            if independent_relation_receipt:
-                document["stage_a_relation_reviews"].append(
-                    independent_relation_receipt
-                )
             (
                 independent_source_partition,
                 independent_compilation_partition,

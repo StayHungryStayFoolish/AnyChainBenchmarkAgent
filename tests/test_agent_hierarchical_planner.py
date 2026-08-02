@@ -243,8 +243,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             json.dumps(wrong),
             json.dumps(admission(wrong["semantic_units"], support=False)),
         ))
+        compiler_payloads = []
 
         def compile_semantics(_provider, *, system_prompt, request_payload, **_kwargs):
+            compiler_payloads.append(request_payload)
             return next(outputs)
 
         state = {
@@ -302,6 +304,14 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(result["stage_a_calls"], 1)
         self.assertEqual(result["admission_calls"], 4)
         self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(
+            compiler_payloads[1]["semantic_units"][1]["operation"],
+            "context",
+        )
+        self.assertEqual(
+            compiler_payloads[1]["semantic_units"][1]["owner_routes"],
+            [],
+        )
         self.assertEqual(
             result["source_partition"][1]["operation"],
             "context",
