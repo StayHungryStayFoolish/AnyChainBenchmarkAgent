@@ -214,19 +214,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ],
             "reason": "competing interpretation",
         }
-        corrected = {
-            "semantic_units": [
-                wrong["semantic_units"][0],
-                {
-                    **wrong["semantic_units"][1],
-                    "operation": "context",
-                    "owner_routes": [],
-                    "reason": "operation framing supports the mode request",
-                },
-            ],
-            "reason": "framing interpretation",
-        }
-
         def admission(units, *, support: bool):
             return {
                 "unit_verdicts": [
@@ -255,18 +242,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         outputs = iter((
             json.dumps(wrong),
             json.dumps(admission(wrong["semantic_units"], support=False)),
-            json.dumps(corrected),
-            json.dumps(admission(corrected["semantic_units"], support=True)),
         ))
 
         def compile_semantics(_provider, *, system_prompt, request_payload, **_kwargs):
-            if "proposal convergence authority" in system_prompt:
-                return json.dumps({
-                    "selected_proposal": "secondary",
-                    "primary_hash": request_payload["primary"]["hash"],
-                    "secondary_hash": request_payload["secondary"]["hash"],
-                    "reason": "generic framing is not an independently named identity",
-                })
             return next(outputs)
 
         state = {
@@ -288,17 +266,274 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
                 side_effect=compile_semantics,
             ) as compiler,
+            patch(
+                "agent.harness.hierarchical_planner.request_open_identity_relation_jury",
+                return_value=SimpleNamespace(
+                    decisions=({
+                        "unit_id": "unit-2",
+                        "relation": "supports_unit",
+                        "supports_unit_id": "unit-1",
+                        "quorum_reached": True,
+                    },),
+                    errors=(),
+                    request_sizes=(100, 100, 100),
+                    receipt={
+                        "proposal_hash": "1" * 64,
+                        "candidate_unit_ids": ["unit-2"],
+                        "possible_support_unit_ids": {"unit-2": ["unit-1"]},
+                        "member_response_hashes": ["2" * 64, "3" * 64, "4" * 64],
+                        "member_validity": [True, True, True],
+                        "request_count": 3,
+                        "request_sizes": [100, 100, 100],
+                        "decisions": [{
+                            "unit_id": "unit-2",
+                            "relation": "supports_unit",
+                            "supports_unit_id": "unit-1",
+                            "quorum_reached": True,
+                        }],
+                        "valid": True,
+                    },
+                ),
+            ),
         ):
             result = begin_semantic_partition(state, text)
 
         self.assertEqual(result["status"], "compile_owner")
-        self.assertEqual(result["stage_a_calls"], 2)
-        self.assertEqual(result["admission_calls"], 3)
-        self.assertEqual(compiler.call_count, 5)
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 4)
+        self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(
+            result["source_partition"][1]["operation"],
+            "context",
+        )
+        self.assertEqual(
+            result["stage_a_relation_reviews"][0]["decisions"],
+            [{
+                "unit_id": "unit-2",
+                "relation": "supports_unit",
+                "supports_unit_id": "unit-1",
+                "quorum_reached": True,
+            }],
+        )
         self.assertEqual(
             [row["groups"] for row in result["owner_requests"]],
             [["target_mode"]],
         )
+
+    def test_open_identity_relation_jury_preserves_a_named_sibling(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_competing_open_identity_relations,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "fake-node ",
+                "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "target_mode"}],
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "source_text": "BNB",
+                "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+            },
+        ]
+        payload = {
+            "user_text": "fake-node BNB",
+            "clauses": [{"clause_id": "clause-1", "text": "fake-node BNB"}],
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{
+                "value": "fake-node",
+                "target_group": "target_mode",
+            }],
+        }
+        verdict = json.dumps({
+            "verdicts": [{
+                "unit_id": "unit-2",
+                "relation": "named_identity",
+                "supports_unit_id": "",
+                "evidence_quote": "BNB",
+                "reason": "the source names a distinct chain identity",
+            }],
+            "reason": "the identity is independent",
+        })
+        with patch(
+            "agent.harness.semantic_compiler.request_semantic_compilation_result",
+            side_effect=[
+                SimpleNamespace(text=verdict, response_hash=str(index) * 64)
+                for index in (1, 2, 3)
+            ],
+        ):
+            normalized, errors, sizes, receipt = (
+                _review_competing_open_identity_relations(
+                    object(), partition, payload
+                )
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(normalized, partition)
+        self.assertEqual(receipt["member_validity"], [True, True, True])
+
+    def test_open_identity_relation_jury_fails_closed_without_quorum(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_competing_open_identity_relations,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "fake-node ",
+                "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "target_mode"}],
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "source_text": "test",
+                "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+            },
+        ]
+        payload = {
+            "user_text": "fake-node test",
+            "clauses": [{"clause_id": "clause-1", "text": "fake-node test"}],
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{
+                "value": "fake-node",
+                "target_group": "target_mode",
+            }],
+        }
+        forged = json.dumps({
+            "verdicts": [{
+                "unit_id": "forged",
+                "relation": "supports_unit",
+                "supports_unit_id": "unit-1",
+                "evidence_quote": "test",
+                "reason": "forged unit",
+            }],
+            "reason": "invalid",
+        })
+        named = json.dumps({
+            "verdicts": [{
+                "unit_id": "unit-2",
+                "relation": "named_identity",
+                "supports_unit_id": "",
+                "evidence_quote": "test",
+                "reason": "one minority vote",
+            }],
+            "reason": "minority",
+        })
+        with patch(
+            "agent.harness.semantic_compiler.request_semantic_compilation_result",
+            side_effect=[
+                SimpleNamespace(text=forged, response_hash="1" * 64),
+                SimpleNamespace(text=named, response_hash="2" * 64),
+                SimpleNamespace(text="not-json", response_hash="3" * 64),
+            ],
+        ):
+            normalized, errors, _sizes, receipt = (
+                _review_competing_open_identity_relations(
+                    object(), partition, payload
+                )
+            )
+
+        self.assertTrue(errors)
+        self.assertEqual(normalized[1]["operation"], "unresolved")
+        self.assertEqual(normalized[1]["owner_routes"], [])
+        self.assertEqual(receipt["member_validity"], [False, True, False])
+
+    def test_open_identity_relation_jury_preserves_explicit_unresolved_quorum(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_competing_open_identity_relations,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1", "clause_id": "clause-1",
+                "source_text": "fake-node ", "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "target_mode"}],
+            },
+            {
+                "unit_id": "unit-2", "clause_id": "clause-1",
+                "source_text": "ambiguous-name", "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+            },
+        ]
+        payload = {
+            "user_text": "fake-node ambiguous-name",
+            "clauses": [{"clause_id": "clause-1", "text": "fake-node ambiguous-name"}],
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{"value": "fake-node", "target_group": "target_mode"}],
+        }
+        verdict = json.dumps({
+            "verdicts": [{
+                "unit_id": "unit-2", "relation": "unresolved",
+                "supports_unit_id": "", "evidence_quote": "ambiguous-name",
+                "reason": "the source does not establish either relation",
+            }],
+            "reason": "clarification is required",
+        })
+        with patch(
+            "agent.harness.semantic_compiler.request_semantic_compilation_result",
+            side_effect=[
+                SimpleNamespace(text=verdict, response_hash=str(index) * 64)
+                for index in (1, 2, 3)
+            ],
+        ):
+            normalized, errors, _sizes, receipt = (
+                _review_competing_open_identity_relations(
+                    object(), partition, payload
+                )
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(normalized[1]["operation"], "unresolved")
+        self.assertTrue(receipt["valid"])
+        self.assertTrue(receipt["decisions"][0]["quorum_reached"])
+
+    def test_open_identity_relation_jury_does_not_join_unrelated_clauses(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_competing_open_identity_relations,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1", "clause_id": "clause-1",
+                "source_text": "fake-node", "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "target_mode"}],
+            },
+            {
+                "unit_id": "unit-2", "clause_id": "clause-2",
+                "source_text": "BNB", "operation": "domain_request",
+                "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+            },
+        ]
+        payload = {
+            "user_text": "fake-node\nBNB",
+            "clauses": [
+                {"clause_id": "clause-1", "text": "fake-node"},
+                {"clause_id": "clause-2", "text": "BNB"},
+            ],
+            "pending_question": {"group": "chain_identity"},
+            "registered_value_mentions": [{"value": "fake-node", "target_group": "target_mode"}],
+        }
+        with patch(
+            "agent.harness.hierarchical_planner.request_open_identity_relation_jury"
+        ) as reviewer:
+            normalized, errors, sizes, receipt = (
+                _review_competing_open_identity_relations(
+                    object(), partition, payload
+                )
+            )
+
+        reviewer.assert_not_called()
+        self.assertEqual(normalized, partition)
+        self.assertEqual((errors, sizes, receipt), ((), (), {}))
 
     def test_stage_a_output_budget_scales_with_structured_atom_count(self) -> None:
         from agent.harness.hierarchical_planner import (

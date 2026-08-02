@@ -63,6 +63,7 @@ from .questions import (
 from .semantic_compiler import (
     STRICT_JSON_REASONING_MODE,
     closed_enum_quote_names_only_competing_values,
+    request_open_identity_relation_jury,
     request_semantic_compilation,
     whole_plan_admission_prompt,
 )
@@ -199,6 +200,7 @@ def begin_semantic_partition(
         "stage_a_calls": 0,
         "stage_b_calls": 0,
         "admission_calls": 0,
+        "stage_a_relation_reviews": [],
         "errors": [],
     }
     if not clauses:
@@ -238,6 +240,22 @@ def begin_semantic_partition(
         document["admission_calls"] += len(stage_a_admission_sizes)
         primary_review_valid = not admission_errors
         if primary_review_valid:
+            (
+                partition,
+                _primary_relation_errors,
+                primary_relation_sizes,
+                primary_relation_receipt,
+            ) = _review_competing_open_identity_relations(
+                provider,
+                partition,
+                stage_a_payload,
+            )
+            document["request_sizes"].extend(primary_relation_sizes)
+            document["admission_calls"] += len(primary_relation_sizes)
+            if primary_relation_receipt:
+                document["stage_a_relation_reviews"].append(
+                    primary_relation_receipt
+                )
             source_partition, compilation_partition = (
                 _partition_after_stage_a_admission(
                     partition,
@@ -343,6 +361,22 @@ def begin_semantic_partition(
                 )))
                 document["unit_count"] = len(source_partition)
                 return document
+            (
+                independent_partition,
+                _independent_relation_errors,
+                independent_relation_sizes,
+                independent_relation_receipt,
+            ) = _review_competing_open_identity_relations(
+                provider,
+                independent_partition,
+                stage_a_payload,
+            )
+            document["request_sizes"].extend(independent_relation_sizes)
+            document["admission_calls"] += len(independent_relation_sizes)
+            if independent_relation_receipt:
+                document["stage_a_relation_reviews"].append(
+                    independent_relation_receipt
+                )
             (
                 independent_source_partition,
                 independent_compilation_partition,
@@ -624,6 +658,156 @@ def _partition_requires_independent_proposal(
     return not (
         payload.get("contract_proven_pending_prefixes")
         or payload.get("pending_typed_candidates")
+    )
+
+
+def _competing_open_identity_relations(
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Return open-identity units competing with registered cross-group values."""
+
+    pending_group = str(
+        (stage_a_payload.get("pending_question") or {}).get("group") or ""
+    )
+    if not pending_group:
+        return ()
+    mentions = [
+        dict(row)
+        for row in stage_a_payload.get("registered_value_mentions") or ()
+        if isinstance(row, Mapping)
+        and str(row.get("target_group") or "")
+        and str(row.get("target_group") or "") != pending_group
+    ]
+    support_units: list[dict[str, Any]] = []
+    for unit in partition:
+        if str(unit.get("operation") or "") != "domain_request":
+            continue
+        source = str(unit.get("source_text") or "")
+        routes = [
+            dict(route)
+            for route in unit.get("owner_routes") or ()
+            if isinstance(route, Mapping)
+        ]
+        matched_mentions = [
+            mention
+            for mention in mentions
+            if any(
+                str(route.get("group") or "")
+                == str(mention.get("target_group") or "")
+                for route in routes
+            )
+            and any(
+                str(conflict.get("target_group") or "")
+                == str(mention.get("target_group") or "")
+                and str(conflict.get("value") or "").casefold()
+                == str(mention.get("value") or "").casefold()
+                for conflict in semantic_value_domain_conflicts(
+                    source,
+                    owning_group="",
+                )
+            )
+        ]
+        if matched_mentions:
+            support_units.append({
+                "unit_id": str(unit.get("unit_id") or ""),
+                "clause_id": str(unit.get("clause_id") or ""),
+                "source_text": source,
+                "operation": "domain_request",
+                "owner_routes": routes,
+                "registered_mentions": matched_mentions,
+            })
+    if not support_units:
+        return ()
+
+    relations: list[dict[str, Any]] = []
+    for unit in partition:
+        if str(unit.get("operation") or "") != "domain_request":
+            continue
+        routes = [
+            dict(route)
+            for route in unit.get("owner_routes") or ()
+            if isinstance(route, Mapping)
+        ]
+        claims_open_identity = any(
+            str(route.get("group") or "") == pending_group
+            and any(
+                spec.owner == str(route.get("owner") or "")
+                and spec.open_identity_grounding_arguments
+                and action_spec_serves_route(
+                    spec,
+                    operation="domain_request",
+                    group=pending_group,
+                )
+                for spec in ACTION_SPECS
+            )
+            for route in routes
+        )
+        same_clause_support = [
+            row
+            for row in support_units
+            if row["clause_id"] == str(unit.get("clause_id") or "")
+            and row["unit_id"] != str(unit.get("unit_id") or "")
+        ]
+        if claims_open_identity and same_clause_support:
+            relations.append({
+                "unit": {
+                    "unit_id": str(unit.get("unit_id") or ""),
+                    "clause_id": str(unit.get("clause_id") or ""),
+                    "source_text": str(unit.get("source_text") or ""),
+                    "operation": "domain_request",
+                    "owner_routes": routes,
+                },
+                "possible_support_units": same_clause_support,
+            })
+    return tuple(relations)
+
+
+def _review_competing_open_identity_relations(
+    provider: Any,
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], tuple[str, ...], tuple[int, ...], dict[str, Any]]:
+    """Normalize only relation verdicts that reach a fixed semantic quorum."""
+
+    relations = _competing_open_identity_relations(partition, stage_a_payload)
+    if not relations:
+        return [dict(unit) for unit in partition], (), (), {}
+    proposal_hash = _partition_hash(partition)
+    request_payload = {
+        "user_text": str(stage_a_payload.get("user_text") or ""),
+        "clauses": list(stage_a_payload.get("clauses") or []),
+        "pending_question": dict(stage_a_payload.get("pending_question") or {}),
+        "relations": list(relations),
+        "open_identity_action_purposes": {
+            spec.action_type: spec.purpose
+            for spec in ACTION_SPECS
+            if spec.open_identity_grounding_arguments
+        },
+    }
+    review = request_open_identity_relation_jury(
+        provider,
+        proposal_hash=proposal_hash,
+        request_payload=request_payload,
+        max_tokens=max(900, 500 + (450 * len(relations))),
+    )
+    decisions = {
+        str(row.get("unit_id") or ""): str(row.get("relation") or "")
+        for row in review.decisions
+    }
+    normalized: list[dict[str, Any]] = []
+    for raw_unit in partition:
+        unit = dict(raw_unit)
+        decision = decisions.get(str(unit.get("unit_id") or ""))
+        if decision is not None and decision != "named_identity":
+            unit["operation"] = "context" if decision == "supports_unit" else "unresolved"
+            unit["owner_routes"] = []
+        normalized.append(unit)
+    return (
+        normalized,
+        review.errors,
+        review.request_sizes,
+        dict(review.receipt),
     )
 
 

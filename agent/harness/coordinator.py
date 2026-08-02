@@ -2008,6 +2008,49 @@ def _planner_authority_chain(
         "none",
     }:
         stage_a["selected_proposal"] = "rejected"
+    relation_reviews: list[dict[str, Any]] = []
+    for receipt in document.get("stage_a_relation_reviews") or ():
+        if not isinstance(receipt, Mapping):
+            continue
+        relation_reviews.append({
+            "proposal_hash": str(receipt.get("proposal_hash") or ""),
+            "candidate_unit_ids": [
+                str(value)
+                for value in receipt.get("candidate_unit_ids") or ()
+            ],
+            "possible_support_unit_ids": {
+                str(unit_id): [str(value) for value in values or ()]
+                for unit_id, values in dict(
+                    receipt.get("possible_support_unit_ids") or {}
+                ).items()
+            },
+            "member_response_hashes": [
+                str(value)
+                for value in receipt.get("member_response_hashes") or ()
+            ],
+            "member_validity": [
+                value is True
+                for value in receipt.get("member_validity") or ()
+            ],
+            "request_count": int(receipt.get("request_count") or 0),
+            "request_sizes": [
+                int(value)
+                for value in receipt.get("request_sizes") or ()
+            ],
+            "decisions": [
+                {
+                    "unit_id": str(row.get("unit_id") or ""),
+                    "relation": str(row.get("relation") or ""),
+                    "supports_unit_id": str(
+                        row.get("supports_unit_id") or ""
+                    ),
+                    "quorum_reached": row.get("quorum_reached") is True,
+                }
+                for row in receipt.get("decisions") or ()
+                if isinstance(row, Mapping)
+            ],
+            "valid": receipt.get("valid") is True,
+        })
     owner_reviews: list[dict[str, Any]] = []
     for owner, owner_document in sorted(
         dict(document.get("owner_documents") or {}).items()
@@ -2037,6 +2080,7 @@ def _planner_authority_chain(
             })
     return {
         "stage_a_convergence": stage_a,
+        "stage_a_relation_reviews": relation_reviews,
         "stage_b_semantic_reviews": owner_reviews,
     }
 

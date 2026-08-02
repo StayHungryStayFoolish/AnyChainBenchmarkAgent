@@ -455,6 +455,7 @@ def _valid_request_sizes(value: Any) -> bool:
 def _valid_planner_authority_chain(value: Any) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
         "stage_a_convergence",
+        "stage_a_relation_reviews",
         "stage_b_semantic_reviews",
     }:
         return False
@@ -521,6 +522,83 @@ def _valid_planner_authority_chain(value: Any) -> bool:
                 and stage_a.get("selected_proposal")
                 not in {"primary", "secondary"}
             )
+        ):
+            return False
+    relation_reviews = value.get("stage_a_relation_reviews")
+    if not isinstance(relation_reviews, list):
+        return False
+    for review in relation_reviews:
+        if not isinstance(review, Mapping) or set(review) != {
+            "proposal_hash",
+            "candidate_unit_ids",
+            "possible_support_unit_ids",
+            "member_response_hashes",
+            "member_validity",
+            "request_count",
+            "request_sizes",
+            "decisions",
+            "valid",
+        }:
+            return False
+        candidate_ids = review.get("candidate_unit_ids")
+        support_ids = review.get("possible_support_unit_ids")
+        decisions = review.get("decisions")
+        if (
+            not _valid_hash(review.get("proposal_hash"))
+            or not isinstance(candidate_ids, list)
+            or not candidate_ids
+            or not all(isinstance(item, str) and item for item in candidate_ids)
+            or len(candidate_ids) != len(set(candidate_ids))
+            or not isinstance(support_ids, Mapping)
+            or set(support_ids) != set(candidate_ids)
+            or any(
+                not isinstance(values, list)
+                or not values
+                or not all(isinstance(item, str) and item for item in values)
+                or len(values) != len(set(values))
+                for values in support_ids.values()
+            )
+            or not isinstance(review.get("member_response_hashes"), list)
+            or len(review["member_response_hashes"]) != 3
+            or not all(
+                _valid_hash(item)
+                for item in review["member_response_hashes"]
+            )
+            or not isinstance(review.get("member_validity"), list)
+            or len(review["member_validity"]) != 3
+            or not all(isinstance(item, bool) for item in review["member_validity"])
+            or review.get("request_count") != 3
+            or not _valid_request_sizes(review.get("request_sizes"))
+            or len(review["request_sizes"]) != 3
+            or not isinstance(decisions, list)
+            or len(decisions) != len(candidate_ids)
+            or not isinstance(review.get("valid"), bool)
+        ):
+            return False
+        for index, decision in enumerate(decisions):
+            if not isinstance(decision, Mapping) or set(decision) != {
+                "unit_id", "relation", "supports_unit_id", "quorum_reached"
+            }:
+                return False
+            unit_id = str(decision.get("unit_id") or "")
+            relation = str(decision.get("relation") or "")
+            supports_unit_id = str(decision.get("supports_unit_id") or "")
+            if (
+                unit_id != candidate_ids[index]
+                or relation not in {
+                    "named_identity", "supports_unit", "unresolved"
+                }
+                or (
+                    relation == "supports_unit"
+                    and supports_unit_id not in support_ids[unit_id]
+                )
+                or (relation != "supports_unit" and supports_unit_id)
+                or not isinstance(decision.get("quorum_reached"), bool)
+            ):
+                return False
+        if review["valid"] is not all(
+            decision["quorum_reached"] is True
+            for decision in decisions
         ):
             return False
     reviews = value.get("stage_b_semantic_reviews")

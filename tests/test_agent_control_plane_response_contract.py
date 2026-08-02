@@ -102,6 +102,7 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                 "admission_calls": 1,
                 "authority_chain": {
                     "stage_a_convergence": {},
+                    "stage_a_relation_reviews": [],
                     "stage_b_semantic_reviews": [],
                 },
             },
@@ -221,6 +222,22 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                     "request_sizes": [2048],
                     "valid": True,
                 },
+                "stage_a_relation_reviews": [{
+                    "proposal_hash": "8" * 64,
+                    "candidate_unit_ids": ["unit-2"],
+                    "possible_support_unit_ids": {"unit-2": ["unit-1"]},
+                    "member_response_hashes": ["9" * 64, "a" * 64, "b" * 64],
+                    "member_validity": [True, True, True],
+                    "request_count": 3,
+                    "request_sizes": [512, 512, 512],
+                    "decisions": [{
+                        "unit_id": "unit-2",
+                        "relation": "supports_unit",
+                        "supports_unit_id": "unit-1",
+                        "quorum_reached": True,
+                    }],
+                    "valid": True,
+                }],
                 "stage_b_semantic_reviews": [{
                     "owner": "orientation",
                     "proposal_hash": "4" * 64,
@@ -245,6 +262,17 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         ] = 2
         valid, reason = validate_coordinator_control_receipt(
             _signed_receipt(forged), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        forged_relation = json.loads(json.dumps(payload))
+        relation = forged_relation["authority_chain"][
+            "stage_a_relation_reviews"
+        ][0]
+        relation["decisions"][0]["supports_unit_id"] = "forged-unit"
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged_relation), turn_index=3
         )
         self.assertFalse(valid)
         self.assertIn("semantics", reason)

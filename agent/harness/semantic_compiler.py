@@ -272,6 +272,16 @@ class SemanticCompilationResult:
     response_hash: str
 
 
+@dataclass(frozen=True)
+class OpenIdentityRelationReview:
+    """Fixed-jury result for competing open-identity source units."""
+
+    decisions: tuple[Mapping[str, Any], ...]
+    errors: tuple[str, ...]
+    request_sizes: tuple[int, ...]
+    receipt: Mapping[str, Any]
+
+
 def request_semantic_compilation_result(
     provider: Any,
     *,
@@ -326,6 +336,174 @@ def request_semantic_compilation(
         max_tokens=max_tokens,
         reasoning_mode=reasoning_mode,
     ).text
+
+
+def request_open_identity_relation_jury(
+    provider: Any,
+    *,
+    proposal_hash: str,
+    request_payload: Mapping[str, Any],
+    max_tokens: int,
+) -> OpenIdentityRelationReview:
+    """Adjudicate identity-versus-support without letting the model edit units."""
+
+    prompt = (
+        "You are the bounded open-identity relation authority for AnyChain "
+        "Benchmark Agent. Review only the supplied immutable semantic units. "
+        "Each candidate unit was proposed as a concrete named identity while "
+        "the same source clause also contains a registered cross-group value "
+        "request. Decide whether the candidate source itself names an "
+        "independent concrete identity, merely supplies operation framing or "
+        "other non-action support for exactly one listed existing unit, or "
+        "remains unresolved. Generic categories, verbs, requests, pronouns, "
+        "placeholders, and operation framing are not named identities. A real "
+        "distinct proper/product/protocol identity remains independent even "
+        "when adjacent to another request. Do not infer from model-authored "
+        "reason text, workflow state, or examples; use exact source spans and "
+        "registry-owned purposes only. Return one strict JSON object with "
+        "exactly verdicts and reason. verdicts must contain one row per "
+        "candidate in supplied order with exactly unit_id, relation, "
+        "supports_unit_id, evidence_quote, and reason. relation is exactly "
+        "named_identity, supports_unit, or unresolved. supports_unit_id is "
+        "required only for supports_unit and must name one supplied possible "
+        "support unit; otherwise it is empty. evidence_quote is the shortest "
+        "non-empty exact substring of the candidate source supporting the "
+        "verdict. Never create, merge, split, rename, or rewrite a unit."
+    )
+    relations = [
+        dict(row)
+        for row in request_payload.get("relations") or ()
+        if isinstance(row, Mapping)
+    ]
+    candidate_ids = [
+        str((row.get("unit") or {}).get("unit_id") or "")
+        for row in relations
+    ]
+    candidate_sources = {
+        str((row.get("unit") or {}).get("unit_id") or ""):
+        str((row.get("unit") or {}).get("source_text") or "")
+        for row in relations
+    }
+    support_ids = {
+        str((row.get("unit") or {}).get("unit_id") or ""): {
+            str(unit.get("unit_id") or "")
+            for unit in row.get("possible_support_units") or ()
+            if isinstance(unit, Mapping) and str(unit.get("unit_id") or "")
+        }
+        for row in relations
+    }
+    if (
+        not proposal_hash
+        or not candidate_ids
+        or any(not unit_id for unit_id in candidate_ids)
+        or len(candidate_ids) != len(set(candidate_ids))
+        or any(not values for values in support_ids.values())
+    ):
+        raise ValueError("open identity relation request is incomplete")
+
+    response_hashes: list[str] = []
+    member_validity: list[bool] = []
+    request_sizes: list[int] = []
+    votes: dict[str, list[tuple[str, str]]] = {
+        unit_id: [] for unit_id in candidate_ids
+    }
+    wire_size = len(prompt.encode("utf-8")) + len(
+        _canonical_json(request_payload).encode("utf-8")
+    )
+    for _member in range(3):
+        request_sizes.append(wire_size)
+        result = request_semantic_compilation_result(
+            provider,
+            system_prompt=prompt,
+            request_payload=request_payload,
+            max_tokens=max_tokens,
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
+        )
+        response_hashes.append(result.response_hash)
+        valid = True
+        try:
+            document = _strict_json_object(result.text)
+        except ValueError:
+            document = {}
+            valid = False
+        if set(document) != {"verdicts", "reason"}:
+            valid = False
+            document = {}
+        rows = document.get("verdicts")
+        if not isinstance(rows, list) or len(rows) != len(candidate_ids):
+            valid = False
+            rows = []
+        parsed_votes: list[tuple[str, str, str]] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping) or set(row) != {
+                "unit_id", "relation", "supports_unit_id", "evidence_quote", "reason"
+            }:
+                valid = False
+                continue
+            unit_id = str(row.get("unit_id") or "")
+            relation = str(row.get("relation") or "")
+            support_id = str(row.get("supports_unit_id") or "")
+            quote = str(row.get("evidence_quote") or "")
+            if unit_id != candidate_ids[index]:
+                valid = False
+            if relation not in {"named_identity", "supports_unit", "unresolved"}:
+                valid = False
+            if relation == "supports_unit":
+                if support_id not in support_ids.get(unit_id, set()):
+                    valid = False
+            elif support_id:
+                valid = False
+            if not quote or quote not in candidate_sources.get(unit_id, ""):
+                valid = False
+            if not str(row.get("reason") or "").strip():
+                valid = False
+            parsed_votes.append((unit_id, relation, support_id))
+        if not str(document.get("reason") or "").strip():
+            valid = False
+        member_validity.append(valid)
+        if valid:
+            for unit_id, relation, support_id in parsed_votes:
+                votes[unit_id].append((relation, support_id))
+
+    decisions: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for unit_id in candidate_ids:
+        counts: dict[tuple[str, str], int] = {}
+        for vote in votes[unit_id]:
+            counts[vote] = counts.get(vote, 0) + 1
+        quorum = [vote for vote, count in counts.items() if count >= 2]
+        quorum_reached = len(quorum) == 1
+        relation, support_id = quorum[0] if quorum_reached else ("unresolved", "")
+        if not quorum_reached:
+            errors.append(
+                f"open identity relation jury did not reach quorum: {unit_id}"
+            )
+        decisions.append({
+            "unit_id": unit_id,
+            "relation": relation,
+            "supports_unit_id": support_id,
+            "quorum_reached": quorum_reached,
+        })
+    receipt = {
+        "proposal_hash": proposal_hash,
+        "candidate_unit_ids": candidate_ids,
+        "possible_support_unit_ids": {
+            unit_id: sorted(support_ids[unit_id])
+            for unit_id in candidate_ids
+        },
+        "member_response_hashes": response_hashes,
+        "member_validity": member_validity,
+        "request_count": 3,
+        "request_sizes": request_sizes,
+        "decisions": decisions,
+        "valid": all(row["quorum_reached"] for row in decisions),
+    }
+    return OpenIdentityRelationReview(
+        decisions=tuple(decisions),
+        errors=tuple(errors),
+        request_sizes=tuple(request_sizes),
+        receipt=receipt,
+    )
 
 
 def freeze_semantic_plan(
