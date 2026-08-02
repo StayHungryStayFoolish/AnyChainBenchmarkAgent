@@ -576,6 +576,7 @@ def _review_bounded_semantic_candidate(
     compact_pending_review: bool = False,
     reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
     authoritative_direct_unit_ids: frozenset[str] = frozenset(),
+    authoritative_context_unit_ids: frozenset[str] = frozenset(),
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -587,6 +588,7 @@ def _review_bounded_semantic_candidate(
             allowed_action_types=allowed_action_types,
             compact_pending_review=compact_pending_review,
             authoritative_direct_unit_ids=authoritative_direct_unit_ids,
+            authoritative_context_unit_ids=authoritative_context_unit_ids,
         )
     except ValueError as exc:
         return None, None, (str(exc),)
@@ -613,12 +615,21 @@ def _freeze_bounded_semantic_plan(
     allowed_action_types: frozenset[str] | None = None,
     compact_pending_review: bool = False,
     authoritative_direct_unit_ids: frozenset[str] = frozenset(),
+    authoritative_context_unit_ids: frozenset[str] = frozenset(),
 ) -> ImmutableSemanticPlan:
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     action_ids = _ensure_admission_action_ids(payload)
     unit_ids = [str(unit.get("unit_id") or "") if isinstance(unit, dict) else "" for unit in units]
+    unknown_authoritative_context_ids = (
+        authoritative_context_unit_ids - set(unit_ids)
+    )
+    if unknown_authoritative_context_ids:
+        raise ValueError(
+            "immutable semantic plan references an unknown authoritative "
+            "context unit"
+        )
     clause_shapes = {clause.clause_id: clause.input_shape for clause in clauses}
     unit_owner_indexes = [
         _semantic_unit_owner_indexes(unit, actions)
@@ -781,6 +792,11 @@ def _freeze_bounded_semantic_plan(
             ),
             "input_shape": clause_shapes.get(str(unit.get("clause_id") or ""), ""),
             "disposition": str(unit.get("disposition") or ""),
+            "required_unit_verdict": (
+                "context"
+                if unit_ids[index] in authoritative_context_unit_ids
+                else ""
+            ),
             "owner_action_ids": [action_ids[action_index] for action_index in unit_owner_indexes[index]],
         }
         for index, unit in enumerate(units)

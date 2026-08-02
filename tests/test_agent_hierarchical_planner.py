@@ -316,6 +316,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             result["source_partition"][1]["operation"],
             "context",
         )
+        self.assertIs(
+            result["source_partition"][1]["_admission_support"],
+            True,
+        )
         self.assertEqual(
             result["stage_a_relation_reviews"][0]["decisions"],
             [{
@@ -9741,7 +9745,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertIn("eth_chainId", request_atom)
 
     def test_hierarchical_support_receipt_survives_candidate_normalization(self) -> None:
-        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.semantic_admission import (
+            _freeze_bounded_semantic_plan,
+            prepare_hierarchical_candidate,
+        )
         from agent.harness.plan_coverage import segment_user_turn
         from agent.harness.state import new_state
 
@@ -9774,6 +9781,22 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [support_id],
         )
         self.assertTrue(validation.valid, validation.errors)
+        frozen = _freeze_bounded_semantic_plan(
+            prepared,
+            new_state("trusted-structured-support", language="en"),
+            clauses,
+            authoritative_context_unit_ids=frozenset({support_id}),
+        )
+        frozen_unit = frozen.request_payload()["semantic_units"][0]
+        self.assertEqual(frozen_unit["required_unit_verdict"], "context")
+
+        with self.assertRaisesRegex(ValueError, "unknown authoritative"):
+            _freeze_bounded_semantic_plan(
+                prepared,
+                new_state("forged-structured-support", language="en"),
+                clauses,
+                authoritative_context_unit_ids=frozenset({"forged-unit"}),
+            )
 
     def test_nested_rpc_evidence_preserves_wire_method_literal(self) -> None:
         from agent.harness.plan_coverage import segment_user_turn, validate_plan_coverage

@@ -486,7 +486,158 @@ def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
     return plan, _whole_plan_admission_payload(request)
 
 
+def _immutable_required_context_fixture(
+    *, authoritative: bool = True,
+) -> tuple[Any, dict[str, Any]]:
+    from agent.harness.semantic_compiler import freeze_semantic_plan
+
+    action_source = "fake-node"
+    context_source = "benchmark"
+    action = {"type": "greeting", "source_evidence": action_source}
+    units = [
+        {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": action_source,
+            "disposition": "action",
+            "action_indexes": [0],
+        },
+        {
+            "unit_id": "unit-2",
+            "clause_id": "clause-1",
+            "source_text": context_source,
+            "disposition": "context",
+            "action_indexes": [],
+        },
+    ]
+    plan = freeze_semantic_plan(
+        {"actions": [action], "semantic_units": units},
+        action_records=[{
+            "action_id": "action-1",
+            "action_index": 0,
+            "action": action,
+            "unit_ids": ["unit-1"],
+            "allowed_support_relations": [],
+            "required_evidence_relations": [],
+        }],
+        unit_records=[
+            {
+                "unit_id": "unit-1",
+                "unit_index": 0,
+                "unit": units[0],
+                "source_text": action_source,
+                "disposition": "action",
+                "required_unit_verdict": "",
+                "owner_action_ids": ["action-1"],
+            },
+            {
+                "unit_id": "unit-2",
+                "unit_index": 1,
+                "unit": units[1],
+                "source_text": context_source,
+                "disposition": "context",
+                "required_unit_verdict": "context" if authoritative else "",
+                "owner_action_ids": [],
+            },
+        ],
+        review_context={"pending_question": {}},
+    )
+    request = SimpleNamespace(
+        messages=[None, SimpleNamespace(content=plan.request_json)]
+    )
+    return plan, _whole_plan_admission_payload(request)
+
+
 class BoundedSemanticAdmissionTest(unittest.TestCase):
+
+    def test_authoritative_context_verdict_cannot_be_reinterpreted(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        plan, valid = _immutable_required_context_fixture()
+        self.assertTrue(validate_whole_plan_admission(
+            json.dumps(valid),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        ).valid)
+
+        omitted = deepcopy(valid)
+        omitted["unit_verdicts"][1].update({
+            "verdict": "omitted",
+            "omitted_action_type": "choose_chain",
+            "reason": "reinterpret the support as a pending chain answer",
+        })
+        result = validate_whole_plan_admission(
+            json.dumps(omitted),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "immutable verdict contract",
+            "; ".join(result.errors),
+        )
+
+    def test_frozen_authoritative_context_must_be_ownerless_context(self) -> None:
+        from agent.harness.semantic_compiler import freeze_semantic_plan
+
+        action = {"type": "greeting", "source_evidence": "hello"}
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "hello",
+            "disposition": "action",
+            "action_indexes": [0],
+        }
+        with self.assertRaisesRegex(ValueError, "not context-only"):
+            freeze_semantic_plan(
+                {"actions": [action], "semantic_units": [unit]},
+                action_records=[{
+                    "action_id": "action-1",
+                    "action_index": 0,
+                    "action": action,
+                    "unit_ids": ["unit-1"],
+                    "allowed_support_relations": [],
+                    "required_evidence_relations": [],
+                }],
+                unit_records=[{
+                    "unit_id": "unit-1",
+                    "unit_index": 0,
+                    "unit": unit,
+                    "source_text": "hello",
+                    "disposition": "action",
+                    "required_unit_verdict": "context",
+                    "owner_action_ids": ["action-1"],
+                }],
+                review_context={"pending_question": {}},
+            )
+
+    def test_ordinary_context_remains_open_to_omission_review(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        plan, payload = _immutable_required_context_fixture(
+            authoritative=False,
+        )
+        payload["unit_verdicts"][1].update({
+            "verdict": "omitted",
+            "omitted_action_type": "choose_chain",
+            "reason": "the ordinary context contains a separate chain demand",
+        })
+        result = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(result.valid)
+        self.assertNotIn(
+            "immutable verdict contract",
+            "; ".join(result.errors),
+        )
+        self.assertIn(
+            "unresolved or omitted demand",
+            "; ".join(result.errors),
+        )
     def test_canonical_chain_selection_uses_mutation_consensus(
         self,
     ) -> None:
