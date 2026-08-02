@@ -368,7 +368,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "evidence_quote": "BNB",
                 "reason": "the source names a distinct chain identity",
             }],
-            "reason": "the identity is independent",
         })
         with patch(
             "agent.harness.semantic_compiler.request_semantic_compilation_result",
@@ -426,7 +425,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "evidence_quote": "test",
                 "reason": "forged unit",
             }],
-            "reason": "invalid",
         })
         named = json.dumps({
             "verdicts": [{
@@ -436,7 +434,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "evidence_quote": "test",
                 "reason": "one minority vote",
             }],
-            "reason": "minority",
         })
         with patch(
             "agent.harness.semantic_compiler.request_semantic_compilation_result",
@@ -456,6 +453,50 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(normalized[1]["operation"], "unresolved")
         self.assertEqual(normalized[1]["owner_routes"], [])
         self.assertEqual(receipt["member_validity"], [False, True, False])
+
+    def test_open_identity_relation_jury_accepts_support_without_duplicate_reason(
+        self,
+    ) -> None:
+        from agent.harness.semantic_compiler import (
+            request_open_identity_relation_jury,
+        )
+
+        payload = {
+            "relations": [{
+                "unit": {
+                    "unit_id": "unit-2",
+                    "source_text": "run",
+                },
+                "possible_support_units": [{"unit_id": "unit-1"}],
+            }],
+        }
+        verdict = json.dumps({
+            "verdicts": [{
+                "unit_id": "unit-2",
+                "relation": "supports_unit",
+                "supports_unit_id": "unit-1",
+                "evidence_quote": "run",
+                "reason": "generic request framing supports the registered value",
+            }],
+        })
+        with patch(
+            "agent.harness.semantic_compiler.request_semantic_compilation_result",
+            side_effect=[
+                SimpleNamespace(text=verdict, response_hash=str(index) * 64)
+                for index in (1, 2, 3)
+            ],
+        ):
+            review = request_open_identity_relation_jury(
+                object(),
+                proposal_hash="4" * 64,
+                request_payload=payload,
+                max_tokens=900,
+            )
+
+        self.assertEqual(review.errors, ())
+        self.assertEqual(review.receipt["member_validity"], [True, True, True])
+        self.assertEqual(review.decisions[0]["relation"], "supports_unit")
+        self.assertEqual(review.decisions[0]["supports_unit_id"], "unit-1")
 
     def test_open_identity_relation_jury_preserves_explicit_unresolved_quorum(self) -> None:
         from agent.harness.hierarchical_planner import (
@@ -486,7 +527,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "supports_unit_id": "", "evidence_quote": "ambiguous-name",
                 "reason": "the source does not establish either relation",
             }],
-            "reason": "clarification is required",
         })
         with patch(
             "agent.harness.semantic_compiler.request_semantic_compilation_result",

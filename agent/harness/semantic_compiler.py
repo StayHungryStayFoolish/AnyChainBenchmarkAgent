@@ -356,12 +356,16 @@ def request_open_identity_relation_jury(
         "independent concrete identity, merely supplies operation framing or "
         "other non-action support for exactly one listed existing unit, or "
         "remains unresolved. Generic categories, verbs, requests, pronouns, "
-        "placeholders, and operation framing are not named identities. A real "
+        "placeholders, and operation framing are not named identities. When "
+        "such generic action or request framing turns an adjacent registered "
+        "value into one present domain request and adds no separate identity, "
+        "value, question, navigation, analysis, or mutation, it supports that "
+        "exact registered-value unit. A real "
         "distinct proper/product/protocol identity remains independent even "
         "when adjacent to another request. Do not infer from model-authored "
         "reason text, workflow state, or examples; use exact source spans and "
         "registry-owned purposes only. Return one strict JSON object with "
-        "exactly verdicts and reason. verdicts must contain one row per "
+        "exactly verdicts. verdicts must contain one row per "
         "candidate in supplied order with exactly unit_id, relation, "
         "supports_unit_id, evidence_quote, and reason. relation is exactly "
         "named_identity, supports_unit, or unresolved. supports_unit_id is "
@@ -426,7 +430,7 @@ def request_open_identity_relation_jury(
         except ValueError:
             document = {}
             valid = False
-        if set(document) != {"verdicts", "reason"}:
+        if set(document) != {"verdicts"}:
             valid = False
             document = {}
         rows = document.get("verdicts")
@@ -458,8 +462,6 @@ def request_open_identity_relation_jury(
             if not str(row.get("reason") or "").strip():
                 valid = False
             parsed_votes.append((unit_id, relation, support_id))
-        if not str(document.get("reason") or "").strip():
-            valid = False
         member_validity.append(valid)
         if valid:
             for unit_id, relation, support_id in parsed_votes:
