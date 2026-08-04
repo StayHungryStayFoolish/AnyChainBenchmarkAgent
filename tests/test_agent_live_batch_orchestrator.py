@@ -54,6 +54,7 @@ from tests.agent_live.batch_orchestrator import (
     _authoritative_ledger_snapshot,
     _classify,
     _controller_fact_payloads,
+    _not_started_interruption_result,
     _scan_batch_execution_ids,
     _validate_context_frame,
     _validate_result_frame,
@@ -1672,6 +1673,303 @@ class BatchOrchestratorTests(unittest.TestCase):
             2,
         )
         self.assertTrue(index.batch_survivor_proof["cleaned"])
+
+    def test_controller_interruption_closes_broker_before_result_publication(
+        self,
+    ) -> None:
+        self._write_targets(3)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-interrupt-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-interrupt-runtime",
+            shard_count=3,
+            max_concurrency=1,
+            required_env_names=(),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+            ),
+        )
+
+        class CloseableBroker:
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+                self.close_count = 0
+
+            async def __call__(self, _shard_id, _context):
+                await self.closed.wait()
+                raise ExternalDecisionBlocked("broker closed")
+
+            def close(self) -> None:
+                self.close_count += 1
+                self.closed.set()
+
+        broker = CloseableBroker()
+        runner_started = asyncio.Event()
+        runner_calls: list[str] = []
+
+        async def controlled_runner(batch, shard, _broker, _signer):
+            runner_calls.append(shard.shard_id)
+            runner_started.set()
+            await broker.closed.wait()
+            return _not_started_interruption_result(
+                batch,
+                shard,
+                asyncio.CancelledError("controller stop completed"),
+            )
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=broker,
+                result_index_path=(
+                    self.root / ".agent" / "controller-interrupt-index.json"
+                ),
+                interruption_event=interruption_event,
+            ))
+            await asyncio.wait_for(runner_started.wait(), timeout=2)
+            interruption_event.set()
+            return await asyncio.wait_for(task, timeout=2)
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_controller_owned_shard",
+            side_effect=controlled_runner,
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertEqual(broker.close_count, 1)
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertEqual(index.completed, 3)
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+        for result in index.shards:
+            receipt_path = Path(result.cleanup_receipt_path)
+            self.assertTrue(receipt_path.is_file())
+            self.assertEqual(
+                hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                result.cleanup_receipt_hash,
+            )
+
+    def test_controller_execution_rejects_a_non_closeable_broker(self) -> None:
+        self._write_targets(1)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-broker-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-broker-runtime",
+            shard_count=1,
+            required_env_names=(),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires a closeable decision broker",
+        ):
+            asyncio.run(run_batch(
+                manifest,
+                broker=lambda _shard_id, _context: {},
+                result_index_path=(
+                    self.root / ".agent" / "controller-broker-index.json"
+                ),
+            ))
+
+        self.assertFalse(
+            (self.root / ".agent" / "controller-broker-runtime").exists()
+        )
+
+    def test_controller_interruption_before_admission_starts_no_shard(
+        self,
+    ) -> None:
+        self._write_targets(2)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-prestart-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-prestart-runtime",
+            shard_count=2,
+            max_concurrency=1,
+            required_env_names=(),
+        )
+
+        class CloseableBroker:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            async def __call__(self, _shard_id, _context):
+                raise AssertionError("no decision should be requested")
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        broker = CloseableBroker()
+        runner_calls: list[str] = []
+
+        async def controlled_runner(*args):
+            runner_calls.append(args[1].shard_id)
+            raise AssertionError("interrupted shard must not start")
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            interruption_event.set()
+            return await run_batch(
+                manifest,
+                broker=broker,
+                result_index_path=(
+                    self.root / ".agent" / "controller-prestart-index.json"
+                ),
+                interruption_event=interruption_event,
+            )
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_controller_owned_shard",
+            side_effect=controlled_runner,
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertEqual(runner_calls, [])
+        self.assertEqual(broker.close_count, 1)
+        self.assertEqual(index.completed, 2)
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+
+    def test_controller_interruption_after_partial_completion_stops_new_work(
+        self,
+    ) -> None:
+        self._write_targets(3)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-partial-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-partial-runtime",
+            shard_count=3,
+            max_concurrency=1,
+            required_env_names=(),
+        )
+
+        class CloseableBroker:
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+
+            async def __call__(self, _shard_id, _context):
+                await self.closed.wait()
+                raise ExternalDecisionBlocked("broker closed")
+
+            def close(self) -> None:
+                self.closed.set()
+
+        broker = CloseableBroker()
+        second_started = asyncio.Event()
+        runner_calls: list[str] = []
+
+        async def controlled_runner(batch, shard, _broker, _signer):
+            runner_calls.append(shard.shard_id)
+            if len(runner_calls) == 2:
+                second_started.set()
+                await broker.closed.wait()
+            return _not_started_interruption_result(
+                batch,
+                shard,
+                asyncio.CancelledError("controller lifecycle completed"),
+            )
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=broker,
+                result_index_path=(
+                    self.root / ".agent" / "controller-partial-index.json"
+                ),
+                interruption_event=interruption_event,
+            ))
+            await asyncio.wait_for(second_started.wait(), timeout=2)
+            interruption_event.set()
+            return await asyncio.wait_for(task, timeout=2)
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_controller_owned_shard",
+            side_effect=controlled_runner,
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertEqual(len(runner_calls), 2)
+        self.assertEqual(index.completed, 3)
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+
+    def test_controller_batch_cancellation_is_a_cooperative_cleanup_barrier(
+        self,
+    ) -> None:
+        self._write_targets(1)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-cancel-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-cancel-runtime",
+            shard_count=1,
+            max_concurrency=1,
+            required_env_names=(),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+            ),
+        )
+
+        class CloseableBroker:
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+
+            async def __call__(self, _shard_id, _context):
+                await self.closed.wait()
+                raise ExternalDecisionBlocked("broker closed")
+
+            def close(self) -> None:
+                self.closed.set()
+
+        broker = CloseableBroker()
+        runner_started = asyncio.Event()
+        runner_cancelled = False
+
+        async def controlled_runner(batch, shard, _broker, _signer):
+            nonlocal runner_cancelled
+            runner_started.set()
+            try:
+                await broker.closed.wait()
+            except asyncio.CancelledError:
+                runner_cancelled = True
+                raise
+            return _not_started_interruption_result(
+                batch,
+                shard,
+                asyncio.CancelledError("controller cancellation completed"),
+            )
+
+        async def scenario():
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=broker,
+                result_index_path=(
+                    self.root / ".agent" / "controller-cancel-index.json"
+                ),
+            ))
+            await asyncio.wait_for(runner_started.wait(), timeout=2)
+            task.cancel()
+            return await asyncio.wait_for(task, timeout=2)
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_controller_owned_shard",
+            side_effect=controlled_runner,
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertFalse(runner_cancelled)
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+        receipt_path = Path(index.shards[0].cleanup_receipt_path)
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(
+            hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+            index.shards[0].cleanup_receipt_hash,
+        )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "formal control plane is Linux-only")
     def test_filesystem_broker_process_sigterm_persists_truthful_cleanup(self) -> None:

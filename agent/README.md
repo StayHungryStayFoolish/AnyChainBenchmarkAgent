@@ -457,6 +457,13 @@ turn from the actual previous response. Ledger, matrix, PTY, simulator, and
 execution scripts are subordinate evidence providers; their direct exit codes
 cannot declare product readiness.
 
+Controller-owned Chaos batches use cooperative shutdown. Their decision broker
+must expose `close()` so an interruption releases every response-bound wait.
+The controller stops admitting queued shards, lets active shard owners finish
+PTY/process cleanup, validates durable cleanup receipts, and only then publishes
+the immutable batch index. Cancelling shielded runner threads or fabricating a
+synthetic success/cleanup receipt is not an accepted shutdown path.
+
 For local real-node and sync-observe orchestration checks, use the digest-pinned
 Geth development service through `tests/agent_live/local_evm_node.sh` inside
 Docker/Linux. It proves runtime wiring and artifacts, not mainnet catch-up

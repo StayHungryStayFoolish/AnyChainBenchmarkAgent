@@ -571,6 +571,14 @@ artifacts. Registry edge coverage, high-risk multi-edge sequences, executed
 covering rows, real execution artifacts, and the required new no-S1/S2 dynamic
 rounds must report `observed-pass`, `observed-fail`, `not-run`, and
 `externally-blocked` denominators.
+
+Controller-owned Chaos batches have one cooperative shutdown barrier. The
+decision broker is closeable; interruption closes it, prevents queued shards
+from starting, and allows active shard owners to finish their own PTY/process
+cleanup. Cleanup receipts must be durable and validated before the controller
+publishes a shard result or immutable batch index. Task cancellation, sleeps,
+or synthetic receipts cannot substitute for that lifecycle proof.
+
 fake-node proves only its closed loop, not real-node or sync-observe workflow
 coverage. Live Gemini `google_search` remains an explicit external verification
 boundary when credentials are unavailable.

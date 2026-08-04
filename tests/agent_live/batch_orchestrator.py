@@ -210,6 +210,9 @@ class DecisionBroker(Protocol):
     ) -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]:
         """Return exactly one decision bound to the supplied response context."""
 
+    def close(self) -> None | Awaitable[None]:
+        """Release pending decision waits during controller shutdown."""
+
 
 CommandFactory = Callable[[int, Path, Path, str, int, str], Sequence[str]]
 
@@ -1660,14 +1663,35 @@ async def run_batch(
     if index_path.exists():
         raise FileExistsError(f"batch result index is immutable: {index_path}")
 
+    broker_close = getattr(broker, "close", None)
+    if frozen.controller_owned_execution and not callable(broker_close):
+        raise ValueError(
+            "controller-owned execution requires a closeable decision broker"
+        )
+
     semaphore = asyncio.Semaphore(frozen.max_concurrency)
+    stop_requested = asyncio.Event()
+    broker_closed = False
+
+    async def request_stop() -> None:
+        nonlocal broker_closed
+        stop_requested.set()
+        if not frozen.controller_owned_execution or broker_closed:
+            return
+        broker_closed = True
+        close_result = broker_close()
+        if inspect.isawaitable(close_result):
+            await close_result
 
     async def run_bounded(shard: FrozenShardSpec) -> ShardResult:
         try:
             async with semaphore:
                 if (
-                    interruption_event is not None
-                    and interruption_event.is_set()
+                    stop_requested.is_set()
+                    or (
+                        interruption_event is not None
+                        and interruption_event.is_set()
+                    )
                 ):
                     return _not_started_interruption_result(
                         frozen,
@@ -1685,6 +1709,8 @@ async def run_batch(
                     frozen, shard, broker, authority_signer
                 )
         except asyncio.CancelledError as exc:
+            if frozen.controller_owned_execution:
+                raise
             return _not_started_interruption_result(frozen, shard, exc)
 
     tasks = [
@@ -1695,7 +1721,11 @@ async def run_batch(
     try:
         gather = asyncio.gather(*tasks, return_exceptions=True)
         if interruption_event is None:
-            raw_results = await gather
+            raw_results = (
+                await asyncio.shield(gather)
+                if frozen.controller_owned_execution
+                else await gather
+            )
         else:
             interruption_wait = asyncio.create_task(interruption_event.wait())
             try:
@@ -1705,20 +1735,32 @@ async def run_batch(
                 )
                 if interruption_wait in done and interruption_event.is_set():
                     batch_interrupted = True
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                raw_results = await gather
+                    await request_stop()
+                    if not frozen.controller_owned_execution:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                raw_results = (
+                    await asyncio.shield(gather)
+                    if frozen.controller_owned_execution
+                    else await gather
+                )
             finally:
                 if not interruption_wait.done():
                     interruption_wait.cancel()
                 await asyncio.gather(interruption_wait, return_exceptions=True)
     except asyncio.CancelledError:
         batch_interrupted = True
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        await request_stop()
+        if not frozen.controller_owned_execution:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        raw_results = (
+            await asyncio.shield(gather)
+            if frozen.controller_owned_execution
+            else await asyncio.gather(*tasks, return_exceptions=True)
+        )
     results: list[ShardResult] = []
     for shard, raw in zip(frozen.shards, raw_results, strict=True):
         if isinstance(raw, BaseException):

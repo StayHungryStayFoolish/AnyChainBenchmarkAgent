@@ -514,6 +514,14 @@ coverage。pass 必须绑定当前 revision 的 observed state transition 和独
 postcondition；execution edge 还必须包含 hash 绑定的 job artifact。registry edge、
 高风险多边序列、covering rows、真实执行 artifact 和规定的新 no-S1/S2 动态轮次，必须
 分别报告 `observed-pass`、`observed-fail`、`not-run` 和 `externally-blocked`
-denominator。fake-node 只能证明
+denominator。
+
+controller-owned Chaos batch 必须通过一个协作式停止屏障收敛。decision broker
+必须可关闭；发生中断时先关闭 broker、阻止排队 shard 启动，再由活跃 shard owner
+完成自己的 PTY/进程清理。只有清理凭据已持久化并通过校验后，controller 才能发布
+shard result 和不可变 batch index。取消受保护的 runner thread、等待固定时长或伪造
+synthetic cleanup receipt 都不能替代该生命周期证明。
+
+fake-node 只能证明
 自身闭环，不能证明 real-node 或 sync-observe workflow coverage。没有可用认证时，真实
 Gemini `google_search` 必须明确记录为外部验证边界。
