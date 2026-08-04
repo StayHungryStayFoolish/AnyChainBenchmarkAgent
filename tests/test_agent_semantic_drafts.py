@@ -2145,6 +2145,40 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(committed["action_queue"], [])
         self.assertEqual(committed["control"]["phase"], "compose")
 
+    def test_session_entry_replays_exact_draft_question_without_resume_takeover(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import (
+            _apply_handler_result,
+            _semantic_draft_question,
+        )
+        from agent.harness.domains.orientation import apply_orientation_action
+
+        draft = self._draft(active_group="qps_profile")
+        state = new_state("draft-test", language="en")
+        state["turn_index"] = draft["creation_turn"]
+        state["active_group"] = "qps_profile"
+        state["semantic_plan_draft"] = deepcopy(draft)
+        state["pending_question"] = _semantic_draft_question(draft)
+        original_pending = deepcopy(state["pending_question"])
+
+        result = apply_orientation_action(
+            state,
+            ActionProposal(
+                action_id="prepare-session-entry",
+                action_type="prepare_session_entry",
+                confidence="high",
+            ),
+        )
+        committed = _apply_handler_result(state, result, owner="orientation")
+
+        self.assertEqual(committed["semantic_plan_draft"], draft)
+        self.assertEqual(committed["pending_question"], original_pending)
+        self.assertEqual(committed["active_group"], "qps_profile")
+        self.assertEqual(committed["resume_context"], {})
+        self.assertEqual(committed["group_states"], {})
+        validate_state(committed)
+
     def test_pending_cancel_option_commits_with_semantic_draft_atomically(
         self,
     ) -> None:

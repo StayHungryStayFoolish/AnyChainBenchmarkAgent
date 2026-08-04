@@ -260,6 +260,17 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     action_type = action.action_type
     if action_type == "prepare_session_entry":
         current_pending = dict(state.get("pending_question") or {})
+        semantic_draft = dict(state.get("semantic_plan_draft") or {})
+        if (
+            semantic_draft.get("status") == "awaiting_clarification"
+            and current_pending.get("semantic_draft_binding")
+        ):
+            return HandlerResult(
+                consumed_action_ids=(action.action_id,),
+                pending_question=current_pending,
+                completion="blocked",
+                stop_after_response=True,
+            )
         resumable = has_resumable_configuration(state)
         question = (
             resume_question(

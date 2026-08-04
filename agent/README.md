@@ -121,6 +121,9 @@ domain requests are not swallowed. No quorum leaves the atom unresolved and
 routes the complete turn normally. Draft identity, source coverage, sibling
 invalidation, and final admission remain deterministic framework contracts;
 the model cannot mutate draft or business state directly.
+On process restart, this exclusive barrier is replayed as the same signed draft
+question; the generic session-resume selector cannot replace it or change its
+active group.
 
 LLM output is never executed directly. The semantic path checkpoints
 `partition`, repeats `compile_owner` once per scheduled owner, checkpoints

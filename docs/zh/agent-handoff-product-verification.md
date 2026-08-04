@@ -136,6 +136,9 @@ reviewer 达成 quorum 后，只能授权一个完全一致、逐字节保留的
 澄清 evidence。该片段由 coordinator 作为唯一 pending answer 处理，Stage A
 仍须无损路由所有未被引用的兄弟片段。未形成 quorum 时 atom 保持 unresolved，
 完整输入走普通路由。模型输出本身无权解析 atom，也无权直接修改产品状态。
+如果进程在该 barrier 生效期间重启，session entry 必须重放同一个签名 draft
+问题；不得使用通用 resume selector 替换它、改变 active group，或创建第二个
+pending authority。
 
 ## 历史问题迁移
 

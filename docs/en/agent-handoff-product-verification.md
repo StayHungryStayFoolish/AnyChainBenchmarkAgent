@@ -181,6 +181,10 @@ owns that pending answer while Stage A losslessly routes every unquoted sibling
 span. Without quorum the atom remains unresolved and the complete turn follows
 ordinary routing. A model response never resolves the atom or mutates product
 state by itself.
+If the process restarts while this barrier is active, session entry must replay
+the exact signed draft question. It must not replace the question with the
+generic resume selector, mutate its active group, or create a second pending
+authority.
 
 ## Migrated Historical Findings
 
