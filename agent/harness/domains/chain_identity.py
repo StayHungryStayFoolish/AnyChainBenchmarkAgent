@@ -16,6 +16,7 @@ from ..advisory import (
 from ..questions import question_text
 from ..state import AgentGraphState
 from ..transitions import (
+    invalidate_for_adapter_family_change,
     invalidate_for_chain_change,
     invalidate_for_target_mode,
 )
@@ -628,6 +629,9 @@ def _enter_case_for_adapter_family(
 ) -> None:
     identity = state.setdefault("chain_identity", {})
     family = normalize_scalar(family)
+    previous_family = normalize_scalar(identity.get("adapter_family"))
+    if previous_family and previous_family != family:
+        invalidate_for_adapter_family_change(state)
     identity["adapter_family"] = family
     if family not in SUPPORTED_ADAPTER_FAMILIES:
         _route_unsupported_family(state, responses=responses)

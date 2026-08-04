@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from agent.harness.queue import ActionQueueConflict, order_action_queue
+from agent.harness.queue import (
+    ActionQueueConflict,
+    action_can_run_while_pending,
+    action_supersedes_pending_contract,
+    order_action_queue,
+)
 from agent.harness.state import new_state
 
 
@@ -26,6 +31,24 @@ def _types(actions: list[dict]) -> list[str]:
 
 
 class ActionQueueOrderingTests(unittest.TestCase):
+    def test_upstream_protocol_change_crosses_stale_pending_barrier(self) -> None:
+        state = _configured_state()
+        state["pending_question"] = {
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "queue_barrier": True,
+            "barrier_policy": "explicit_detour_only",
+        }
+        action = {
+            "type": "choose_adapter_family",
+            "adapter_family": "jsonrpc",
+            "_origin_text": "Change the protocol family, then validate the method.",
+            "_plan_transaction_hash": "reviewed-plan",
+        }
+
+        self.assertTrue(action_supersedes_pending_contract(state, action))
+        self.assertTrue(action_can_run_while_pending(state, action))
+
     def test_exact_target_mode_replacement_precedes_same_turn_qps(self) -> None:
         state = _configured_state()
         actions = [

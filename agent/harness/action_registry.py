@@ -773,6 +773,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
                 value_argument="adapter_family",
             ),
         ),
+        crosses_pending_barrier=True,
         semantic_value_grounding_arguments=("adapter_family",),
     ),
     ActionSpec(

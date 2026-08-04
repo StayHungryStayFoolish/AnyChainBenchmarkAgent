@@ -64,6 +64,30 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
     record_group_invalidations(state, "chain_identity")
 
 
+def invalidate_for_adapter_family_change(state: AgentGraphState) -> None:
+    """Remove facts whose interpretation depends on the adapter protocol."""
+
+    state["rpc_mode"] = ""
+    for key in ("workload", "endpoint_evidence", "fixture_evidence", "custom_rpc"):
+        state[key] = {}
+    confirmed = state.setdefault("confirmed_config", {})
+    for field in (
+        "LOCAL_RPC_URL",
+        "SYNC_OBSERVE_RPC_URL",
+        "MAINNET_RPC_URL",
+        "MAINNET_RPC_URL_REVIEWED",
+        "MAINNET_RPC_URL_DISABLED",
+        "CHAIN_REST_URL",
+        "CHAIN_INDEXER_URL",
+        "CHAIN_SIDECAR_URL",
+        "CHAIN_EVM_RPC_URL",
+        "CHAIN_JSON_RPC_URL",
+        "CHAIN_MIRROR_URL",
+    ):
+        confirmed.pop(field, None)
+    record_group_invalidations(state, "chain_identity")
+
+
 def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") -> None:
     """Invalidate mode-specific state after an explicitly confirmed switch.
 

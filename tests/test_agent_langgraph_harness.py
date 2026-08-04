@@ -9302,6 +9302,111 @@ network:
         self.assertEqual(result["chain_identity"]["status"], "existing_family_needs_endpoint")
         self.assertEqual(result["pending_question"]["id"], "new_chain_endpoint")
 
+    def test_protocol_correction_invalidates_old_evidence_and_defers_method(
+        self,
+    ) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("protocol-correction", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "example-chain",
+            "canonical": "example-chain",
+            "adapter_family": "rest",
+            "status": "existing_family_needs_method",
+            "case": "case2",
+            "identity_confirmed": True,
+        }
+        state["endpoint_evidence"] = {
+            "candidate_endpoint": "http://old.invalid",
+            "candidate_endpoint_ready": True,
+        }
+        state["confirmed_config"] = {"LOCAL_RPC_URL": "http://old.invalid"}
+        state["pending_question"] = {
+            "contract_version": 6,
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "owner": "chain_rpc",
+            "kind": "manual_value",
+            "field": "new_chain_method",
+            "manual_input_allowed": True,
+            "sensitive_input": False,
+            "options": [],
+            "accepted_action_types": ["answer_pending", "rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+            "queue_barrier": True,
+            "barrier_policy": "explicit_detour_only",
+            "value_domain": "typed_value",
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+        }
+        state["last_user_input"] = (
+            "Change the protocol family, then validate method_a."
+        )
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "choose_adapter_family",
+                    "adapter_family": "jsonrpc",
+                    "confidence": "high",
+                },
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_method",
+                    "rpc_method": "method_a",
+                    "source_evidence": "method_a",
+                    "confidence": "high",
+                },
+            ],
+        )
+
+        self.assertEqual(result["chain_identity"]["adapter_family"], "jsonrpc")
+        self.assertEqual(
+            result["chain_identity"]["status"],
+            "existing_family_needs_endpoint",
+        )
+        self.assertEqual(result["pending_question"]["id"], "new_chain_endpoint")
+        self.assertNotIn("LOCAL_RPC_URL", result["confirmed_config"])
+        self.assertEqual(result["endpoint_evidence"], {})
+        self.assertIn(
+            "rpc_catalog_command",
+            [item["action_type"] for item in result["action_queue"]],
+        )
+
+        result["last_user_input"] = "https://example.invalid/rpc"
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+            side_effect=self._mock_rpc_probe,
+        ):
+            result = _reviewed_pending_answer(
+                result,
+                result["last_user_input"],
+                manual_value=result["last_user_input"],
+            )
+
+        self.assertEqual(
+            result["chain_identity"]["status"],
+            "existing_family_needs_schema_evidence",
+        )
+        self.assertEqual(
+            _catalog_draft(result)["method"],
+            "method_a",
+        )
+        self.assertEqual(
+            result["pending_question"]["id"],
+            "new_chain_schema_evidence",
+        )
+        self.assertEqual(result["action_queue"], [])
+
     def test_unknown_chain_protocol_hint_with_requirements_question_keeps_endpoint_pending(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state

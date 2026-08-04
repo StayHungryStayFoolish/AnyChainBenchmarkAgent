@@ -52,6 +52,7 @@ from .questions import (
     typed_pending_value_candidates,
     value_satisfies_pending_contract,
 )
+from .queue import action_supersedes_pending_contract
 from .semantic_compiler import (
     ImmutableSemanticPlan,
     STRICT_JSON_REASONING_MODE,
@@ -171,6 +172,11 @@ def _canonicalize_pending_choice_actions(
         return text
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    pending_superseded = any(
+        isinstance(sibling, Mapping)
+        and action_supersedes_pending_contract(state, sibling)
+        for sibling in actions
+    )
     contracts: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
@@ -189,6 +195,8 @@ def _canonicalize_pending_choice_actions(
                 if str(action.get("type") or "") == "answer_pending"
                 else _matching_pending_manual_value(action, pending)
             )
+            if manual_value is None and pending_superseded:
+                manual_value = _single_pending_answer_representation(action)
         if manual_value is not None:
             source = str(action.get("source_evidence") or "").strip()
             units = _source_units_for_action(payload, index)
@@ -198,16 +206,21 @@ def _canonicalize_pending_choice_actions(
                 continue
             if _action_answers_bound_semantic_draft(action, pending):
                 continue
-            declared_manual_action = manual_action_for_value(
-                pending,
-                manual_value,
+            declared_manual_action = (
+                _manual_action_after_pending_supersession(
+                    pending,
+                    manual_value,
+                )
+                if pending_superseded
+                else manual_action_for_value(pending, manual_value)
             )
             if (
                 declared_manual_action
                 and str(declared_manual_action.get("type") or "")
                 != "answer_pending"
                 and (
-                    isinstance(
+                    pending_superseded
+                    or isinstance(
                         pending.get("semantic_draft_binding"),
                         Mapping,
                     )
@@ -302,6 +315,59 @@ def _canonicalize_pending_choice_actions(
         payload["pending_choice_contracts"] = contracts
     payload = _coalesce_equivalent_manual_pending_answers(payload, pending)
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _single_pending_answer_representation(action: Mapping[str, Any]) -> Any:
+    """Read one unambiguous answer without applying a stale value domain."""
+
+    if str(action.get("type") or "") != "answer_pending":
+        return None
+    values: list[Any] = []
+    identities: set[str] = set()
+    for key in ("answer", "selected_value"):
+        if key not in action:
+            continue
+        value = action.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        normalized = value.strip() if isinstance(value, str) else value
+        identity = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if identity not in identities:
+            identities.add(identity)
+            values.append(normalized)
+    return values[0] if len(values) == 1 else None
+
+
+def _manual_action_after_pending_supersession(
+    pending: Mapping[str, Any],
+    value: Any,
+) -> dict[str, Any]:
+    """Compile the declared owner action after its old value domain expired."""
+
+    declared = pending.get("manual_action")
+    if not isinstance(declared, Mapping):
+        return {}
+    action_type = str(declared.get("type") or "").strip()
+    value_argument = str(declared.get("value_argument") or "").strip()
+    spec = ACTION_BY_TYPE.get(action_type)
+    if (
+        spec is None
+        or not value_argument
+        or value_argument not in spec.allowed_arguments
+    ):
+        return {}
+    action = {
+        str(key): item
+        for key, item in declared.items()
+        if str(key) not in {"value_argument", "use_complete_turn"}
+    }
+    action[value_argument] = value
+    return action
 
 
 def _coalesce_equivalent_manual_pending_answers(

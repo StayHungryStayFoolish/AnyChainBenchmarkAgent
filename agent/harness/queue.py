@@ -82,6 +82,25 @@ def order_action_queue(
             }
             if missing & providers[sibling_index]:
                 continue
+            declared_manual = (state.get("pending_question") or {}).get(
+                "manual_action"
+            )
+            detached_manual_owner = bool(
+                isinstance(declared_manual, Mapping)
+                and str(declared_manual.get("type") or "")
+                == str(actions[settler_index].get("type") or "")
+            )
+            if (
+                detached_manual_owner
+                and action_supersedes_pending_contract(state, sibling)
+            ):
+                _add_dependency(
+                    sibling_index,
+                    settler_index,
+                    incoming=incoming,
+                    outgoing=outgoing,
+                )
+                continue
             _add_dependency(
                 settler_index,
                 sibling_index,
@@ -228,6 +247,30 @@ def _action_settles_current_pending(
     if not pending:
         return False
     return action_settles_pending_contract(action, pending)
+
+
+def action_supersedes_pending_contract(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> bool:
+    """Return whether a mutation changes an upstream fact of the question.
+
+    This is a dependency decision, not an intent guess. The group registry owns
+    the dependency graph, and the action registry owns mutation effects and
+    invalidations.
+    """
+
+    pending_group = str(
+        (state.get("pending_question") or {}).get("group") or ""
+    ).strip()
+    if not pending_group or not _action_mutates_workflow(action):
+        return False
+    target_groups = action_target_groups(action)
+    invalidated_groups = _action_invalidations(action)
+    return bool(
+        pending_group in invalidated_groups
+        or target_groups & _transitive_group_dependencies(pending_group)
+    )
 
 
 def _group_invalidations(group: str) -> tuple[str, ...]:
@@ -393,26 +436,62 @@ def action_can_run_while_pending(
         for item in pending.get("accepted_action_types") or []
         if str(item).strip()
     }
+    pending_created_this_turn = bool(
+        pending
+        and "created_turn_index" in pending
+        and int(pending.get("created_turn_index") or 0)
+        == int(state.get("turn_index") or 0)
+    )
+    declared_manual = pending.get("manual_action")
     spec = ACTION_BY_TYPE.get(action_type)
     if action_type == "answer_pending":
         return True
-    if action_type in accepted and not (
-        spec is not None
-        and spec.typed_option_only
-        and action.get("selection_contract_verified") is not True
+    if (
+        action_type in accepted
+        and (
+            not pending_created_this_turn
+            or not isinstance(declared_manual, Mapping)
+            or action_settles_pending_contract(action, pending)
+        )
+        and not (
+            spec is not None
+            and spec.typed_option_only
+            and action.get("selection_contract_verified") is not True
+        )
     ):
         return True
     source_evidence = str(action.get("source_evidence") or "").strip()
     origin_text = str(action.get("_origin_text") or "").strip()
     source_is_grounded = bool(
-        source_evidence
-        and origin_text
-        and source_evidence.casefold() in origin_text.casefold()
+        (
+            source_evidence
+            and origin_text
+            and source_evidence.casefold() in origin_text.casefold()
+        )
+        or (
+            origin_text
+            and action.get("_source_unit_ids")
+            and (
+                action.get("_semantic_consensus_receipt")
+                or action.get("_semantic_admission_receipt")
+                or action.get("_plan_transaction_hash")
+            )
+        )
+    )
+    reviewed_plan_is_grounded = bool(
+        source_is_grounded
+        or (origin_text and action.get("_plan_transaction_hash"))
     )
     user_grounded_detour = bool(
         spec is not None
         and spec.preserve_pending
         and source_is_grounded
+    )
+    superseding_mutation = bool(
+        spec is not None
+        and spec.crosses_pending_barrier
+        and reviewed_plan_is_grounded
+        and action_supersedes_pending_contract(state, action)
     )
     declared_intake_detour = bool(
         spec is not None
@@ -449,10 +528,6 @@ def action_can_run_while_pending(
     barrier = pending_barrier_semantics(pending)
     if barrier["queue_barrier"]:
         barrier_policy = str(barrier["policy"])
-        pending_created_this_turn = bool(
-            int(pending.get("created_turn_index") or 0)
-            == int(state.get("turn_index") or 0)
-        )
         if barrier_policy == "exclusive_owner":
             if pending_created_this_turn:
                 return bool(
@@ -469,6 +544,7 @@ def action_can_run_while_pending(
                 action_is_turn_local(action)
                 or explicit_navigation
                 or explicit_administrative_detour
+                or superseding_mutation
                 or trusted_runtime_control
             )
         if pending_created_this_turn:
@@ -483,11 +559,6 @@ def action_can_run_while_pending(
             or administrative_detour
             or explicit_navigation
         )
-    pending_created_this_turn = bool(
-        pending
-        and int(pending.get("created_turn_index") or 0)
-        == int(state.get("turn_index") or 0)
-    )
     if pending_created_this_turn:
         return bool(
             pending.get("same_turn_navigation_allowed") is True

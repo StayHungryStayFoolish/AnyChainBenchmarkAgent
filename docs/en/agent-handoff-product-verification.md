@@ -185,6 +185,20 @@ If the process restarts while this barrier is active, session entry must replay
 the exact signed draft question. It must not replace the question with the
 generic resume selector, mutate its active group, or create a second pending
 authority.
+Finalization is a single replay boundary. The replay may yield a fully admitted
+action plan, but it must never mint a second semantic draft from an atom whose
+clarification was already accepted. A still-unrepresentable atom makes the
+original draft stale and enters the explicit unresolved/failure path; repeating
+the same clarification question is a product failure.
+
+An upstream mutation and a value for the now-stale pending question may coexist
+in one reviewed turn. The registered dependency and invalidation graphs must
+order the mutation first, invalidate evidence derived from the old context, and
+retain the old question's declared manual action behind any newly required
+prerequisite. The retained action executes only after that prerequisite is
+confirmed. Matching only an `accepted_action_type` is insufficient to bypass a
+new manual question when the action's fixed arguments do not match the
+question's declared manual action.
 
 ## Migrated Historical Findings
 

@@ -1692,6 +1692,42 @@ def review_semantic_plan(
     )
     if not validation.valid:
         if validation.unresolved_units and not validation.errors:
+            ready_draft = dict(state.get("semantic_plan_draft") or {})
+            finalization = dict(
+                (state.get("turn_context") or {}).get(
+                    "semantic_draft_finalization"
+                )
+                or {}
+            )
+            finalizing_ready_draft = bool(
+                ready_draft.get("status") == "ready_for_review"
+                and str(finalization.get("draft_id") or "")
+                == str(ready_draft.get("draft_id") or "")
+                and int(finalization.get("revision") or 0)
+                == int(ready_draft.get("revision") or 0)
+            )
+            if finalizing_ready_draft:
+                return _with_metrics(
+                    _unresolved_action_queue(
+                        clauses,
+                        (
+                            "semantic draft finalization remained unresolved "
+                            "after bound clarification",
+                        ),
+                        semantic_units=[
+                            dict(item)
+                            for item in validation.unresolved_units
+                            if isinstance(item, Mapping)
+                        ],
+                    ),
+                    started,
+                    request_sizes=request_sizes,
+                    stage_a_calls=stage_a_calls,
+                    stage_b_calls=stage_b_calls,
+                    admission_calls=admission_calls,
+                    owner_count=owner_count,
+                    unit_count=unit_count,
+                )
             original_input = "\n".join(clause.text for clause in clauses)
             (
                 source_secret_replacements,

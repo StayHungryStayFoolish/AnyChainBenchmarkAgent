@@ -124,6 +124,21 @@ the model cannot mutate draft or business state directly.
 On process restart, this exclusive barrier is replayed as the same signed draft
 question; the generic session-resume selector cannot replace it or change its
 active group.
+Finalization recompiles the original complete turn exactly once with the bound
+resolution evidence. It may produce a final admitted action plan, but it may
+not recursively create another semantic draft. If the owning compilers still
+cannot represent a resolved atom, the original draft becomes stale and the
+turn enters the explicit unresolved/failure path instead of asking the same
+clarification again.
+
+When one reviewed turn both replaces an upstream workflow fact and supplies a
+value for the question that depended on the old fact, the dependency graph
+orders the upstream mutation first. The old question's declared manual action
+is detached from its stale value domain and retained as a durable action. The
+mutation invalidates protocol-derived evidence, the replacement prerequisite
+question is completed, and only then may the retained action execute under the
+new context. A newly created manual question cannot be bypassed merely because
+it accepts the same multiplexed action type with different fixed arguments.
 
 LLM output is never executed directly. The semantic path checkpoints
 `partition`, repeats `compile_owner` once per scheduled owner, checkpoints

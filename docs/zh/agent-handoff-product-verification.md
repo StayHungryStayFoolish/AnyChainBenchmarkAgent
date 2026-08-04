@@ -139,6 +139,17 @@ reviewer 达成 quorum 后，只能授权一个完全一致、逐字节保留的
 如果进程在该 barrier 生效期间重启，session entry 必须重放同一个签名 draft
 问题；不得使用通用 resume selector 替换它、改变 active group，或创建第二个
 pending authority。
+finalization 是一次性 replay 边界：它可以生成完整且通过 admission 的 action
+plan，但不得针对已经接受澄清的 atom 再创建第二份 semantic draft。如果 owner
+compiler 仍无法表示该 atom，原 draft 必须标记为 stale，并进入显式 unresolved /
+failure 路径；再次询问同一个澄清问题属于产品失败。
+
+同一个已审核回合可以同时包含上游配置修改，以及针对旧 pending question 的值。
+此时必须由已注册的依赖图和失效图先执行上游修改、清除旧上下文派生的证据，并将
+旧问题声明的 manual action 保留在新前置条件之后；只有新前置条件确认完成后，该
+action 才能在新上下文中执行。新创建的 manual question 不能仅因另一个 action
+具有相同的 `accepted_action_type` 就被绕过；该 action 的固定参数还必须与问题
+声明的 manual action 一致。
 
 ## 历史问题迁移
 

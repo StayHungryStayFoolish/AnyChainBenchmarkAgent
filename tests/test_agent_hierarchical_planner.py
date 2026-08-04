@@ -44,6 +44,71 @@ def _closed_enum_review_response(payload: dict) -> dict:
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_upstream_mutation_detaches_manual_answer_from_stale_pending(
+        self,
+    ) -> None:
+        import json
+
+        from agent.harness.semantic_admission import (
+            _canonicalize_pending_choice_actions,
+        )
+        from agent.harness.state import new_state
+
+        text = "Change the protocol family, then validate method_a."
+        state = new_state("pending-superseded", language="en")
+        state["pending_question"] = {
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "manual_input_allowed": True,
+            "value_domain": "typed_value",
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "choose_adapter_family",
+                    "adapter_family": "jsonrpc",
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "method_a",
+                    "source_evidence": "method_a",
+                    "confidence": "high",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-family",
+                    "source_text": "Change the protocol family, ",
+                    "action_indexes": [0],
+                },
+                {
+                    "unit_id": "unit-method",
+                    "source_text": "then validate method_a.",
+                    "action_indexes": [1],
+                },
+            ],
+        }
+
+        canonical = json.loads(
+            _canonicalize_pending_choice_actions(
+                json.dumps(payload),
+                state,
+            )
+        )
+
+        self.assertEqual(
+            [action["type"] for action in canonical["actions"]],
+            ["choose_adapter_family", "rpc_catalog_command"],
+        )
+        self.assertEqual(canonical["actions"][1]["catalog_command"], "set_method")
+        self.assertEqual(canonical["actions"][1]["rpc_method"], "method_a")
+
     def test_registered_cross_group_mutation_requires_independent_proposal(
         self,
     ) -> None:
@@ -1075,6 +1140,86 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             result["owner_failures"][0]["unit_ids"],
             ["unit-chain"],
+        )
+
+    def test_finalization_does_not_recursively_create_semantic_draft(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import review_semantic_plan
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        state = new_state("finalization-no-recursion", language="en")
+        state["semantic_plan_draft"] = {
+            "status": "ready_for_review",
+            "draft_id": "ready-draft",
+            "revision": 2,
+        }
+        state["turn_context"] = {
+            "semantic_draft_finalization": {
+                "draft_id": "ready-draft",
+                "revision": 2,
+            },
+        }
+        unresolved = {
+            "unit_id": "unit-workload",
+            "clause_id": "clause-1",
+            "source_text": "Do not retain the previous custom workload.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "workload_rpc",
+            }],
+            "disposition": "unresolved",
+            "action_indexes": [],
+            "reason": "no registered action represents the clarified demand",
+        }
+        document = {
+            "status": "review_plan",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": unresolved["source_text"],
+                "input_shape": "prose",
+            }],
+            "source_partition": [unresolved],
+            "routed_partition": [unresolved],
+            "owner_documents": {
+                "chain_rpc": {
+                    "actions": [],
+                    "bindings": [{
+                        "unit_id": "unit-workload",
+                        "action_indexes": [],
+                        "disposition": "unresolved",
+                        "reason": unresolved["reason"],
+                    }],
+                },
+            },
+        }
+        coverage = PlanCoverageResult(
+            valid=False,
+            errors=(),
+            unresolved_clauses=(unresolved["source_text"],),
+            unresolved_units=(unresolved,),
+        )
+
+        with patch(
+            "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
+            return_value=("{}", coverage),
+        ):
+            result = review_semantic_plan(state, document)
+
+        self.assertNotIn("semantic_draft", result)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+        self.assertEqual(
+            result["unresolved_clauses"],
+            [unresolved["source_text"]],
+        )
+        self.assertIn(
+            "finalization remained unresolved",
+            result["coverage_errors"][0],
         )
 
     def test_owner_batch_compiles_concurrently_and_merges_request_order(

@@ -562,7 +562,11 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
                 completion="unchanged",
                 response_fragments=tuple(responses),
             )
-        if identity.get("status") not in {"needs_identity_confirmation", "needs_protocol_confirmation"}:
+        if (
+            identity.get("status")
+            not in {"needs_identity_confirmation", "needs_protocol_confirmation"}
+            and not is_existing_family_lifecycle(identity)
+        ):
             return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "adapter_family_outside_identity_resolution"}, source=__name__))
         _enter_case_for_adapter_family(next_state, family, responses=responses)
         return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))

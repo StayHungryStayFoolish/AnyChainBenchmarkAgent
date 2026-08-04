@@ -1809,6 +1809,71 @@ class SemanticPlanDraftTests(unittest.TestCase):
         )
         validate_state(updated)
 
+    def test_unresolved_finalization_stales_draft_instead_of_reasking_atom(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import (
+            _consume_planner_queue,
+            _prepare_ready_semantic_draft_finalization,
+        )
+        from agent.harness.invariants import validate_state
+
+        draft = self._draft(active_group="workload_rpc")
+        ready = resolve_semantic_draft_atom(
+            draft,
+            draft_id=draft["draft_id"],
+            revision=draft["revision"],
+            atom_id=draft["active_atom_id"],
+            resolution="Do not retain the previous custom workload.",
+        )
+        state = new_state(ready["session_id"], language="en")
+        state["turn_index"] = ready["creation_turn"]
+        state["active_group"] = "workload_rpc"
+        _bind_product_head(state)
+        state["semantic_plan_draft"] = ready
+        transition = _prepare_ready_semantic_draft_finalization(state)
+        self.assertEqual(transition["phase"], "plan")
+
+        updated = _consume_planner_queue(
+            state,
+            {
+                "actions": [{
+                    "type": "clarify_unresolved",
+                    "clauses": ["Do not reuse the prior workload."],
+                    "reason": (
+                        "semantic draft finalization remained unresolved "
+                        "after bound clarification"
+                    ),
+                    "confidence": "high",
+                }],
+                "semantic_units": [{
+                    "unit_id": "unit-workload",
+                    "clause_id": "clause-1",
+                    "source_text": "Do not reuse the prior workload.",
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                }],
+                "reason": "resolver returned an incomplete clause plan",
+            },
+        )
+
+        self.assertEqual(
+            updated["semantic_plan_draft"]["status"],
+            "stale",
+        )
+        self.assertIn(
+            "finalization_still_unresolved",
+            updated["semantic_plan_draft"]["lifecycle_receipts"][-1][
+                "reasons"
+            ],
+        )
+        self.assertFalse(
+            (updated.get("pending_question") or {}).get(
+                "semantic_draft_binding"
+            )
+        )
+        validate_state(updated)
+
     def test_awaiting_draft_without_bound_question_fails_closed(self) -> None:
         from agent.harness.invariants import StateInvariantError, validate_state
 
