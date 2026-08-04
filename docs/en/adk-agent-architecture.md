@@ -182,6 +182,17 @@ checkpoint; a failed turn stores the same sequence in an immutable physical
 attempt checkpoint and binds that checkpoint to the terminal diagnostic.
 Provider failure, timeout, and cancellation never advance Product Head.
 
+The shared deadline permits bounded concurrency only for work whose inputs are
+already frozen and independent: owner compilations and fixed open-identity,
+Stage-B, and whole-plan jury members. Workers use separate copied runtime
+contexts but share the same absolute deadline, cancellation event, and locked
+provider-attempt collector. Their outputs and per-owner control receipts are
+merged in canonical submission order. A first worker failure cancels and joins
+all siblings before the typed failure escapes, so no background task or second
+state authority survives the turn. Stage-A proposal/convergence, per-reviewer
+contract repair, and component calls outside an active runtime turn remain
+serial.
+
 `terminal_protocol.py` defines the shared non-secret terminal projection used
 by the product and live acceptance runners. Delivery order is:
 

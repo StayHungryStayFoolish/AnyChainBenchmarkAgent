@@ -25,6 +25,158 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TurnBudgetContractTest(unittest.TestCase):
+    def test_independent_tasks_share_turn_and_return_submission_order(self) -> None:
+        from agent.llm.types import (
+            llm_turn_scope,
+            run_independent_llm_tasks,
+        )
+
+        barrier = threading.Barrier(3)
+
+        def task(index: int) -> int:
+            barrier.wait(timeout=1)
+            time.sleep(0.01 * (3 - index))
+            return index
+
+        with llm_turn_scope(1):
+            result = run_independent_llm_tasks(tuple(
+                lambda index=index: task(index)
+                for index in range(3)
+            ))
+
+        self.assertEqual(result, (0, 1, 2))
+
+    def test_independent_task_failure_cancels_and_joins_siblings(self) -> None:
+        from agent.llm.types import (
+            LLMTurnCancelledError,
+            ensure_turn_active,
+            llm_turn_scope,
+            run_independent_llm_tasks,
+        )
+
+        barrier = threading.Barrier(3)
+        stopped = [threading.Event(), threading.Event()]
+
+        def failing() -> None:
+            barrier.wait(timeout=1)
+            raise RuntimeError("primary worker failed")
+
+        def sibling(index: int) -> None:
+            barrier.wait(timeout=1)
+            try:
+                while True:
+                    ensure_turn_active()
+                    time.sleep(0.001)
+            except LLMTurnCancelledError:
+                stopped[index].set()
+                raise
+
+        with llm_turn_scope(1):
+            with self.assertRaisesRegex(RuntimeError, "primary worker failed"):
+                run_independent_llm_tasks((
+                    failing,
+                    lambda: sibling(0),
+                    lambda: sibling(1),
+                ))
+
+        self.assertTrue(all(event.is_set() for event in stopped))
+
+    def test_independent_tasks_remain_serial_without_runtime_turn(self) -> None:
+        from agent.llm.types import run_independent_llm_tasks
+
+        active = 0
+        maximum = 0
+
+        def task(index: int) -> int:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            active -= 1
+            return index
+
+        self.assertEqual(
+            run_independent_llm_tasks(tuple(
+                lambda index=index: task(index)
+                for index in range(3)
+            )),
+            (0, 1, 2),
+        )
+        self.assertEqual(maximum, 1)
+
+    def test_independent_tasks_share_locked_provider_attempt_evidence(
+        self,
+    ) -> None:
+        from agent.llm.types import (
+            llm_turn_scope,
+            provider_attempt_evidence,
+            record_provider_attempt,
+            run_independent_llm_tasks,
+        )
+
+        barrier = threading.Barrier(3)
+
+        def task(index: int) -> None:
+            barrier.wait(timeout=1)
+            record_provider_attempt({
+                "provider": "deepseek",
+                "model": f"member-{index}",
+                "outcome": "success",
+                "attempt_count": 1,
+                "retry_reasons": [],
+                "retry_exhausted": False,
+                "last_finish_reason": "stop",
+            })
+
+        with llm_turn_scope(1):
+            run_independent_llm_tasks(tuple(
+                lambda index=index: task(index)
+                for index in range(3)
+            ))
+            evidence = provider_attempt_evidence()
+
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual(
+            {item["model"] for item in evidence},
+            {"member-0", "member-1", "member-2"},
+        )
+
+    def test_independent_tasks_reject_nonpositive_worker_limit(self) -> None:
+        from agent.llm.types import run_independent_llm_tasks
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            run_independent_llm_tasks((lambda: None,), max_workers=0)
+
+    def test_five_owner_three_reviewer_transaction_is_bounded(self) -> None:
+        from agent.llm.types import (
+            llm_turn_scope,
+            run_independent_llm_tasks,
+        )
+
+        def run_batch(size: int, label: str) -> tuple[str, ...]:
+            barrier = threading.Barrier(size)
+
+            def task(index: int) -> str:
+                barrier.wait(timeout=1)
+                return f"{label}-{index}"
+
+            return run_independent_llm_tasks(tuple(
+                lambda index=index: task(index)
+                for index in range(size)
+            ))
+
+        with llm_turn_scope(1):
+            owners = run_batch(5, "owner")
+            reviewers = run_batch(3, "reviewer")
+
+        self.assertEqual(
+            owners,
+            tuple(f"owner-{index}" for index in range(5)),
+        )
+        self.assertEqual(
+            reviewers,
+            tuple(f"reviewer-{index}" for index in range(3)),
+        )
+
     def test_copied_worker_context_shares_deadline_and_cancellation(self) -> None:
         from agent.llm.types import (
             LLMTurnCancelledError,

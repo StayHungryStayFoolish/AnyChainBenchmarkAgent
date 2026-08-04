@@ -502,6 +502,71 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(review.decisions[0]["relation"], "supports_unit")
         self.assertEqual(review.decisions[0]["supports_unit_id"], "unit-1")
 
+    def test_open_identity_relation_jury_runs_concurrently_in_member_order(
+        self,
+    ) -> None:
+        from agent.harness.semantic_compiler import (
+            request_open_identity_relation_jury,
+        )
+        from agent.llm.types import llm_turn_scope
+
+        payload = {
+            "relations": [{
+                "unit": {
+                    "unit_id": "unit-2",
+                    "source_text": "run",
+                },
+                "possible_support_units": [{"unit_id": "unit-1"}],
+            }],
+        }
+        verdict = json.dumps({
+            "verdicts": [{
+                "unit_id": "unit-2",
+                "relation": "supports_unit",
+                "supports_unit_id": "unit-1",
+                "evidence_quote": "run",
+                "reason": "the source supports the registered value",
+            }],
+        })
+        barrier = threading.Barrier(3)
+        result_lock = threading.Lock()
+        result_index = 0
+
+        def review(*_args, **_kwargs):
+            nonlocal result_index
+            with result_lock:
+                index = result_index
+                result_index += 1
+            barrier.wait(timeout=1)
+            return SimpleNamespace(
+                text=verdict,
+                response_hash=str(index + 1) * 64,
+            )
+
+        with (
+            llm_turn_scope(1),
+            patch(
+                "agent.harness.semantic_compiler.request_semantic_compilation_result",
+                side_effect=review,
+            ),
+        ):
+            relation_review = request_open_identity_relation_jury(
+                object(),
+                proposal_hash="4" * 64,
+                request_payload=payload,
+                max_tokens=900,
+            )
+
+        self.assertEqual(relation_review.errors, ())
+        self.assertEqual(
+            set(relation_review.receipt["member_response_hashes"]),
+            {"1" * 64, "2" * 64, "3" * 64},
+        )
+        self.assertEqual(
+            relation_review.receipt["member_validity"],
+            [True, True, True],
+        )
+
     def test_open_identity_relation_jury_preserves_explicit_unresolved_quorum(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_competing_open_identity_relations,
@@ -906,6 +971,58 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             result["owner_failures"][0]["unit_ids"],
             ["unit-chain"],
         )
+
+    def test_owner_batch_compiles_concurrently_and_merges_request_order(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import compile_next_owner
+        from agent.harness.state import new_state
+        from agent.llm.types import llm_turn_scope
+
+        owners = ("orientation", "performance", "chain_rpc")
+        barrier = threading.Barrier(len(owners))
+
+        def compile_owner(_state, owner, _groups, _partition, unit_ids):
+            barrier.wait(timeout=1)
+            return ({
+                "actions": [],
+                "bindings": [{
+                    "unit_id": unit_ids[0],
+                    "action_indexes": [],
+                    "disposition": "context",
+                    "reason": owner,
+                }],
+            }, (), (100 + owners.index(owner),))
+
+        document = {
+            "status": "compile_owner",
+            "owner_cursor": 0,
+            "owner_requests": [
+                {
+                    "owner": owner,
+                    "unit_ids": [f"unit-{index}"],
+                    "groups": [],
+                }
+                for index, owner in enumerate(owners)
+            ],
+            "routed_partition": [],
+            "request_sizes": [77],
+            "stage_b_calls": 0,
+        }
+        with (
+            llm_turn_scope(1),
+            patch(
+                "agent.harness.hierarchical_planner._compile_owner_document",
+                side_effect=compile_owner,
+            ),
+        ):
+            result = compile_next_owner(new_state("owner-batch"), document)
+
+        self.assertEqual(result["status"], "review_plan")
+        self.assertEqual(result["owner_cursor"], 3)
+        self.assertEqual(list(result["owner_documents"]), list(owners))
+        self.assertEqual(result["request_sizes"], [77, 100, 101, 102])
+        self.assertEqual(result["stage_b_calls"], 3)
 
     def test_stage_a_structured_demand_atoms_can_use_distinct_operations(
         self,
@@ -3915,6 +4032,74 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(len(receipt["review_hashes"]), 3)
         self.assertTrue(receipt["valid"])
 
+    def test_stage_b_semantic_jury_runs_concurrently_in_member_order(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_owner_document_semantics,
+        )
+        from agent.llm.types import llm_turn_scope
+
+        payload = {
+            "owner": "chain_rpc",
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "choose another mode",
+            }],
+            "owner_action_schema": [{
+                "type": "request_target_mode_selection",
+                "purpose": "open typed selection",
+            }],
+        }
+        document = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "choose another mode",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "compiled",
+            }],
+            "reason": "compiled",
+        }
+        barrier = threading.Barrier(3)
+
+        def review(*_args, **kwargs):
+            barrier.wait(timeout=1)
+            return json.dumps({
+                "proposal_hash": kwargs["request_payload"]["proposal_hash"],
+                "unit_verdicts": [{
+                    "unit_id": "unit-1",
+                    "verdict": "admit",
+                    "reason": "member verdict",
+                }],
+                "action_verdicts": [{
+                    "action_index": 0,
+                    "verdict": "admit",
+                    "reason": "member verdict",
+                }],
+                "reason": "reviewed",
+            })
+
+        with (
+            llm_turn_scope(1),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=review,
+            ),
+        ):
+            errors, sizes, receipt = _review_owner_document_semantics(
+                object(), payload, document
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(receipt["request_count"], 3)
+        self.assertEqual(receipt["member_validity"], [True, True, True])
+        self.assertEqual(len(receipt["review_hashes"]), 3)
+
     def test_stage_b_semantic_jury_requires_two_admissions(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_owner_document_semantics,
@@ -4725,6 +4910,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner._compile_owner_document",
+                return_value=({"actions": [], "bindings": []}, (), (211,)),
             ) as owner_compiler,
             patch(
                 "agent.harness.hierarchical_planner.build_semantic_plan_draft",

@@ -17,7 +17,13 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Collection, Mapping, Sequence
 
-from ..llm.types import LLMMessage, LLMRequest, ReasoningMode, ensure_turn_active
+from ..llm.types import (
+    LLMMessage,
+    LLMRequest,
+    ReasoningMode,
+    ensure_turn_active,
+    run_independent_llm_tasks,
+)
 from .input_values import parse_weight_spec
 from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 
@@ -414,15 +420,18 @@ def request_open_identity_relation_jury(
     wire_size = len(prompt.encode("utf-8")) + len(
         _canonical_json(request_payload).encode("utf-8")
     )
-    for _member in range(3):
-        request_sizes.append(wire_size)
-        result = request_semantic_compilation_result(
+    request_sizes.extend((wire_size, wire_size, wire_size))
+    member_results = run_independent_llm_tasks(tuple(
+        lambda: request_semantic_compilation_result(
             provider,
             system_prompt=prompt,
             request_payload=request_payload,
             max_tokens=max_tokens,
             reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
+        for _member in range(3)
+    ))
+    for result in member_results:
         response_hashes.append(result.response_hash)
         valid = True
         try:
@@ -871,7 +880,13 @@ def request_whole_plan_admission(
     review_ids: list[str] = []
     consensus_required = _requires_grounded_mutation_consensus(plan)
 
-    def run_review(*, consensus_index: int) -> WholePlanAdmission:
+    def run_review(
+        *,
+        consensus_index: int,
+    ) -> tuple[WholePlanAdmission, tuple[int, ...], tuple[str, ...], tuple[str, ...]]:
+        local_request_sizes: list[int] = []
+        local_review_hashes: list[str] = []
+        local_review_ids: list[str] = []
         previous_output = ""
         previous_errors: tuple[str, ...] = ()
         admission = WholePlanAdmission(
@@ -911,7 +926,7 @@ def request_whole_plan_admission(
                     "merely to pass validation."
                 )
             payload_text = _canonical_json(payload)
-            request_sizes.append(
+            local_request_sizes.append(
                 len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
             )
             response = provider.complete(LLMRequest(
@@ -935,17 +950,25 @@ def request_whole_plan_admission(
                 if consensus_required
                 else "primary"
             )
-            review_ids.append(f"{reviewer_id}/attempt_{attempt + 1}")
-            review_hashes.append(
+            local_review_ids.append(f"{reviewer_id}/attempt_{attempt + 1}")
+            local_review_hashes.append(
                 _content_hash(admission.response or previous_output)
             )
             if admission.valid or _is_explicit_semantic_rejection(admission):
                 break
             previous_errors = admission.errors
-        return admission
+        return (
+            admission,
+            tuple(local_request_sizes),
+            tuple(local_review_hashes),
+            tuple(local_review_ids),
+        )
 
-    primary = run_review(consensus_index=0)
     if not consensus_required:
+        primary, sizes, hashes, identities = run_review(consensus_index=0)
+        request_sizes.extend(sizes)
+        review_hashes.extend(hashes)
+        review_ids.extend(identities)
         return replace(
             primary,
             request_count=len(request_sizes),
@@ -955,11 +978,19 @@ def request_whole_plan_admission(
             review_ids=tuple(review_ids),
         )
 
-    jury = (
-        primary,
-        run_review(consensus_index=1),
-        run_review(consensus_index=2),
+    jury_results = run_independent_llm_tasks(tuple(
+        lambda index=index: run_review(consensus_index=index)
+        for index in range(3)
+    ))
+    for _review, sizes, hashes, identities in jury_results:
+        request_sizes.extend(sizes)
+        review_hashes.extend(hashes)
+        review_ids.extend(identities)
+    jury = tuple(
+        review
+        for review, _sizes, _hashes, _identities in jury_results
     )
+    primary = jury[0]
     admitted = tuple(review for review in jury if review.valid)
     if len(admitted) < 2:
         rejected = next(

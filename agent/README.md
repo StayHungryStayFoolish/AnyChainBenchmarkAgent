@@ -153,6 +153,17 @@ checkpoint. Failed turns bind the same sequence to the immutable physical
 attempt checkpoint and terminal diagnostic while leaving Product Head
 unchanged.
 
+Within that one deadline, only semantically independent work is executed with
+bounded concurrency: frozen owner compilations and fixed open-identity,
+Stage-B, and whole-plan jury members. Each worker receives its own copied
+runtime context while sharing the same deadline, cancellation signal, and
+thread-safe provider-attempt collector. Results and owner audit receipts merge
+in canonical submission order. The first worker failure cancels and joins its
+siblings and fails the complete turn; it never creates a second scheduler,
+deadline, retry budget, or state authority. Dependent Stage-A convergence and
+contract repair remain serial. Direct component calls outside a runtime turn
+also remain serial.
+
 `harness/terminal_protocol.py` defines the shared non-secret delivery
 projection. The terminal renders and flushes the complete frame, durably
 appends the projection, and only then acknowledges the outbox row as

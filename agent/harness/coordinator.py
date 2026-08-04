@@ -1927,7 +1927,7 @@ def partition_turn_step(state: AgentGraphState) -> AgentGraphState:
 
 
 def compile_owner_turn_step(state: AgentGraphState) -> AgentGraphState:
-    """Compile and checkpoint one owner document per graph transition."""
+    """Compile one frozen owner batch and retain per-owner audit receipts."""
 
     before = dict(state.get("semantic_planning") or {})
     cursor = int(before.get("owner_cursor") or 0)
@@ -1936,27 +1936,30 @@ def compile_owner_turn_step(state: AgentGraphState) -> AgentGraphState:
         for item in before.get("owner_requests") or []
         if isinstance(item, Mapping)
     ]
-    owner = (
-        str(requests[cursor].get("owner") or "")
-        if cursor < len(requests)
-        else ""
-    )
     document = hierarchical_planner.compile_next_owner(state, before)
     state["semantic_planning"] = document
-    _append_control_receipt(
-        state,
-        "owner_compilation",
-        {
-            "owner": owner,
-            "cursor_before": cursor,
-            "cursor_after": int(document.get("owner_cursor") or 0),
-            "status": str(document.get("status") or ""),
-            "document_hash": _receipt_hash(
-                (document.get("owner_documents") or {}).get(owner) or {}
-            ),
-            "errors_hash": _receipt_hash(document.get("errors") or []),
-        },
-    )
+    cursor_after = int(document.get("owner_cursor") or 0)
+    for index in range(cursor, cursor_after):
+        owner = str(requests[index].get("owner") or "")
+        status = (
+            "compile_owner"
+            if index + 1 < len(requests)
+            else str(document.get("status") or "")
+        )
+        _append_control_receipt(
+            state,
+            "owner_compilation",
+            {
+                "owner": owner,
+                "cursor_before": index,
+                "cursor_after": index + 1,
+                "status": status,
+                "document_hash": _receipt_hash(
+                    (document.get("owner_documents") or {}).get(owner) or {}
+                ),
+                "errors_hash": _receipt_hash(document.get("errors") or []),
+            },
+        )
     next_phase = (
         "compile_owner"
         if document.get("status") == "compile_owner"

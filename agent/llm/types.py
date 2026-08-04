@@ -5,9 +5,21 @@ from __future__ import annotations
 import contextvars
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Literal, Mapping, ParamSpec, Protocol, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Literal,
+    Mapping,
+    ParamSpec,
+    Protocol,
+    Sequence,
+    TypeVar,
+    cast,
+)
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
@@ -344,6 +356,59 @@ def run_in_llm_turn_context(
     """Run one worker with the captured absolute deadline and cancellation."""
 
     return context.run(callback, *args, **kwargs)
+
+
+def run_independent_llm_tasks(
+    callbacks: Sequence[Callable[[], _R]],
+    *,
+    max_workers: int | None = None,
+) -> tuple[_R, ...]:
+    """Run independent model work under one deadline and return source order."""
+
+    tasks = tuple(callbacks)
+    if not tasks:
+        return ()
+    if max_workers is not None and max_workers <= 0:
+        raise ValueError("independent LLM task worker count must be positive")
+    turn = _TURN_CONTEXT.get()
+    if turn is None:
+        return tuple(callback() for callback in tasks)
+    worker_count = min(len(tasks), max_workers or len(tasks))
+    contexts = [copy_llm_turn_context() for _task in tasks]
+    results: list[_R | None] = [None] * len(tasks)
+    completed = [False] * len(tasks)
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="anychain-llm",
+    )
+    futures = {
+        executor.submit(run_in_llm_turn_context, context, callback): index
+        for index, (context, callback) in enumerate(zip(contexts, tasks))
+    }
+    try:
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+                completed[index] = True
+            except BaseException:
+                turn.cancelled.set()
+                for sibling in futures:
+                    if sibling is not future:
+                        sibling.cancel()
+                for sibling in futures:
+                    if sibling is future:
+                        continue
+                    try:
+                        sibling.result()
+                    except BaseException:
+                        pass
+                raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    if not all(completed):
+        raise RuntimeError("independent LLM task batch completed incompletely")
+    return tuple(cast(_R, result) for result in results)
 
 
 def cancel_active_llm_turn() -> None:

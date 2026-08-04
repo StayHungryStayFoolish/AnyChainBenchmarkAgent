@@ -1698,13 +1698,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertIsNotNone(head)
         self.assertGreater(head.revision, source_draft["source_checkpoint_revision"])
 
-    def test_split_planner_resumes_owner_cursor_from_sqlite_checkpoint(self) -> None:
-        """The product graph checkpoints each owner compilation transition.
-
-        Unlike ``reviewed_stage_planner``, this test enters the real partition,
-        compile-owner, and review nodes. It interrupts after the first owner,
-        closes the runtime, and resumes the same graph from SQLite.
-        """
+    def test_split_planner_checkpoints_one_ordered_owner_batch(self) -> None:
+        """The graph persists one batch plus strict per-owner receipts."""
 
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.state import new_state
@@ -1745,26 +1740,18 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
                 "errors": [],
             }
 
-        def compile_owner(_state, document):
-            output = deepcopy(dict(document))
-            cursor = int(output.get("owner_cursor") or 0)
-            request = dict(output["owner_requests"][cursor])
-            owner = str(request["owner"])
+        def compile_owner_document(
+            _state,
+            owner,
+            _groups,
+            _partition,
+            unit_ids,
+        ):
             compiled_owners.append(owner)
-            owner_documents = deepcopy(dict(output.get("owner_documents") or {}))
-            owner_documents[owner] = {
+            return ({
                 "actions": [],
-                "semantic_units": list(request["unit_ids"]),
-            }
-            output["owner_documents"] = owner_documents
-            output["owner_cursor"] = cursor + 1
-            output["stage_b_calls"] = int(output.get("stage_b_calls") or 0) + 1
-            output["status"] = (
-                "compile_owner"
-                if output["owner_cursor"] < len(output["owner_requests"])
-                else "review_plan"
-            )
-            return output
+                "semantic_units": list(unit_ids),
+            }, (), (101,))
 
         def review(_state, document):
             self.assertEqual(document["owner_cursor"], 2)
@@ -1788,8 +1775,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             "agent.harness.hierarchical_planner.begin_semantic_partition",
             side_effect=partition,
         ), patch(
-            "agent.harness.hierarchical_planner.compile_next_owner",
-            side_effect=compile_owner,
+            "agent.harness.hierarchical_planner._compile_owner_document",
+            side_effect=compile_owner_document,
         ), patch(
             "agent.harness.hierarchical_planner.review_semantic_plan",
             side_effect=review,
@@ -1811,9 +1798,18 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             )
             self.assertEqual(
                 interrupted["semantic_planning"]["owner_cursor"],
-                1,
+                2,
             )
-            self.assertEqual(compiled_owners, ["orientation"])
+            self.assertEqual(compiled_owners, ["orientation", "performance"])
+            receipts = [
+                item
+                for item in interrupted["turn_context"]["control_receipts"]
+                if item["receipt_type"] == "owner_compilation"
+            ]
+            self.assertEqual(
+                [item["owner"] for item in receipts],
+                ["orientation", "performance"],
+            )
             runtime.close()
 
             resumed_runtime = AnyChainGraphRuntime(
@@ -1835,7 +1831,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
                 int((snapshot.values.get("semantic_planning") or {}).get("owner_cursor") or 0)
                 for snapshot in history
             },
-            {0, 1, 2},
+            {0, 2},
         )
 
     def test_group_order_prioritizes_chain_after_target_mode(self) -> None:

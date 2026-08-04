@@ -167,6 +167,16 @@ Head checkpoint；失败 turn 将同一 sequence 写入不可变 physical-attemp
 checkpoint，并把该 checkpoint 绑定到 terminal diagnostic。provider failure、
 timeout 与 cancellation 都不得推进 Product Head。
 
+共享 deadline 只允许已冻结且相互独立的工作进行有限并发：owner compilation，
+以及固定的 open-identity、Stage-B 和 whole-plan jury member。每个 worker 使用
+独立复制的 runtime context，但共享同一个 absolute deadline、cancellation event
+和加锁的 provider-attempt collector；输出和逐 owner control receipt 始终按规范
+submission order 合并。第一个 worker 失败时，必须先取消并 join 所有 sibling，
+再向外传播原始类型化错误，因此 turn 结束后不会残留后台任务，也不会产生第二个
+scheduler、deadline、retry budget 或 state authority。Stage-A proposal /
+convergence、单个 reviewer 内的 contract repair，以及 active runtime turn 之外的
+component call 仍保持串行。
+
 `terminal_protocol.py` 是产品与 live acceptance runner 共用的非敏感终端投影
 协议。交付顺序固定为：
 

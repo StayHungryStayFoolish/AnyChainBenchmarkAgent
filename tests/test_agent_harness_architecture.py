@@ -7,6 +7,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -663,6 +664,37 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertTrue(admission.valid, admission.errors)
         self.assertTrue(admission.consensus_required)
         self.assertEqual(provider.complete.call_count, 3)
+
+    def test_mutation_jury_runs_concurrently_with_ordered_receipts(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+        from agent.llm.types import llm_turn_scope
+
+        plan, valid = _confirmation_proposal_admission_fixture()
+        barrier = threading.Barrier(3)
+
+        class Provider:
+            def complete(self, _request):
+                barrier.wait(timeout=1)
+                return SimpleNamespace(text=json.dumps(valid, sort_keys=True))
+
+        with llm_turn_scope(1):
+            admission = request_whole_plan_admission(
+                Provider(),
+                plan,
+                semantic_policy="preserve the immutable plan",
+                allowed_action_types=ALLOWED_ACTION_TYPES,
+            )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertEqual(
+            admission.review_ids,
+            (
+                "jury_1/attempt_1",
+                "jury_2/attempt_1",
+                "jury_3/attempt_1",
+            ),
+        )
 
     def test_canonical_chain_selection_purpose_is_lifecycle_neutral(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE

@@ -20,6 +20,7 @@ from ..llm.providers import provider_from_config
 from ..llm.types import (
     LLMProviderError,
     LLMTurnTimeoutError,
+    run_independent_llm_tasks,
 )
 from .action_registry import (
     ACTION_ARGUMENT_SCHEMAS,
@@ -1061,7 +1062,7 @@ def compile_next_owner(
     state: AgentGraphState,
     document: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Compile exactly one owner document and advance the persisted cursor."""
+    """Compile the remaining independent owners and merge canonical order."""
 
     output = dict(document)
     if output.get("status") != "compile_owner":
@@ -1075,33 +1076,42 @@ def compile_next_owner(
     if cursor >= len(requests):
         output["status"] = "review_plan"
         return output
-    request = requests[cursor]
-    owner = str(request.get("owner") or "")
-    try:
-        owner_document, errors, request_sizes = _compile_owner_document(
-            state,
-            owner,
-            frozenset(str(item) for item in request.get("groups") or []),
-            [
-                dict(item)
-                for item in output.get("routed_partition") or []
-                if isinstance(item, Mapping)
-            ],
-            tuple(str(item) for item in request.get("unit_ids") or []),
-        )
-    except (LLMTurnTimeoutError, LLMProviderError):
-        raise
-    except Exception as exc:
-        errors = (f"Stage B {owner} failed: {type(exc).__name__}",)
-        owner_document = {}
-        request_sizes = ()
-    output["request_sizes"] = [
-        *[int(value) for value in output.get("request_sizes") or []],
-        *[int(value) for value in request_sizes],
+    remaining_requests = requests[cursor:]
+    routed_partition = [
+        dict(item)
+        for item in output.get("routed_partition") or []
+        if isinstance(item, Mapping)
     ]
-    output["stage_b_calls"] = int(output.get("stage_b_calls") or 0) + len(
-        request_sizes
-    )
+
+    def compile_request(
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], tuple[str, ...], tuple[int, ...]]:
+        owner = str(request.get("owner") or "")
+        try:
+            return _compile_owner_document(
+                state,
+                owner,
+                frozenset(str(item) for item in request.get("groups") or []),
+                routed_partition,
+                tuple(str(item) for item in request.get("unit_ids") or []),
+            )
+        except (LLMTurnTimeoutError, LLMProviderError):
+            raise
+        except Exception as exc:
+            return (
+                {},
+                (f"Stage B {owner} failed: {type(exc).__name__}",),
+                (),
+            )
+
+    compiled = run_independent_llm_tasks(tuple(
+        lambda request=request: compile_request(request)
+        for request in remaining_requests
+    ))
+    all_request_sizes = [
+        int(value) for value in output.get("request_sizes") or []
+    ]
+    stage_b_calls = int(output.get("stage_b_calls") or 0)
     owner_documents = {
         str(key): dict(value)
         for key, value in dict(output.get("owner_documents") or {}).items()
@@ -1112,49 +1122,56 @@ def compile_next_owner(
         for item in output.get("owner_failures") or ()
         if isinstance(item, Mapping)
     ]
-    if errors:
-        semantic_review_receipts = [
-            dict(receipt)
-            for receipt in owner_document.get("semantic_review_receipts") or ()
-            if isinstance(receipt, Mapping)
-        ]
-        owner_document = {
-            "actions": [],
-            "bindings": [
-                {
-                    "unit_id": str(unit_id),
-                    "action_indexes": [],
-                    "disposition": "unresolved",
-                    "reason": (
-                        "The owning compiler could not produce a valid typed "
-                        "action after bounded repair."
-                    ),
-                }
-                for unit_id in request.get("unit_ids") or ()
-                if str(unit_id)
-            ],
-            **(
-                {"semantic_review_receipts": semantic_review_receipts}
-                if semantic_review_receipts
-                else {}
-            ),
-        }
-        owner_failures.append({
-            "owner": owner,
-            "unit_ids": [
-                str(unit_id)
-                for unit_id in request.get("unit_ids") or ()
-                if str(unit_id)
-            ],
-            "errors": list(errors),
-        })
-    owner_documents[owner] = owner_document
+    for request, (owner_document, errors, request_sizes) in zip(
+        remaining_requests,
+        compiled,
+    ):
+        owner = str(request.get("owner") or "")
+        all_request_sizes.extend(int(value) for value in request_sizes)
+        stage_b_calls += len(request_sizes)
+        if errors:
+            semantic_review_receipts = [
+                dict(receipt)
+                for receipt in owner_document.get("semantic_review_receipts") or ()
+                if isinstance(receipt, Mapping)
+            ]
+            owner_document = {
+                "actions": [],
+                "bindings": [
+                    {
+                        "unit_id": str(unit_id),
+                        "action_indexes": [],
+                        "disposition": "unresolved",
+                        "reason": (
+                            "The owning compiler could not produce a valid typed "
+                            "action after bounded repair."
+                        ),
+                    }
+                    for unit_id in request.get("unit_ids") or ()
+                    if str(unit_id)
+                ],
+                **(
+                    {"semantic_review_receipts": semantic_review_receipts}
+                    if semantic_review_receipts
+                    else {}
+                ),
+            }
+            owner_failures.append({
+                "owner": owner,
+                "unit_ids": [
+                    str(unit_id)
+                    for unit_id in request.get("unit_ids") or ()
+                    if str(unit_id)
+                ],
+                "errors": list(errors),
+            })
+        owner_documents[owner] = owner_document
+    output["request_sizes"] = all_request_sizes
+    output["stage_b_calls"] = stage_b_calls
     output["owner_documents"] = owner_documents
     output["owner_failures"] = owner_failures
-    output["owner_cursor"] = cursor + 1
-    output["status"] = (
-        "compile_owner" if cursor + 1 < len(requests) else "review_plan"
-    )
+    output["owner_cursor"] = len(requests)
+    output["status"] = "review_plan"
     return output
 
 
@@ -4378,14 +4395,17 @@ def _review_owner_document_semantics(
     review_hashes: list[str] = []
     member_validity: list[bool] = []
     member_errors: list[tuple[str, ...]] = []
-    for _member_index in range(3):
-        response = request_semantic_compilation(
+    responses = run_independent_llm_tasks(tuple(
+        lambda: request_semantic_compilation(
             provider,
             system_prompt=prompt,
             request_payload=review_payload,
             max_tokens=_stage_b_review_output_token_budget(payload, document),
             reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
+        for _member_index in range(3)
+    ))
+    for response in responses:
         review_hashes.append(
             hashlib.sha256(response.encode("utf-8")).hexdigest()
         )
