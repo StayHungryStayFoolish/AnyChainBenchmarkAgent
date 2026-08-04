@@ -1623,6 +1623,9 @@ def _stage_a_prompt() -> str:
         "source_text, and source_path from atom_id after your classification; do not repeat "
         "those fields in structured output. operation must be one of the supplied "
         "universal_operations. "
+        "Prose unit_id values are turn-local labels and must be non-empty and unique. "
+        "The Harness may deterministically rebind missing or colliding prose labels; they "
+        "carry no semantic or execution authority. "
         "Treat universal_operation_purposes as authoritative. pending_answer requires a present "
         "commitment to the active question; a hypothetical, counterfactual, consequence, or "
         "explanation question is consultation and never authorizes the pending action. A request "
@@ -1953,6 +1956,65 @@ def _bind_structured_partition_provenance(
     return output
 
 
+def _bind_ambiguous_prose_partition_identities(
+    raw_units: Sequence[Any],
+    clauses: Sequence[TurnClause],
+) -> list[Any]:
+    """Replace only missing or colliding model prose labels deterministically.
+
+    Structured atom identities are parser-owned and remain untouched. Prose
+    labels carry no semantic authority, so an identity collision must not hide
+    otherwise reviewable semantic units from the admission boundary.
+    """
+
+    clause_shapes = {clause.clause_id: clause.input_shape for clause in clauses}
+    identities = [
+        str(raw.get("unit_id") or "").strip()
+        if isinstance(raw, Mapping)
+        else ""
+        for raw in raw_units
+    ]
+    identity_counts: dict[str, int] = defaultdict(int)
+    for identity in identities:
+        if identity:
+            identity_counts[identity] += 1
+    preserved = {
+        identity
+        for index, identity in enumerate(identities)
+        if identity
+        and identity_counts[identity] == 1
+        and isinstance(raw_units[index], Mapping)
+    }
+    generated = set(preserved)
+    clause_sequences: dict[str, int] = defaultdict(int)
+    output: list[Any] = []
+    for index, raw in enumerate(raw_units):
+        if not isinstance(raw, Mapping):
+            output.append(raw)
+            continue
+        unit = dict(raw)
+        clause_id = str(unit.get("clause_id") or "").strip()
+        identity = identities[index]
+        if (
+            clause_shapes.get(clause_id) != "prose"
+            or (identity and identity_counts[identity] == 1)
+        ):
+            output.append(unit)
+            continue
+        while True:
+            clause_sequences[clause_id] += 1
+            candidate = (
+                f"__harness_prose_{clause_id or 'unknown'}_"
+                f"{clause_sequences[clause_id]}"
+            )
+            if candidate not in generated:
+                break
+        generated.add(candidate)
+        unit["unit_id"] = candidate
+        output.append(unit)
+    return output
+
+
 def _matching_structured_intake(
     candidate: Mapping[str, Any],
     contracts: Sequence[Mapping[str, Any]],
@@ -2223,6 +2285,7 @@ def _validate_partition_document(
         state or {},
     )
     raw_units = _bind_structured_partition_provenance(raw_units, clauses)
+    raw_units = _bind_ambiguous_prose_partition_identities(raw_units, clauses)
     raw_units = _retain_unclaimed_prose_clauses(raw_units, clauses)
     placed_partition = validate_semantic_partition(raw_units, clauses)
     raw_units = list(placed_partition.units)

@@ -171,6 +171,13 @@ convergence, and admission review receive both complete registries. Action
 purposes must not be copied into every applicable group because that changes
 wire cost without adding semantic authority.
 
+Structured semantic-unit identities are parser-owned DemandAtom IDs and fail
+closed on any unknown, missing, or duplicate identity. Prose `unit_id` values
+from Stage A are untrusted turn-local labels. The Harness deterministically
+rebinds only missing or colliding prose labels before lossless span placement;
+it does not merge, drop, reorder, or reinterpret their semantic units. Existing
+admission remains the sole authority for their meaning and disposition.
+
 `harness/terminal_protocol.py` defines the shared non-secret delivery
 projection. The terminal renders and flushes the complete frame, durably
 appends the projection, and only then acknowledges the outbox row as

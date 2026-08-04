@@ -183,6 +183,12 @@ registry。每个 action purpose 只出现一次，并完整携带 owner、seman
 registry。禁止把 action purpose 复制到每个适用 group 中，因为这种重复只会增加
 wire cost，不会产生新的语义权威。
 
+structured semantic identity 仍是 parser-owned DemandAtom ID；未知、缺失或重复
+都必须 fail closed。Stage A 返回的 prose `unit_id` 只是非可信的 turn-local
+label。Harness 在 lossless span placement 前只对缺失或碰撞的 prose label 做确定性
+重绑定，不合并、不丢弃、不重排、也不重新解释 unit；其最终语义与 disposition 仍由
+semantic admission 唯一裁决。
+
 `terminal_protocol.py` 是产品与 live acceptance runner 共用的非敏感终端投影
 协议。交付顺序固定为：
 

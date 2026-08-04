@@ -200,6 +200,13 @@ convergence, and admission review receive both registries. Replicating action
 purposes inside every applicable group is forbidden because it increases wire
 cost without creating new semantic authority.
 
+Structured semantic identities remain parser-owned DemandAtom IDs and fail
+closed when unknown, missing, or duplicated. Stage-A prose IDs are untrusted
+turn-local labels. Before lossless span placement, the Harness deterministically
+rebinds only missing or colliding prose labels without merging, dropping,
+reordering, or reinterpreting units; semantic admission still owns their final
+meaning and disposition.
+
 `terminal_protocol.py` defines the shared non-secret terminal projection used
 by the product and live acceptance runners. Delivery order is:
 

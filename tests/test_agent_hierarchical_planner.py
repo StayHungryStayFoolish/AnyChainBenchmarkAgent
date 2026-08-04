@@ -823,6 +823,100 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "jsonrpc",
         )
 
+    def test_stage_a_rebinds_colliding_prose_labels_without_dropping_units(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_partition_document
+        from agent.harness.plan_coverage import TurnClause
+
+        clauses = (TurnClause("clause-1", "fake-node 测试", "prose"),)
+        document = {
+            "semantic_units": [
+                {
+                    "unit_id": "clause-1",
+                    "clause_id": "clause-1",
+                    "source_text": "fake-node",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "target_mode",
+                    }],
+                    "reason": "registered target mode",
+                },
+                {
+                    "unit_id": "clause-1",
+                    "clause_id": "clause-1",
+                    "source_text": "测试",
+                    "operation": "context",
+                    "owner_routes": [],
+                    "reason": "operation framing",
+                },
+            ],
+            "reason": "two semantic units",
+        }
+
+        first, first_errors = _validate_partition_document(
+            json.dumps(document, ensure_ascii=False),
+            clauses,
+        )
+        second, second_errors = _validate_partition_document(
+            json.dumps(document, ensure_ascii=False),
+            clauses,
+        )
+
+        self.assertEqual(first_errors, ())
+        self.assertEqual(second_errors, ())
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(
+            [unit["unit_id"] for unit in first],
+            ["__harness_prose_clause-1_1", "__harness_prose_clause-1_2"],
+        )
+        self.assertEqual(
+            [unit["source_text"] for unit in first],
+            ["fake-node ", "测试"],
+        )
+
+    def test_stage_a_rebinds_missing_prose_label_and_preserves_unique_label(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bind_ambiguous_prose_partition_identities,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        clauses = (TurnClause("clause-1", "configure mode", "prose"),)
+        rebound = _bind_ambiguous_prose_partition_identities(
+            [
+                {"unit_id": "", "clause_id": "clause-1"},
+                {"unit_id": "unit-2", "clause_id": "clause-1"},
+            ],
+            clauses,
+        )
+
+        self.assertEqual(rebound[0]["unit_id"], "__harness_prose_clause-1_1")
+        self.assertEqual(rebound[1]["unit_id"], "unit-2")
+
+    def test_stage_a_does_not_rebind_structured_atom_collisions(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bind_ambiguous_prose_partition_identities,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        atom_id = "__harness_structured_clause-1_1"
+        units = [
+            {"unit_id": atom_id, "clause_id": "clause-1"},
+            {"unit_id": atom_id, "clause_id": "clause-1"},
+        ]
+
+        self.assertEqual(
+            _bind_ambiguous_prose_partition_identities(
+                units,
+                (TurnClause("clause-1", '{"chain":"bsc"}', "structured"),),
+            ),
+            units,
+        )
+
     def test_receipt_attachment_rejection_becomes_typed_unresolved_work(
         self,
     ) -> None:
