@@ -456,7 +456,11 @@ fields, and atomic finalization receipts; incomplete version 20 finalization
 transactions are quarantined as a whole. Version 22 adds a durable-state
 secret-binding registry. Version 23 signs sensitivity into the group/question
 contract, uses salted memory-hard secret verifiers, and transacts registry
-mutations with the Product Head commit. Checkpoints and durable execution plans
+mutations with the Product Head commit.
+Every accepted domain delta reconciles durable secret ownership inside that
+same atomic commit boundary before candidate validation. Sensitive-value
+replacement therefore retires the superseded binding without exposing a
+partially updated product state. Checkpoints and durable execution plans
 retain only opaque references and verifiers. Exact sensitive scalar answers
 are projected before the LLM and first checkpoint. In compound turns,
 deterministic typed candidates such as endpoint URLs and structured

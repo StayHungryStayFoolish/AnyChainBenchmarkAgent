@@ -413,8 +413,11 @@ version 20 draft 若跨越任何 contract authority 变化，也必须先标记�
 receipt；未完成的 version 20 finalization transaction 必须整体 quarantine。
 version 22 增加 durable-state secret-binding registry。version 23 将敏感性纳入
 group/question 签名契约，使用带 salt 的 memory-hard secret verifier，并让进程内
-registry 变更与 Product Head commit 同事务。checkpoint 与 durable execution
-plan 只能保存 reference 与 verifier。敏感的完整标量答案必须在进入 LLM 和首次
+registry 变更与 Product Head commit 同事务。
+每个已接受的 domain delta 都必须在同一原子 commit 边界内、candidate validation
+之前完成 durable secret ownership reconciliation；替换敏感值时必须撤销旧 binding，
+不能暴露部分更新的 product state。checkpoint 与 durable execution plan 只能保存
+reference 与 verifier。敏感的完整标量答案必须在进入 LLM 和首次
 checkpoint 前投影为不透明 reference；复合输入中的确定性 typed candidate（例如
 endpoint URL 和结构化凭据）分别投影，从而保留同轮其他需求供 semantic planning
 处理；声明的编号与 Y/N 选项仍是普通 contract value，不作为 secret。明文只允许在

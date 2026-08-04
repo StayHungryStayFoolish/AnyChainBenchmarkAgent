@@ -663,6 +663,144 @@ class SecretReferenceRegistryTests(unittest.TestCase):
             raw_secret_paths_in_state(state),
         )
 
+    def test_domain_commit_atomically_reconciles_replaced_state_secret(self) -> None:
+        from agent.harness.contracts import DeltaWrite, HandlerResult, StateDelta
+        from agent.harness.coordinator import _apply_handler_result
+        from agent.harness.secret_refs import (
+            project_secret_input,
+            reconcile_state_secret_bindings,
+            register_state_secret_bindings,
+        )
+        from agent.harness.state import new_state
+
+        old_value = "https://rpc.example.invalid/old-secret-token"
+        new_value = "https://rpc.example.invalid/new-secret-token"
+        old_reference, old_bindings = project_secret_input(
+            old_value,
+            scope_id="turn:replace:old",
+            force_secret=True,
+        )
+        new_reference, new_bindings = project_secret_input(
+            new_value,
+            scope_id="turn:replace:new",
+            force_secret=True,
+        )
+        state = new_state("secret-replacement", language="en")
+        state["custom_rpc"] = {"endpoint": old_reference}
+        state["endpoint_evidence"] = {"candidate_endpoint": old_reference}
+        register_state_secret_bindings(state, old_bindings)
+        reconcile_state_secret_bindings(state)
+
+        # Admission owns the replacement while its action is in flight.
+        state["action_queue"] = [{
+            "type": "rpc_catalog_command",
+            "rpc_endpoint": new_reference,
+        }]
+        register_state_secret_bindings(state, new_bindings)
+        reconcile_state_secret_bindings(state)
+        state["action_queue"] = []
+
+        committed = _apply_handler_result(
+            state,
+            HandlerResult(delta=StateDelta(writes=(
+                DeltaWrite(("custom_rpc", "endpoint"), new_reference),
+                DeltaWrite(
+                    ("endpoint_evidence", "candidate_endpoint"),
+                    new_reference,
+                ),
+            ))),
+            owner="chain_rpc",
+        )
+
+        self.assertEqual(
+            {item["reference"] for item in committed["secret_bindings"]},
+            {new_reference},
+        )
+        self.assertIsNone(
+            resolve_secret_reference(
+                old_reference,
+                draft_id=old_bindings[0]["draft_id"],
+                atom_id=old_bindings[0]["atom_id"],
+                expected_hash=old_bindings[0]["value_hash"],
+            )
+        )
+        self.assertEqual(
+            resolve_secret_reference(
+                new_reference,
+                draft_id=new_bindings[0]["draft_id"],
+                atom_id=new_bindings[0]["atom_id"],
+                expected_hash=new_bindings[0]["value_hash"],
+            ),
+            new_value,
+        )
+        self.assertNotIn(old_value, str(committed))
+        self.assertNotIn(new_value, str(committed))
+
+    def test_replaced_state_secret_rolls_back_with_product_transaction(self) -> None:
+        from agent.harness.contracts import DeltaWrite, HandlerResult, StateDelta
+        from agent.harness.coordinator import _apply_handler_result
+        from agent.harness.secret_refs import (
+            project_secret_input,
+            reconcile_state_secret_bindings,
+            register_state_secret_bindings,
+        )
+        from agent.harness.state import new_state
+
+        old_value = "https://rpc.example.invalid/rollback-old-token"
+        new_value = "https://rpc.example.invalid/rollback-new-token"
+        old_reference, old_bindings = project_secret_input(
+            old_value,
+            scope_id="turn:rollback:old",
+            force_secret=True,
+        )
+        state = new_state("secret-replacement-rollback", language="en")
+        state["custom_rpc"] = {"endpoint": old_reference}
+        register_state_secret_bindings(state, old_bindings)
+        reconcile_state_secret_bindings(state)
+        new_reference = ""
+        new_bindings = ()
+
+        with self.assertRaisesRegex(RuntimeError, "Product Head rejected"):
+            with secret_registry_transaction():
+                new_reference, new_bindings = project_secret_input(
+                    new_value,
+                    scope_id="turn:rollback:new",
+                    force_secret=True,
+                )
+                state["action_queue"] = [{"rpc_endpoint": new_reference}]
+                register_state_secret_bindings(state, new_bindings)
+                reconcile_state_secret_bindings(state)
+                state["action_queue"] = []
+                _apply_handler_result(
+                    state,
+                    HandlerResult(delta=StateDelta(writes=(
+                        DeltaWrite(
+                            ("custom_rpc", "endpoint"),
+                            new_reference,
+                        ),
+                    ))),
+                    owner="chain_rpc",
+                )
+                raise RuntimeError("Product Head rejected")
+
+        self.assertEqual(
+            resolve_secret_reference(
+                old_reference,
+                draft_id=old_bindings[0]["draft_id"],
+                atom_id=old_bindings[0]["atom_id"],
+                expected_hash=old_bindings[0]["value_hash"],
+            ),
+            old_value,
+        )
+        self.assertIsNone(
+            resolve_secret_reference(
+                new_reference,
+                draft_id=new_bindings[0]["draft_id"],
+                atom_id=new_bindings[0]["atom_id"],
+                expected_hash=new_bindings[0]["value_hash"],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

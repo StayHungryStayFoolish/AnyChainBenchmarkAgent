@@ -4800,6 +4800,13 @@ def _apply_handler_result(
         },
     )
 
+    # A domain delta may replace a state-owned secret reference. Reconcile at
+    # the atomic domain boundary before validating the candidate; the caller's
+    # post-commit reconciliation is necessarily too late for this invariant.
+    try:
+        reconcile_state_secret_bindings(candidate)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
     validate_state(candidate)
     return candidate
 

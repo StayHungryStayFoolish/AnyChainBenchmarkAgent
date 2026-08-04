@@ -272,6 +272,10 @@ Version 22 adds the durable-state secret-binding registry. Version 23 makes
 input sensitivity part of the signed question/group contract, separates
 deterministic semantic hashes from salted memory-hard secret verifiers, and
 commits process-local registry mutations with the Product Head transaction.
+Every accepted domain delta reconciles durable secret ownership inside the
+same atomic commit boundary before candidate validation, so replacing a
+sensitive value retires its old binding without exposing a partially updated
+state.
 An exact sensitive scalar is projected as one opaque reference before the LLM
 or checkpoint boundary. For compound input, deterministic typed candidates
 such as endpoint URLs and explicitly structured credentials are projected

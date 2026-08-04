@@ -17764,6 +17764,65 @@ response:
         self.assertNotIn("example.invalid", str(result.get("confirmed_config") or {}))
         self.assertNotIn("example.invalid", str(result.get("endpoint_evidence") or {}))
 
+    def test_unreachable_validation_endpoint_can_be_replaced_atomically(self) -> None:
+        from tests.agent_live.graph_turn import answer_pending
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.secret_refs import materialize_state_secret_references
+        from agent.harness.state import new_state
+
+        state = new_state("endpoint-replacement", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "endpoint_process",
+            "chain_identity": {
+                "raw": "ethereum",
+                "canonical": "ethereum",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+                "case": "known",
+            },
+            "custom_rpc": {"status": "needs_endpoint"},
+        })
+        state["pending_question"] = question_for_chain_rpc(
+            state,
+            "endpoint_process",
+        ) or {}
+        failed_probe = {
+            "ready": False,
+            "status": "ERR",
+            "error": "connection refused",
+            "evidence_file": "failed-probe.json",
+        }
+        ready_probe = {
+            "ready": True,
+            "status": "ok",
+            "evidence_file": "ready-probe.json",
+        }
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+            return_value=failed_probe,
+        ):
+            failed = answer_pending(state, "http://127.0.0.1:8545")
+        self.assertEqual((failed.get("custom_rpc") or {}).get("status"), "probe_failed")
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+            return_value=ready_probe,
+        ):
+            replaced = answer_pending(failed, "http://fake-node:19000")
+
+        endpoint = (replaced.get("custom_rpc") or {}).get("endpoint")
+        self.assertEqual(
+            materialize_state_secret_references(endpoint, replaced),
+            "http://fake-node:19000",
+        )
+        self.assertTrue((replaced.get("custom_rpc") or {}).get("endpoint_ready"))
+        self.assertEqual(len(replaced.get("secret_bindings") or []), 1)
+        self.assertNotIn("127.0.0.1:8545", str(replaced))
+        self.assertNotIn("fake-node:19000", str(replaced))
+
     def test_new_pending_question_replaces_the_previous_rendered_question(self) -> None:
         from agent.harness.contracts import HandlerResult, ResponseFragment
         from agent.harness.coordinator import _apply_handler_result
