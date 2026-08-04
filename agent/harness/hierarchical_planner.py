@@ -969,6 +969,9 @@ def _select_stage_a_proposal(
             stage_a_payload.get("registered_value_mentions") or []
         ),
         "groups": stage_a_payload["groups"],
+        "routing_purposes": list(
+            stage_a_payload.get("routing_purposes") or []
+        ),
         "universal_operations": list(
             stage_a_payload.get("universal_operations") or []
         ),
@@ -1866,6 +1869,16 @@ def _stage_a_payload(
             for operation, owners in _UNIVERSAL_OPERATION_OWNERS.items()
         },
         "owners": sorted(_OWNERS),
+        "routing_purposes": [
+            {
+                "action_type": action["type"],
+                "owner": action["owner"],
+                "purpose": action["purpose"],
+                "semantic_operations": action["semantic_operations"],
+                "route_groups": action["route_groups"],
+            }
+            for action in projected_actions
+        ],
         "groups": [
             {
                 "name": row["name"],
@@ -1874,21 +1887,6 @@ def _stage_a_payload(
                 "fields": row["fields"],
                 "depends_on": row["depends_on"],
                 "entry_actions": row["entry_actions"],
-                "routing_purposes": [
-                    {
-                        "action_type": action["type"],
-                        "owner": action["owner"],
-                        "purpose": action["purpose"],
-                        "semantic_operations": action["semantic_operations"],
-                        "route_groups": action["route_groups"],
-                    }
-                    for action in projected_actions
-                    if _action_schema_applies(
-                        action,
-                        groups=frozenset({row["name"]}),
-                        operations=frozenset(action["semantic_operations"]),
-                    )
-                ],
             }
             for row in group_schema()
         ],
@@ -3404,6 +3402,9 @@ def _review_stage_a_partition_detailed(
             stage_a_payload.get("semantic_draft_revision") or 0
         ),
         "groups": stage_a_payload["groups"],
+        "routing_purposes": list(
+            stage_a_payload.get("routing_purposes") or []
+        ),
         "universal_operations": stage_a_payload["universal_operations"],
         "universal_operation_purposes": dict(
             stage_a_payload.get("universal_operation_purposes")

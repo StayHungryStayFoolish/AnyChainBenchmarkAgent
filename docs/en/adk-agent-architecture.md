@@ -193,6 +193,13 @@ state authority survives the turn. Stage-A proposal/convergence, per-reviewer
 contract repair, and component calls outside an active runtime turn remain
 serial.
 
+Stage A projects group metadata and action routing purposes as two normalized
+authoritative registries. Every action purpose appears exactly once with its
+owner, semantic operations, and complete route-group set; proposal,
+convergence, and admission review receive both registries. Replicating action
+purposes inside every applicable group is forbidden because it increases wire
+cost without creating new semantic authority.
+
 `terminal_protocol.py` defines the shared non-secret terminal projection used
 by the product and live acceptance runners. Delivery order is:
 

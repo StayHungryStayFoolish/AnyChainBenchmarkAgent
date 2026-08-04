@@ -164,6 +164,13 @@ deadline, retry budget, or state authority. Dependent Stage-A convergence and
 contract repair remain serial. Direct component calls outside a runtime turn
 also remain serial.
 
+Stage A receives two normalized authoritative registries: `groups` contains
+group metadata, while `routing_purposes` contains each registered action's
+owner, purpose, semantic operations, and route groups exactly once. Proposal,
+convergence, and admission review receive both complete registries. Action
+purposes must not be copied into every applicable group because that changes
+wire cost without adding semantic authority.
+
 `harness/terminal_protocol.py` defines the shared non-secret delivery
 projection. The terminal renders and flushes the complete frame, durably
 appends the projection, and only then acknowledges the outbox row as

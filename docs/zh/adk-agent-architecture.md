@@ -177,6 +177,12 @@ scheduler、deadline、retry budget 或 state authority。Stage-A proposal /
 convergence、单个 reviewer 内的 contract repair，以及 active runtime turn 之外的
 component call 仍保持串行。
 
+Stage A 将 group metadata 与 action routing purpose 投影成两个规范化的权威
+registry。每个 action purpose 只出现一次，并完整携带 owner、semantic operation
+与 route-group 集合；proposal、convergence 和 admission review 都接收这两个完整
+registry。禁止把 action purpose 复制到每个适用 group 中，因为这种重复只会增加
+wire cost，不会产生新的语义权威。
+
 `terminal_protocol.py` 是产品与 live acceptance runner 共用的非敏感终端投影
 协议。交付顺序固定为：
 

@@ -146,6 +146,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "value": "fake-node",
             }],
             "groups": [],
+            "routing_purposes": [{
+                "action_type": "choose_target_mode",
+                "owner": "chain_rpc",
+                "purpose": "choose a target mode",
+                "semantic_operations": ["domain_request"],
+                "route_groups": ["target_mode"],
+            }],
             "universal_operations": ["domain_request"],
             "universal_operation_purposes": {"domain_request": "mutate"},
             "universal_owner_action_purposes": {},
@@ -179,6 +186,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             captured["registered_semantic_value_domains"],
             stage_a_payload["registered_semantic_value_domains"],
+        )
+        self.assertEqual(
+            captured["routing_purposes"],
+            stage_a_payload["routing_purposes"],
         )
 
     def test_cross_group_registered_value_arbitrates_competing_open_identity(
@@ -2757,6 +2768,34 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             payload["universal_operation_purposes"],
             dict(SEMANTIC_OPERATION_PURPOSES),
+        )
+
+    def test_stage_a_payload_normalizes_complete_routing_catalog(self) -> None:
+        from agent.harness.context import action_schema
+        from agent.harness.hierarchical_planner import _stage_a_payload
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "Configure several independent groups and explain one mode."
+        payload = _stage_a_payload({}, text, segment_user_turn(text))
+        expected = [
+            {
+                "action_type": action["type"],
+                "owner": action["owner"],
+                "purpose": action["purpose"],
+                "semantic_operations": action["semantic_operations"],
+                "route_groups": action["route_groups"],
+            }
+            for action in action_schema()
+        ]
+
+        self.assertEqual(payload["routing_purposes"], expected)
+        self.assertTrue(payload["groups"])
+        self.assertTrue(
+            all("routing_purposes" not in group for group in payload["groups"])
+        )
+        self.assertLess(
+            len(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+            60_000,
         )
 
     def test_stage_a_projects_closed_consultation_topic_purposes(self) -> None:
@@ -6940,6 +6979,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 {"name": "chain_identity", "owner": "chain_rpc"},
                 {"name": "qps_profile", "owner": "performance"},
             ],
+            "routing_purposes": [{
+                "action_type": "choose_chain",
+                "owner": "chain_rpc",
+                "purpose": "choose a chain",
+                "semantic_operations": ["domain_request"],
+                "route_groups": ["chain_identity"],
+            }],
             "universal_operations": ["domain_request"],
         }
         partition = [{
@@ -6972,7 +7018,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         with patch(
             "agent.harness.hierarchical_planner.request_semantic_compilation",
             return_value=json.dumps(response),
-        ):
+        ) as compiler:
             errors, _sizes, _redundant = _review_stage_a_partition(
                 object(),
                 payload,
@@ -6980,6 +7026,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             )
 
         self.assertTrue(any("omitted demand" in error for error in errors))
+        self.assertEqual(
+            compiler.call_args.kwargs["request_payload"]["routing_purposes"],
+            payload["routing_purposes"],
+        )
 
     def test_pending_entailment_jury_rejects_unrelated_workflow_request(self) -> None:
         from agent.harness.hierarchical_planner import (
