@@ -7648,14 +7648,24 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(sizes, ())
 
-    def test_manual_pending_uses_existing_stage_a_coverage_authority(self) -> None:
+    def test_manual_pending_entailment_requires_semantic_quorum(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_stage_a_pending_entailment,
             _stage_a_admission_prompt,
         )
 
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "selected_value": "us-1",
+                "evidence_quote": "us-1",
+                "reason": "one concrete region value is supplied",
+            })
+
         with patch(
             "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
         ) as compiler:
             errors, sizes = _review_stage_a_pending_entailment(
                 object(),
@@ -7682,13 +7692,179 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             )
 
         self.assertEqual(errors, ())
-        self.assertEqual(sizes, ())
-        compiler.assert_not_called()
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(compiler.call_count, 3)
         self.assertIn(
             "a prose pending_answer is complete only when its exact source "
             "supplies one concrete value",
             _stage_a_admission_prompt(),
         )
+
+    def test_manual_pending_entailment_rejects_relative_change_request(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "I need to benchmark a different chain."
+        payload = {
+            "pending_question": {
+                "id": "BLOCKCHAIN_NODE",
+                "group": "chain_identity",
+                "manual_input_allowed": True,
+                "validation": {"value_type": "bounded_text"},
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_identity",
+            }],
+        }]
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "different_request",
+                "selected_value": None,
+                "evidence_quote": "different chain",
+                "reason": "this requests replacement, not one chain value",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ) as compiler:
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(any("quorum rejected" in error for error in errors))
+
+    def test_manual_pending_entailment_preserves_typed_contract_identities(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        cases = (
+            (
+                "qps",
+                "Set it to 25.",
+                "25",
+                25,
+                {"value_type": "positive_integer"},
+            ),
+            (
+                "endpoint",
+                "Use https://node.example/rpc for this run.",
+                "https://node.example/rpc",
+                "https://node.example/rpc",
+                {"value_type": "url"},
+            ),
+            (
+                "machine",
+                "The machine type is c4-standard-16.",
+                "c4-standard-16",
+                "c4-standard-16",
+                {"value_type": "scalar_token"},
+            ),
+        )
+        for name, source, evidence, selected, validation in cases:
+            payload = {
+                "pending_question": {
+                    "id": name,
+                    "group": name,
+                    "manual_input_allowed": True,
+                    "validation": validation,
+                },
+                "contract_proven_pending_prefixes": [],
+                "pending_typed_candidates": [],
+            }
+            partition = [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "operation": "pending_answer",
+                "owner_routes": [{"owner": "coordinator", "group": name}],
+            }]
+
+            def response(*_args, **kwargs):
+                return json.dumps({
+                    "claim_hash": kwargs["request_payload"]["claim_hash"],
+                    "verdict": "answers",
+                    "selected_value": selected,
+                    "evidence_quote": evidence,
+                    "reason": "one concrete contract value is supplied",
+                })
+
+            with self.subTest(name=name), patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=response,
+            ):
+                errors, sizes = _review_stage_a_pending_entailment(
+                    object(), payload, partition
+                )
+
+            self.assertEqual(errors, ())
+            self.assertEqual(len(sizes), 3)
+
+    def test_manual_pending_entailment_rejects_value_not_grounded_by_quote(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "Set the maximum QPS to 25."
+        payload = {
+            "pending_question": {
+                "id": "MAX_QPS",
+                "group": "qps_profile",
+                "manual_input_allowed": True,
+                "validation": {"value_type": "positive_integer"},
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "qps_profile",
+            }],
+        }]
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "selected_value": 50,
+                "evidence_quote": "25",
+                "reason": "invented a different numeric value",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(any("quorum rejected" in error for error in errors))
 
     def test_pending_entailment_jury_remains_for_semantic_options(self) -> None:
         from agent.harness.hierarchical_planner import (

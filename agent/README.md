@@ -102,6 +102,15 @@ typed values, natural-language alternatives, multi-intent prose, and structured
 content that requires semantic ownership enter the hierarchical planner before
 the pending contract and owning domain validate them.
 
+An unproven semantic `pending_answer` is also reviewed by an independent
+reject-only quorum. Option paraphrases must select exactly one declared option.
+A manual answer must contain one concrete, directly usable value whose typed
+contract identity matches its exact source quote. Relative references, requests
+to change or revisit a field, navigation, capability questions, and deferred
+values do not answer the pending question; they remain available for routing to
+their registered owner. Exact signed options and deterministic typed candidates
+keep their narrow local lane.
+
 LLM output is never executed directly. The semantic path checkpoints
 `partition`, repeats `compile_owner` once per scheduled owner, checkpoints
 `review_plan` for independent whole-plan semantic admission, and then enters

@@ -105,6 +105,14 @@ evidence transport framing 和空输入。用户手工输入的 typed value 不�
 option；它必须先进入 semantic partition，由模型确定 ownership，然后仍由
 pending-question contract 和所属 domain 执行确定性值校验。
 
+任何尚未获得确定性证明的语义 `pending_answer` 在被选中前，都必须通过独立、
+只负责拒绝的 quorum 审查。自然语言 option 答案必须唯一选择一个已声明 option；
+手填答案必须在原文中给出一个具体、可直接使用的值，并且模型选择值与最短精确
+原文引用必须具有相同的 typed pending-contract identity。相对或泛化指代、要求
+选择/更改/重访/替换字段、导航或能力咨询，以及承诺稍后提供值，都不是当前问题的
+手填答案。该解释被拒绝后，同一原文仍可交给其他已注册 owner route。已签名的
+精确 option 和确定性 typed candidate 继续使用其受限本地通道。
+
 `partition`、每一次独立的 `compile_owner`、以及 `review_plan` 都是可
 checkpoint 的独立 transition。`review_plan` 对不可变 owner documents 执行独立的
 whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在 action

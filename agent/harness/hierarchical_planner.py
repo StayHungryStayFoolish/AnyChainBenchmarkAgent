@@ -3276,14 +3276,20 @@ def _pending_entailment_prompt() -> str:
         "verdict must be "
         "answers, different_request, or uncertain. For answers, evidence_quote "
         "must be the shortest non-empty exact substring that commits to the pending "
-        "answer, and selected_value must copy the exact JSON value of the one "
-        "declared pending_question option selected by that source. Do not return "
-        "an option id, label, number, or paraphrase as selected_value. For "
-        "different_request or uncertain, selected_value must be null. When the "
-        "pending question accepts a manual value, the quote must "
+        "answer. For an option question, selected_value must copy the exact JSON "
+        "value of the one declared pending_question option selected by that source; "
+        "do not return an option id, label, number, or paraphrase. For a manual "
+        "question, selected_value must contain exactly the concrete value in the "
+        "evidence quote, preserving its typed JSON representation when the contract "
+        "requires one. For different_request or uncertain, selected_value must be "
+        "null. When the pending question accepts a manual value, the quote must "
         "be the shortest exact source substring containing only the proposed value "
-        "that can be validated against that question; do not include its field "
-        "label or sibling demands. For other verdicts it must be an exact non-empty substring showing "
+        "that can be validated against that question; it must denote one concrete, "
+        "directly usable field value. A generic or relative reference, a request to "
+        "change, choose, revisit, or replace the value, a capability question, or a "
+        "promise to provide the value later is not a manual answer. Do not include "
+        "its field label or sibling demands. For other verdicts it must be an exact "
+        "non-empty substring showing "
         "why the source is not an answer. Never infer an answer from consequence or "
         "convenience."
     )
@@ -3434,8 +3440,6 @@ def _review_stage_a_pending_entailment(
     pending = dict(stage_a_payload.get("pending_question") or {})
     if (
         not pending
-        or not pending.get("options")
-        or pending.get("manual_input_allowed") is True
         or isinstance(pending.get("semantic_draft_binding"), Mapping)
         or stage_a_payload.get("contract_proven_pending_prefixes")
         or stage_a_payload.get("pending_typed_candidates")
@@ -3470,7 +3474,7 @@ def _review_stage_a_pending_entailment(
             ).encode("utf-8")
         ).hexdigest()
         payload = {"claim_hash": claim_hash, **claim_payload}
-        option_votes: dict[str, int] = defaultdict(int)
+        answer_votes: dict[str, int] = defaultdict(int)
         for _member in range(3):
             request_sizes.append(_wire_size(prompt, payload))
             response = request_semantic_compilation(
@@ -3508,10 +3512,17 @@ def _review_stage_a_pending_entailment(
                     continue
                 continue
             selected_identity = pending_value_identity(selected_value, pending)
-            if not selected_identity.startswith("option:"):
+            if not selected_identity:
                 continue
-            option_votes[selected_identity] += 1
-        if max(option_votes.values(), default=0) < 2:
+            if not selected_identity.startswith("option:"):
+                evidence_identity = pending_value_identity(evidence, pending)
+                if (
+                    pending.get("manual_input_allowed") is not True
+                    or selected_identity != evidence_identity
+                ):
+                    continue
+            answer_votes[selected_identity] += 1
+        if max(answer_votes.values(), default=0) < 2:
             errors.append(
                 "Stage A pending-answer entailment quorum rejected unit: "
                 f"{claim['unit_id']}"

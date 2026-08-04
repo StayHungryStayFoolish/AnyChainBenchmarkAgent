@@ -111,6 +111,17 @@ semantic partitioning so the model can assign ownership, after which the
 pending-question contract and owning domain still perform deterministic value
 validation.
 
+Before an unproven semantic `pending_answer` can be selected, an independent
+reject-only quorum reviews its exact source evidence. A semantic option answer
+must select exactly one declared option. A manual answer must expose one
+concrete, directly usable value, and the selected value must have the same typed
+pending-contract identity as the shortest exact source quote. A relative or
+generic reference, a request to choose/change/revisit/replace a field, a
+navigation or capability question, and a promised later value are different
+requests rather than manual answers. Rejecting that interpretation leaves the
+same source available to another registered owner route. Exact signed options
+and deterministic typed candidates retain their bounded local lanes.
+
 `partition`, every individual `compile_owner`, and `review_plan` are separate
 checkpointed transitions. `review_plan` performs independent whole-plan
 semantic admission over the immutable owner documents. The following `admit`
