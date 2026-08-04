@@ -200,6 +200,14 @@ convergence, and admission review receive both registries. Replicating action
 purposes inside every applicable group is forbidden because it increases wire
 cost without creating new semantic authority.
 
+Competing independently reviewed Stage-A proposals are not selectable merely
+because their partitions are structurally complete. Before convergence, each
+otherwise eligible proposal passes a read-only, non-admitting owner-compilation
+preflight. Every executable unit must bind to a registered action served by its
+declared owner and group; an unresolved or invalid binding removes that proposal
+from selection. Preflight documents are discarded and cannot mutate state,
+enqueue work, publish admission, or replace canonical Stage-B compilation.
+
 Structured semantic identities remain parser-owned DemandAtom IDs and fail
 closed when unknown, missing, or duplicated. Stage-A prose IDs are untrusted
 turn-local labels. Before lossless span placement, the Harness deterministically

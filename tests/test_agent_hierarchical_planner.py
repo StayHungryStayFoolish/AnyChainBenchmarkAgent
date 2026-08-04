@@ -3694,6 +3694,413 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertTrue(receipt["secondary_eligible"])
         self.assertEqual(receipt["request_count"], 0)
 
+    def test_stage_a_compilation_preflight_rejects_wrong_owner_before_selection(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _proposal_compilation_eligible,
+            _select_stage_a_proposal,
+        )
+
+        source = "May I retest a different value?"
+        coordinator = [{
+            "unit_id": "primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "navigation",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_identity",
+            }],
+            "reason": "structurally valid but owned by the wrong compiler",
+        }]
+        chain = [{
+            "unit_id": "secondary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "chain_rpc", "group": "chain_identity"}],
+            "reason": "present chain mutation request",
+        }]
+
+        def compile_owner(_state, owner, _groups, _partition, unit_ids):
+            unit_id = unit_ids[0]
+            if owner == "coordinator":
+                return ({
+                    "actions": [],
+                    "bindings": [{
+                        "unit_id": unit_id,
+                        "action_indexes": [],
+                        "disposition": "unresolved",
+                        "reason": "no coordinator action serves this request",
+                    }],
+                }, (), (101,))
+            return ({
+                "actions": [{"type": "chain_change_input"}],
+                "bindings": [{
+                    "unit_id": unit_id,
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "registered chain intake",
+                }],
+            }, (), (103,))
+
+        with patch(
+            "agent.harness.hierarchical_planner._compile_owner_document",
+            side_effect=compile_owner,
+        ):
+            primary_eligible, primary_sizes = (
+                _proposal_compilation_eligible({}, coordinator)
+            )
+            secondary_eligible, secondary_sizes = (
+                _proposal_compilation_eligible({}, chain)
+            )
+
+        payload = {
+            "user_text": source,
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": source,
+                "input_shape": "prose",
+            }],
+            "pending_question": {},
+            "groups": [],
+            "universal_operation_purposes": {},
+        }
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+        ) as convergence:
+            selected, errors, sizes, receipt = _select_stage_a_proposal(
+                object(),
+                payload,
+                coordinator,
+                chain,
+                primary_eligible=primary_eligible,
+                secondary_eligible=secondary_eligible,
+            )
+
+        convergence.assert_not_called()
+        self.assertFalse(primary_eligible)
+        self.assertTrue(secondary_eligible)
+        self.assertEqual(primary_sizes, (101,))
+        self.assertEqual(secondary_sizes, (103,))
+        self.assertEqual(selected, chain)
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, ())
+        self.assertEqual(receipt["selection_authority"], "harness_eligibility")
+
+    def test_stage_a_partition_uses_compilation_preflight_for_competing_routes(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "May I retest a different value?"
+        proposals = [
+            {
+                "semantic_units": [{
+                    "unit_id": "primary",
+                    "clause_id": "clause-1",
+                    "source_text": text,
+                    "operation": "navigation",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "chain_identity",
+                    }],
+                    "reason": "wrong owner",
+                }],
+                "reason": "primary proposal",
+            },
+            {
+                "semantic_units": [{
+                    "unit_id": "secondary",
+                    "clause_id": "clause-1",
+                    "source_text": text,
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "chain_identity",
+                    }],
+                    "reason": "registered owner",
+                }],
+                "reason": "secondary proposal",
+            },
+        ]
+        proposal_index = 0
+
+        def semantic_response(*_args, **kwargs):
+            nonlocal proposal_index
+            system = kwargs["system_prompt"]
+            payload = kwargs["request_payload"]
+            if "Stage A semantic partition" in system:
+                result = proposals[proposal_index]
+                proposal_index += 1
+                return json.dumps(result)
+            raise AssertionError(system)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=semantic_response,
+            ) as compiler,
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_partition_requires_independent_proposal",
+                return_value=True,
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_competing_open_identity_relations",
+                side_effect=lambda _provider, partition, _payload: (
+                    [dict(unit) for unit in partition],
+                    (),
+                    (),
+                    {},
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_candidate",
+                return_value=((), (), frozenset(), True, ()),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_proposal_compilation_eligible",
+                side_effect=[(False, (101,)), (True, (103,))],
+            ) as compilation_preflight,
+        ):
+            result = begin_semantic_partition({}, text)
+
+        self.assertEqual(result["status"], "compile_owner", result)
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(result["admission_calls"], 0)
+        self.assertEqual(result["stage_b_calls"], 2)
+        self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(compilation_preflight.call_count, 2)
+        self.assertEqual(
+            result["stage_a_convergence"]["selected_proposal"],
+            "secondary",
+        )
+        self.assertEqual(
+            result["stage_a_convergence"]["selection_authority"],
+            "harness_eligibility",
+        )
+        self.assertEqual(
+            result["owner_requests"],
+            [{
+                "owner": "chain_rpc",
+                "unit_ids": ["secondary"],
+                "groups": ["chain_identity"],
+            }],
+        )
+
+    def test_stage_a_compilation_preflight_is_generic_across_domain_owners(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _proposal_compilation_eligible,
+        )
+
+        routes = (
+            ("chain_rpc", "chain_identity"),
+            ("chain_rpc", "endpoint_process"),
+            ("chain_rpc", "target_mode"),
+            ("performance", "qps_profile"),
+            ("orientation", "framework_summary"),
+        )
+
+        def compile_owner(_state, _owner, _groups, _partition, unit_ids):
+            return ({
+                "actions": [{"type": "registered-action"}],
+                "bindings": [{
+                    "unit_id": unit_ids[0],
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "compiled by the registered owner",
+                }],
+            }, (), (107,))
+
+        with patch(
+            "agent.harness.hierarchical_planner._compile_owner_document",
+            side_effect=compile_owner,
+        ):
+            for index, (owner, group) in enumerate(routes, start=1):
+                with self.subTest(owner=owner, group=group):
+                    eligible, sizes = _proposal_compilation_eligible({}, [{
+                        "unit_id": f"unit-{index}",
+                        "clause_id": "clause-1",
+                        "source_text": "one present request",
+                        "operation": (
+                            "consultation"
+                            if owner == "orientation"
+                            else "domain_request"
+                        ),
+                        "owner_routes": [{"owner": owner, "group": group}],
+                        "reason": "registered route",
+                    }])
+                    self.assertTrue(eligible)
+                    self.assertEqual(sizes, (107,))
+
+    def test_stage_a_compilation_preflight_fails_closed_for_unbound_unit(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _proposal_compilation_eligible,
+        )
+
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "change the current setting",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "performance", "group": "qps_profile"}],
+            "reason": "present request",
+        }]
+        with patch(
+            "agent.harness.hierarchical_planner._compile_owner_document",
+            return_value=({
+                "actions": [],
+                "bindings": [{
+                    "unit_id": "unit-1",
+                    "action_indexes": [],
+                    "disposition": "unresolved",
+                    "reason": "insufficient owner compilation",
+                }],
+            }, (), (109,)),
+        ):
+            eligible, sizes = _proposal_compilation_eligible({}, partition)
+
+        self.assertFalse(eligible)
+        self.assertEqual(sizes, (109,))
+
+    def test_stage_a_convergence_rejects_two_uncompileable_proposals(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _select_stage_a_proposal
+
+        primary = [{
+            "unit_id": "primary",
+            "clause_id": "clause-1",
+            "source_text": "change the current setting",
+            "operation": "navigation",
+            "owner_routes": [{"owner": "coordinator", "group": "qps_profile"}],
+            "reason": "first uncompileable route",
+        }]
+        secondary = [{
+            "unit_id": "secondary",
+            "clause_id": "clause-1",
+            "source_text": "change the current setting",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "performance", "group": "qps_profile"}],
+            "reason": "second uncompileable route",
+        }]
+        payload = {
+            "user_text": "change the current setting",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "change the current setting",
+                "input_shape": "prose",
+            }],
+            "pending_question": {},
+            "groups": [],
+            "universal_operation_purposes": {},
+        }
+        verdict = json.dumps({
+            "selected_proposal": "primary",
+            "primary_hash": "",
+            "secondary_hash": "",
+            "reason": "select one despite failed owner compilation",
+        })
+
+        def converge(*_args, **kwargs):
+            request = kwargs["request_payload"]
+            document = json.loads(verdict)
+            document["primary_hash"] = request["primary"]["hash"]
+            document["secondary_hash"] = request["secondary"]["hash"]
+            return json.dumps(document)
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=converge,
+        ):
+            _selected, errors, _sizes, receipt = _select_stage_a_proposal(
+                object(),
+                payload,
+                primary,
+                secondary,
+                primary_eligible=False,
+                secondary_eligible=False,
+            )
+
+        self.assertIn(
+            "Stage A convergence selected an incomplete proposal",
+            errors,
+        )
+        self.assertFalse(receipt["valid"])
+
+    def test_stage_a_convergence_still_reviews_two_compileable_proposals(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _select_stage_a_proposal
+
+        primary = [{
+            "unit_id": "primary",
+            "clause_id": "clause-1",
+            "source_text": "change the current setting",
+            "operation": "navigation",
+            "owner_routes": [{"owner": "coordinator", "group": "qps_profile"}],
+            "reason": "registered navigation",
+        }]
+        secondary = [{
+            "unit_id": "secondary",
+            "clause_id": "clause-1",
+            "source_text": "change the current setting",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "performance", "group": "qps_profile"}],
+            "reason": "registered mutation intake",
+        }]
+        payload = {
+            "user_text": "change the current setting",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "change the current setting",
+                "input_shape": "prose",
+            }],
+            "pending_question": {},
+            "groups": [],
+            "universal_operation_purposes": {},
+        }
+
+        def converge(*_args, **kwargs):
+            request = kwargs["request_payload"]
+            return json.dumps({
+                "selected_proposal": "secondary",
+                "primary_hash": request["primary"]["hash"],
+                "secondary_hash": request["secondary"]["hash"],
+                "reason": "the mutation route best matches the present request",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=converge,
+        ) as compiler:
+            selected, errors, _sizes, receipt = _select_stage_a_proposal(
+                object(),
+                payload,
+                primary,
+                secondary,
+                primary_eligible=True,
+                secondary_eligible=True,
+            )
+
+        compiler.assert_called_once()
+        self.assertEqual(selected, secondary)
+        self.assertEqual(errors, ())
+        self.assertTrue(receipt["valid"])
+        self.assertEqual(receipt["selection_authority"], "model_convergence")
+
     def test_malformed_independent_stage_a_proposal_fails_closed(self) -> None:
         from agent.harness.hierarchical_planner import begin_semantic_partition
 

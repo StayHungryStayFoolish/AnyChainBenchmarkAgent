@@ -171,6 +171,14 @@ convergence, and admission review receive both complete registries. Action
 purposes must not be copied into every applicable group because that changes
 wire cost without adding semantic authority.
 
+When independently reviewed Stage-A proposals disagree, partition completeness
+alone does not grant selection authority. Each otherwise selectable proposal
+must first pass a non-admitting owner-compilation preflight: every executable
+unit must bind to a registered action under its declared owner and group. An
+unresolved or invalid owner binding makes that proposal ineligible before
+convergence. The preflight never mutates state or enqueues actions, and its
+documents are discarded before canonical Stage-B compilation.
+
 Structured semantic-unit identities are parser-owned DemandAtom IDs and fail
 closed on any unknown, missing, or duplicate identity. Prose `unit_id` values
 from Stage A are untrusted turn-local labels. The Harness deterministically

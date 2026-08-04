@@ -401,6 +401,41 @@ def begin_semantic_partition(
                 independent_partition,
                 independent_redundant_unit_ids,
             )
+            primary_eligible = (
+                primary_review_valid
+                and _proposal_selection_eligible(source_partition)
+            )
+            secondary_eligible = _proposal_selection_eligible(
+                independent_source_partition
+            )
+            if (
+                primary_eligible
+                and secondary_eligible
+                and _partition_hash(source_partition)
+                != _partition_hash(independent_source_partition)
+            ):
+                compilation_reviews = run_independent_llm_tasks((
+                    lambda: _proposal_compilation_eligible(
+                        state,
+                        compilation_partition,
+                    ),
+                    lambda: _proposal_compilation_eligible(
+                        state,
+                        independent_compilation_partition,
+                    ),
+                ))
+                primary_eligible, primary_compilation_sizes = (
+                    compilation_reviews[0]
+                )
+                secondary_eligible, secondary_compilation_sizes = (
+                    compilation_reviews[1]
+                )
+                compilation_sizes = (
+                    *primary_compilation_sizes,
+                    *secondary_compilation_sizes,
+                )
+                document["request_sizes"].extend(compilation_sizes)
+                document["stage_b_calls"] += len(compilation_sizes)
             (
                 selected_partition,
                 convergence_errors,
@@ -411,13 +446,8 @@ def begin_semantic_partition(
                 stage_a_payload,
                 source_partition,
                 independent_source_partition,
-                primary_eligible=(
-                    primary_review_valid
-                    and _proposal_selection_eligible(source_partition)
-                ),
-                secondary_eligible=_proposal_selection_eligible(
-                    independent_source_partition
-                ),
+                primary_eligible=primary_eligible,
+                secondary_eligible=secondary_eligible,
             )
             document["request_sizes"].extend(convergence_sizes)
             document["admission_calls"] += len(convergence_sizes)
@@ -849,6 +879,72 @@ def _proposal_selection_eligible(
         str(unit.get("operation") or "") == "unresolved"
         for unit in partition
     )
+
+
+def _proposal_compilation_eligible(
+    state: AgentGraphState,
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[bool, tuple[int, ...]]:
+    """Prove that every executable unit compiles under its routed owner.
+
+    Stage A validates source coverage and route shape. This non-admitting
+    preflight closes the remaining authority gap: a structurally valid owner
+    route is selectable only when that owner can bind every routed unit to a
+    registered action. The resulting documents are intentionally discarded;
+    canonicalization and normal Stage B compilation remain authoritative.
+    """
+
+    if not _proposal_selection_eligible(partition):
+        return False, ()
+    requests: list[tuple[str, frozenset[str], tuple[str, ...]]] = []
+    for owner, unit_ids in _owner_requests(partition).items():
+        groups = frozenset(
+            str(route.get("group") or "")
+            for unit in partition
+            if str(unit.get("unit_id") or "") in unit_ids
+            for route in unit.get("owner_routes") or ()
+            if (
+                isinstance(route, Mapping)
+                and str(route.get("owner") or "") == owner
+                and str(route.get("group") or "")
+            )
+        )
+        requests.append((owner, groups, unit_ids))
+    if not requests:
+        return False, ()
+
+    compiled = run_independent_llm_tasks(tuple(
+        lambda request=request: _compile_owner_document(
+            state,
+            request[0],
+            request[1],
+            partition,
+            request[2],
+        )
+        for request in requests
+    ))
+    request_sizes: list[int] = []
+    eligible = True
+    for (_owner, _groups, unit_ids), (document, errors, sizes) in zip(
+        requests,
+        compiled,
+    ):
+        request_sizes.extend(int(value) for value in sizes)
+        if errors:
+            eligible = False
+            continue
+        bindings = {
+            str(binding.get("unit_id") or ""): dict(binding)
+            for binding in document.get("bindings") or ()
+            if isinstance(binding, Mapping)
+        }
+        if any(
+            str(bindings.get(unit_id, {}).get("disposition") or "") != "action"
+            or not bindings.get(unit_id, {}).get("action_indexes")
+            for unit_id in unit_ids
+        ):
+            eligible = False
+    return eligible, tuple(request_sizes)
 
 
 def _stage_a_convergence_prompt() -> str:

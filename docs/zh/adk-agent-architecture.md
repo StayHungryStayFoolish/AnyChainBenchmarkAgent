@@ -183,6 +183,13 @@ registry。每个 action purpose 只出现一次，并完整携带 owner、seman
 registry。禁止把 action purpose 复制到每个适用 group 中，因为这种重复只会增加
 wire cost，不会产生新的语义权威。
 
+两份经过独立 review 的 Stage-A proposal 发生竞争时，partition 在结构上完整并不
+等于具备选择权。每份原本可选的 proposal 必须先经过只读、不可 admission 的
+owner-compilation preflight；每个可执行 unit 都必须由其声明的 owner/group 绑定到
+已注册 action。任何 unresolved 或无效 owner binding 都会使该 proposal 在
+convergence 前失去资格。preflight document 会被丢弃，不得修改 state、入队、发布
+admission，也不能取代规范的 Stage-B compilation。
+
 structured semantic identity 仍是 parser-owned DemandAtom ID；未知、缺失或重复
 都必须 fail closed。Stage A 返回的 prose `unit_id` 只是非可信的 turn-local
 label。Harness 在 lossless span placement 前只对缺失或碰撞的 prose label 做确定性
