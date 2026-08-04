@@ -6650,7 +6650,14 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     )
                 ) and str(payload.get("user_text") or "").strip() == "quick"
                 model_calls.append((system, has_resolution))
-                if "Stage A proposal convergence authority" in system:
+                if "semantic-draft clarification reviewer" in system:
+                    response = {
+                        "contract_hash": payload["contract_hash"],
+                        "verdict": "clarifies_atom",
+                        "evidence_quote": payload["user_text"],
+                        "reason": "the complete turn supplies the profile value",
+                    }
+                elif "Stage A proposal convergence authority" in system:
                     response = {
                         "selected_proposal": "primary",
                         "primary_hash": payload["primary"]["hash"],
@@ -6717,9 +6724,12 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         "reason": "lossless two-demand partition",
                     }
                 elif "Stage A coverage authority" in system:
+                    clarification_unit_id = str(
+                        payload["semantic_units"][0]["unit_id"]
+                    )
                     response = {
                         "unit_verdicts": [{
-                            "unit_id": "unit-draft-answer",
+                            "unit_id": clarification_unit_id,
                             "verdict": "complete",
                             "supports_unit_id": "",
                             "reason": "the pending answer is represented",

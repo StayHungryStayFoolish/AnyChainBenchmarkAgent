@@ -130,6 +130,13 @@ reference-only durable plan。v21 的原始凭据/reference 与 v22 的旧
 binding/reference 必须 quarantine；当前版本缺失 secret 时使用 question
 contract v6 重录入。旧 state 必须 fail closed、迁移或 quarantine。
 
+semantic draft 等待澄清时，下一条自由文本不能自动视为答案。hierarchical
+Harness 必须先把本轮绑定到精确签名的 draft revision 与 active atom；独立
+reviewer 达成 quorum 后，只能授权一个完全一致、逐字节保留的原文片段作为
+澄清 evidence。该片段由 coordinator 作为唯一 pending answer 处理，Stage A
+仍须无损路由所有未被引用的兄弟片段。未形成 quorum 时 atom 保持 unresolved，
+完整输入走普通路由。模型输出本身无权解析 atom，也无权直接修改产品状态。
+
 ## 历史问题迁移
 
 运行：

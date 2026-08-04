@@ -179,6 +179,229 @@ class HierarchicalPlannerMetrics:
         }
 
 
+def _semantic_draft_clarification_prompt() -> str:
+    """Return the bounded review contract for one active draft atom."""
+
+    return (
+        "You are an independent semantic-draft clarification reviewer for "
+        "AnyChain Benchmark Agent. Return one strict JSON object with exactly "
+        "contract_hash, verdict, evidence_quote, and reason. verdict is one of "
+        "clarifies_atom, does_not_clarify, or uncertain. The active_atom is the "
+        "exact unresolved demand currently shown to the user. Select "
+        "clarifies_atom only when one exact contiguous span of the current user "
+        "turn answers, corrects, replaces, supersedes, or explicitly declines "
+        "that exact demand. Copy that complete span byte-for-byte into "
+        "evidence_quote. Do not include an independent sibling request in the "
+        "quote; normal whole-turn routing must preserve every unquoted span. "
+        "Select does_not_clarify or uncertain when no single exact source span "
+        "is a complete clarification. Questions about the clarification prompt, "
+        "unrelated navigation, new configuration, and new analysis requests do "
+        "not answer the atom merely because they occur while it is pending. Do "
+        "not infer product actions, mutate state, shorten or paraphrase evidence, "
+        "or trust prior reviewer output. Copy contract_hash exactly. reason must "
+        "be non-empty."
+    )
+
+
+def _review_bound_semantic_draft_clarification(
+    provider: Any,
+    state: AgentGraphState,
+    text: str,
+    clauses: Sequence[TurnClause],
+) -> tuple[dict[str, Any], tuple[int, ...], dict[str, Any]]:
+    """Prove that a complete turn is evidence for the exact active draft atom.
+
+    The jury may authorize only the pending clarification boundary. It does not
+    compile an action or decide the meaning of any other product operation.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    binding = dict(pending.get("semantic_draft_binding") or {})
+    draft = dict(state.get("semantic_plan_draft") or {})
+    if not binding or draft.get("status") != "awaiting_clarification":
+        return {}, (), {}
+    try:
+        draft = validate_semantic_plan_draft(draft)
+        expected = semantic_draft_question_binding(draft)
+    except ValueError:
+        return {}, (), {}
+    if binding != expected:
+        return {}, (), {}
+    active_atom = next(
+        (
+            dict(item)
+            for item in draft.get("unresolved_atoms") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("atom_id") or "")
+            == str(binding.get("atom_id") or "")
+        ),
+        {},
+    )
+    user_text = str(text or "").strip()
+    if not active_atom or not user_text:
+        return {}, (), {}
+    contract = {
+        "draft_id": str(binding.get("draft_id") or ""),
+        "revision": int(binding.get("revision") or 0),
+        "atom_id": str(binding.get("atom_id") or ""),
+        "active_atom": {
+            "source_text": str(active_atom.get("source_text") or ""),
+            "source_path": str(active_atom.get("source_path") or ""),
+            "reason": str(active_atom.get("reason") or ""),
+            "reason_detail": str(active_atom.get("reason_detail") or ""),
+        },
+        "user_text": user_text,
+        "clauses": [clause.as_dict() for clause in clauses],
+    }
+    contract_hash = hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = {"contract_hash": contract_hash, **contract}
+    prompt = _semantic_draft_clarification_prompt()
+
+    def review() -> Mapping[str, Any]:
+        response = request_semantic_compilation(
+            provider,
+            system_prompt=prompt,
+            request_payload=payload,
+            max_tokens=700,
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
+        )
+        try:
+            document = json.loads(response)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(document, Mapping) or set(document) != {
+            "contract_hash",
+            "verdict",
+            "evidence_quote",
+            "reason",
+        }:
+            return {}
+        verdict = str(document.get("verdict") or "")
+        quote = str(document.get("evidence_quote") or "")
+        if (
+            str(document.get("contract_hash") or "") != contract_hash
+            or verdict not in {
+                "clarifies_atom",
+                "does_not_clarify",
+                "uncertain",
+            }
+            or not str(document.get("reason") or "").strip()
+            or not quote
+            or quote not in user_text
+            or (
+                verdict == "clarifies_atom"
+                and user_text.count(quote) != 1
+            )
+        ):
+            return {}
+        return dict(document)
+
+    reviews = run_independent_llm_tasks((review, review, review))
+    request_size = len(prompt.encode("utf-8")) + len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    valid_reviews = [dict(item) for item in reviews if item]
+    clarifying_quotes = [
+        str(item.get("evidence_quote") or "")
+        for item in valid_reviews
+        if str(item.get("verdict") or "") == "clarifies_atom"
+    ]
+    quote_votes = {
+        quote: clarifying_quotes.count(quote)
+        for quote in set(clarifying_quotes)
+    }
+    selected_quote = max(
+        quote_votes,
+        key=lambda quote: (quote_votes[quote], len(quote), quote),
+        default="",
+    )
+    clarifying_votes = quote_votes.get(selected_quote, 0)
+    candidate = (
+        {
+            "contract_hash": contract_hash,
+            "draft_id": contract["draft_id"],
+            "revision": contract["revision"],
+            "atom_id": contract["atom_id"],
+            "evidence_quote": selected_quote,
+        }
+        if clarifying_votes >= 2
+        else {}
+    )
+    receipt = {
+        "contract_hash": contract_hash,
+        "valid_review_count": len(valid_reviews),
+        "clarifying_vote_count": clarifying_votes,
+        "verdict_hashes": [
+            hashlib.sha256(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for item in valid_reviews
+        ],
+        "candidate_authorized": bool(candidate),
+    }
+    return candidate, (request_size, request_size, request_size), receipt
+
+
+def _bound_semantic_draft_resolution_partition(
+    state: AgentGraphState,
+    text: str,
+    candidate: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Project one jury-authorized clarification onto the signed owner route."""
+
+    pending = dict(state.get("pending_question") or {})
+    binding = dict(pending.get("semantic_draft_binding") or {})
+    user_text = str(text or "").strip()
+    evidence = str(candidate.get("evidence_quote") or "")
+    if (
+        not binding
+        or str(candidate.get("draft_id") or "")
+        != str(binding.get("draft_id") or "")
+        or int(candidate.get("revision") or 0)
+        != int(binding.get("revision") or 0)
+        or str(candidate.get("atom_id") or "")
+        != str(binding.get("atom_id") or "")
+        or not evidence
+        or evidence not in user_text
+    ):
+        raise ValueError("semantic draft clarification candidate is not bound")
+    return [{
+        "unit_id": "__harness_semantic_draft_resolution",
+        "clause_id": "clause-1",
+        "source_text": evidence,
+        "operation": "pending_answer",
+        "owner_routes": [{
+            "owner": "coordinator",
+            "group": str(
+                pending.get("group")
+                or state.get("active_group")
+                or "opening"
+            ),
+        }],
+        "reason": (
+            "Independent semantic-draft jury bound the complete turn to the "
+            "exact active atom."
+        ),
+    }]
+
+
 def begin_semantic_partition(
     state: AgentGraphState,
     text: str,
@@ -211,14 +434,59 @@ def begin_semantic_partition(
     try:
         provider = provider_from_config()
         stage_a_payload = _stage_a_payload(state, text, clauses)
-        stage_a_prompt = _stage_a_prompt()
-        partition, partition_errors, proposal_sizes = _request_stage_a_proposal(
+        (
+            clarification_candidate,
+            clarification_sizes,
+            clarification_receipt,
+        ) = _review_bound_semantic_draft_clarification(
             provider,
-            stage_a_payload,
-            clauses,
             state,
-            stage_a_prompt,
+            text,
+            clauses,
         )
+        document["request_sizes"].extend(clarification_sizes)
+        document["admission_calls"] += len(clarification_sizes)
+        if clarification_receipt:
+            document["semantic_draft_clarification_review"] = (
+                clarification_receipt
+            )
+        if clarification_candidate:
+            clarification_evidence = str(
+                clarification_candidate.get("evidence_quote") or ""
+            )
+            stage_a_payload["contract_proven_semantic_draft_resolution"] = (
+                clarification_candidate
+            )
+        else:
+            clarification_evidence = ""
+        if clarification_candidate and clarification_evidence == str(
+            text or ""
+        ).strip():
+            clauses = (TurnClause("clause-1", str(text or "").strip(), "prose"),)
+            document["clauses"] = [clause.as_dict() for clause in clauses]
+            stage_a_payload = _stage_a_payload(state, text, clauses)
+            stage_a_payload["contract_proven_semantic_draft_resolution"] = (
+                clarification_candidate
+            )
+        stage_a_prompt = _stage_a_prompt()
+        if clarification_candidate and clarification_evidence == str(
+            text or ""
+        ).strip():
+            partition = _bound_semantic_draft_resolution_partition(
+                state,
+                text,
+                clarification_candidate,
+            )
+            partition_errors = ()
+            proposal_sizes = ()
+        else:
+            partition, partition_errors, proposal_sizes = _request_stage_a_proposal(
+                provider,
+                stage_a_payload,
+                clauses,
+                state,
+                stage_a_prompt,
+            )
         document["request_sizes"].extend(proposal_sizes)
         document["stage_a_calls"] += len(proposal_sizes)
         if partition_errors:
@@ -603,6 +871,10 @@ def _request_stage_a_proposal(
         errors = tuple(dict.fromkeys((
             *errors,
             *_pending_answer_contract_errors(partition, state),
+            *_semantic_draft_resolution_contract_errors(
+                partition,
+                stage_a_payload,
+            ),
             *_cross_domain_pending_errors(partition, state),
         )))
         if not errors:
@@ -705,7 +977,58 @@ def _partition_requires_independent_proposal(
     return not (
         payload.get("contract_proven_pending_prefixes")
         or payload.get("pending_typed_candidates")
+        or payload.get("contract_proven_semantic_draft_resolution")
     )
+
+
+def _semantic_draft_resolution_contract_errors(
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Require the jury-bound span to remain one exact pending answer."""
+
+    contract = dict(
+        stage_a_payload.get("contract_proven_semantic_draft_resolution") or {}
+    )
+    if not contract:
+        return ()
+    evidence = str(contract.get("evidence_quote") or "")
+    matching = [
+        unit
+        for unit in partition
+        if str(unit.get("operation") or "") == "pending_answer"
+        and str(unit.get("source_text") or "") == evidence
+        and [
+            {
+                "owner": str(route.get("owner") or ""),
+                "group": str(route.get("group") or ""),
+            }
+            for route in unit.get("owner_routes") or ()
+            if isinstance(route, Mapping)
+        ]
+        == [{
+            "owner": "coordinator",
+            "group": str(
+                (stage_a_payload.get("pending_question") or {}).get("group")
+                or ""
+            ),
+        }]
+    ]
+    if len(matching) != 1:
+        return (
+            "Stage A did not preserve the exact jury-bound semantic draft "
+            "clarification as one coordinator pending answer",
+        )
+    if any(
+        unit is not matching[0]
+        and evidence
+        and evidence in str(unit.get("source_text") or "")
+        for unit in partition
+    ):
+        return (
+            "Stage A duplicated the jury-bound semantic draft clarification",
+        )
+    return ()
 
 
 def _competing_open_identity_relations(
@@ -1744,6 +2067,13 @@ def _stage_a_prompt() -> str:
         "pending_answer unit and independently classify every remaining source character. "
         "Never absorb a remaining mutation, consultation, navigation, analysis, or context "
         "span into that pending answer. "
+        "contract_proven_semantic_draft_resolution is a quorum-reviewed Harness fact "
+        "bound to the exact active semantic draft atom. When present, its evidence_quote "
+        "is one exact immutable source span and must remain one coordinator-owned "
+        "pending_answer; every source span outside that quote must still be partitioned "
+        "under its own registered purpose. The quote is not a new unresolved demand and "
+        "cannot be relabeled as "
+        "consultation, clarification, navigation, or another group operation. "
         "owner_routes is an ordered list of {owner,group}; use an empty list only for context "
         "or unresolved. A prose unit may route to several owners when one indivisible excerpt "
         "contains independently owned values. A structured clause is one immutable SourceClause; "
@@ -3549,6 +3879,10 @@ def _review_stage_a_partition_detailed(
         ),
         "contract_proven_pending_prefixes": list(
             stage_a_payload.get("contract_proven_pending_prefixes") or []
+        ),
+        "contract_proven_semantic_draft_resolution": dict(
+            stage_a_payload.get("contract_proven_semantic_draft_resolution")
+            or {}
         ),
         "registered_semantic_value_domains": list(
             stage_a_payload.get("registered_semantic_value_domains") or []

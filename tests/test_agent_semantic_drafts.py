@@ -115,6 +115,206 @@ class SemanticPlanDraftTests(unittest.TestCase):
             ),
         )
 
+    def _awaiting_draft_state(self) -> dict:
+        from agent.harness.coordinator import _semantic_draft_question
+
+        draft = self._draft()
+        state = new_state(draft["session_id"], language="en")
+        state["thread_id"] = draft["session_id"]
+        state["session"]["id"] = draft["session_id"]
+        state["turn_index"] = draft["creation_turn"]
+        state["semantic_plan_draft"] = draft
+        state["pending_question"] = _semantic_draft_question(draft)
+        return state
+
+    def test_bound_clarification_jury_authorizes_complete_turn_once(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bound_semantic_draft_resolution_partition,
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        text = "By that setting I mean use the quick benchmark profile."
+
+        def clarify(_provider, *, request_payload, **_kwargs):
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": request_payload["user_text"],
+                "reason": "the complete turn replaces the active atom meaning",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=clarify,
+        ):
+            candidate, sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(),
+                    state,
+                    text,
+                    segment_user_turn(text),
+                )
+            )
+
+        self.assertEqual(receipt["clarifying_vote_count"], 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(
+            candidate["atom_id"],
+            state["semantic_plan_draft"]["active_atom_id"],
+        )
+        partition = _bound_semantic_draft_resolution_partition(
+            state,
+            text,
+            candidate,
+        )
+        self.assertEqual(len(partition), 1)
+        self.assertEqual(partition[0]["operation"], "pending_answer")
+        self.assertEqual(partition[0]["source_text"], text)
+        self.assertEqual(
+            partition[0]["owner_routes"],
+            [{"owner": "coordinator", "group": "opening"}],
+        )
+
+    def test_bound_clarification_jury_does_not_consume_unrelated_turn(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bound_semantic_draft_resolution_partition,
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        text = "Instead, show the latest benchmark report."
+
+        def unrelated(_provider, *, request_payload, **_kwargs):
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "does_not_clarify",
+                "evidence_quote": request_payload["user_text"],
+                "reason": "this is an independent report request",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=unrelated,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(),
+                    state,
+                    text,
+                    segment_user_turn(text),
+                )
+            )
+
+        self.assertEqual(candidate, {})
+        self.assertFalse(receipt["candidate_authorized"])
+        forged = {
+            "draft_id": state["semantic_plan_draft"]["draft_id"],
+            "revision": state["semantic_plan_draft"]["revision"] + 1,
+            "atom_id": state["semantic_plan_draft"]["active_atom_id"],
+            "evidence_quote": text,
+        }
+        with self.assertRaisesRegex(ValueError, "not bound"):
+            _bound_semantic_draft_resolution_partition(state, text, forged)
+
+    def test_bound_clarification_jury_preserves_independent_sibling_span(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_bound_semantic_draft_clarification,
+            _semantic_draft_resolution_contract_errors,
+            _stage_a_payload,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        clarification = "Use the quick benchmark profile."
+        sibling = " Also show the latest report."
+        text = clarification + sibling
+        verdicts = iter((clarification, clarification, text))
+
+        def review(_provider, *, request_payload, **_kwargs):
+            quote = next(verdicts)
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": quote,
+                "reason": "the quoted span supplies the requested meaning",
+            })
+
+        clauses = segment_user_turn(text)
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(), state, text, clauses
+                )
+            )
+
+        self.assertEqual(candidate["evidence_quote"], clarification)
+        self.assertEqual(receipt["clarifying_vote_count"], 2)
+        payload = _stage_a_payload(state, text, clauses)
+        payload["contract_proven_semantic_draft_resolution"] = candidate
+        valid_partition = [{
+            "unit_id": "clarification",
+            "clause_id": "clause-1",
+            "source_text": clarification,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "bound clarification",
+        }, {
+            "unit_id": "report",
+            "clause_id": "clause-1",
+            "source_text": sibling,
+            "operation": "consultation",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "independent sibling",
+        }]
+        self.assertEqual(
+            _semantic_draft_resolution_contract_errors(valid_partition, payload),
+            (),
+        )
+        invalid_partition = [dict(valid_partition[1])]
+        self.assertIn(
+            "did not preserve",
+            _semantic_draft_resolution_contract_errors(
+                invalid_partition, payload
+            )[0],
+        )
+
+    def test_bound_clarification_jury_rejects_ambiguous_repeated_span(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        quote = "Use quick."
+        text = f"{quote} Then inspect the report. {quote}"
+
+        def review(_provider, *, request_payload, **_kwargs):
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": quote,
+                "reason": "the quote appears to answer the active atom",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(), state, text, segment_user_turn(text)
+                )
+            )
+
+        self.assertEqual(candidate, {})
+        self.assertEqual(receipt["valid_review_count"], 0)
+
     def test_draft_preserves_candidates_without_admission_metadata(self) -> None:
         draft = self._draft()
         self.assertEqual(draft["status"], "awaiting_clarification")

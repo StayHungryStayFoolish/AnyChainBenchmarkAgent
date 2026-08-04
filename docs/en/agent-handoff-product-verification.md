@@ -173,6 +173,15 @@ credentials/references and version 22 legacy bindings/references are
 quarantined. Older state is quarantined and only allowlisted environment facts
 may be offered for reconfirmation.
 
+An awaiting semantic draft does not make its next free-form turn an automatic
+answer. The hierarchical Harness first binds the turn to the exact signed
+draft revision and active atom. Independent reviewers may authorize only one
+identical, byte-exact source span as clarification evidence. The coordinator
+owns that pending answer while Stage A losslessly routes every unquoted sibling
+span. Without quorum the atom remains unresolved and the complete turn follows
+ordinary routing. A model response never resolves the atom or mutates product
+state by itself.
+
 ## Migrated Historical Findings
 
 Run the migration audit from the repository root:

@@ -111,6 +111,17 @@ values do not answer the pending question; they remain available for routing to
 their registered owner. Exact signed options and deterministic typed candidates
 keep their narrow local lane.
 
+When a durable semantic draft is awaiting clarification, the Harness reviews
+the next free-form turn against the exact signed draft, revision, and active
+atom before ordinary routing may create another unresolved demand. A quorum
+may bind only one identical exact source span as clarification evidence. That
+span becomes one coordinator-owned pending answer; every unquoted span remains
+in the normal lossless partition so consultation, navigation, correction, and
+domain requests are not swallowed. No quorum leaves the atom unresolved and
+routes the complete turn normally. Draft identity, source coverage, sibling
+invalidation, and final admission remain deterministic framework contracts;
+the model cannot mutate draft or business state directly.
+
 LLM output is never executed directly. The semantic path checkpoints
 `partition`, repeats `compile_owner` once per scheduled owner, checkpoints
 `review_plan` for independent whole-plan semantic admission, and then enters
