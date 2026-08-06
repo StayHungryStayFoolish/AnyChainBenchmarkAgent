@@ -52,7 +52,12 @@ from .semantic_admission import (
     _unresolved_action_queue,
     prepare_hierarchical_candidate,
 )
-from .plan_coverage import TurnClause, segment_user_turn, validate_semantic_partition
+from .plan_coverage import (
+    PlanCoverageResult,
+    TurnClause,
+    segment_user_turn,
+    validate_semantic_partition,
+)
 from .questions import (
     exact_option_prefix_answer,
     pending_option_value_exists,
@@ -66,6 +71,7 @@ from .queue import mutation_conflict_action_groups
 from .semantic_compiler import (
     STRICT_JSON_REASONING_MODE,
     closed_enum_quote_names_only_competing_values,
+    is_explicit_semantic_rejection,
     request_open_identity_relation_jury,
     request_semantic_compilation,
     whole_plan_admission_prompt,
@@ -1596,6 +1602,255 @@ def compile_next_owner(
     return output
 
 
+def _collapse_logical_semantic_units(
+    units: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Restore route-expanded rows to their immutable Stage A identity."""
+
+    output: list[dict[str, Any]] = []
+    by_identity: dict[str, dict[str, Any]] = {}
+    for raw in units:
+        unit_id = str(raw.get("unit_id") or "")
+        logical_id = str(raw.get("parent_unit_id") or unit_id)
+        if not logical_id:
+            continue
+        current = by_identity.get(logical_id)
+        if current is None:
+            current = dict(raw)
+            current["unit_id"] = logical_id
+            current.pop("parent_unit_id", None)
+            current["owner_routes"] = []
+            if "action_indexes" in raw:
+                current["action_indexes"] = []
+            by_identity[logical_id] = current
+            output.append(current)
+        for route in raw.get("owner_routes") or ():
+            if not isinstance(route, Mapping):
+                continue
+            normalized = dict(route)
+            if normalized not in current["owner_routes"]:
+                current["owner_routes"].append(normalized)
+        for index in raw.get("action_indexes") or ():
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and index not in current.setdefault("action_indexes", [])
+            ):
+                current["action_indexes"].append(index)
+    return output
+
+
+def _semantic_rejection_draft_projection(
+    source_partition: Sequence[Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+    plan: Any,
+    admission: Any,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    PlanCoverageResult,
+]:
+    """Project one explicit rejection into a durable, non-executable draft."""
+
+    raw_units = [
+        dict(item)
+        for item in candidate.get("semantic_units") or ()
+        if isinstance(item, Mapping)
+    ]
+    actions = [
+        dict(item)
+        for item in candidate.get("actions") or ()
+        if isinstance(item, Mapping)
+    ]
+    action_ids = tuple(str(item) for item in getattr(plan, "action_ids", ()))
+    admitted_indexes = {
+        index
+        for index, action_id in enumerate(action_ids)
+        if any(
+            str(row.get("action_id") or "") == action_id
+            and str(row.get("verdict") or "") == "admit"
+            for row in getattr(admission, "action_verdicts", ())
+            if isinstance(row, Mapping)
+        )
+    }
+    unit_verdicts = {
+        str(row.get("unit_id") or ""): str(row.get("verdict") or "")
+        for row in getattr(admission, "unit_verdicts", ())
+        if isinstance(row, Mapping)
+    }
+    route_rows_by_logical: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    action_logical_owners: dict[int, set[str]] = defaultdict(set)
+    for unit in raw_units:
+        logical_id = str(unit.get("parent_unit_id") or unit.get("unit_id") or "")
+        if not logical_id:
+            continue
+        route_rows_by_logical[logical_id].append(unit)
+        for index in unit.get("action_indexes") or ():
+            if isinstance(index, int) and not isinstance(index, bool):
+                action_logical_owners[index].add(logical_id)
+    safe_logical_ids: set[str] = set()
+    for logical_id, rows in route_rows_by_logical.items():
+        actionable = [
+            row for row in rows
+            if str(row.get("disposition") or "") != "context"
+        ]
+        if actionable and all(
+            unit_verdicts.get(str(row.get("unit_id") or ""))
+            in {"complete", "support"}
+            and all(
+                index in admitted_indexes
+                for index in row.get("action_indexes") or ()
+                if isinstance(index, int) and not isinstance(index, bool)
+            )
+            for row in actionable
+        ):
+            safe_logical_ids.add(logical_id)
+    retained_indexes = [
+        index
+        for index in sorted(admitted_indexes)
+        if action_logical_owners.get(index)
+        and action_logical_owners[index].issubset(safe_logical_ids)
+        and index < len(actions)
+    ]
+    old_to_new = {
+        old: new for new, old in enumerate(retained_indexes)
+    }
+    retained_actions = [actions[index] for index in retained_indexes]
+    logical_units = _collapse_logical_semantic_units(raw_units)
+    unresolved_units: list[dict[str, Any]] = []
+    for unit in logical_units:
+        logical_id = str(unit["unit_id"])
+        if logical_id in safe_logical_ids:
+            mapped = [
+                old_to_new[index]
+                for index in unit.get("action_indexes") or ()
+                if index in old_to_new
+            ]
+            unit["disposition"] = "action"
+            unit["action_indexes"] = list(dict.fromkeys(mapped))
+            continue
+        rows = route_rows_by_logical.get(logical_id, [])
+        if rows and all(
+            str(row.get("disposition") or "") == "context"
+            for row in rows
+        ):
+            unit["disposition"] = "context"
+            unit["action_indexes"] = []
+            continue
+        unit["disposition"] = "unresolved"
+        unit["action_indexes"] = []
+        unit["reason"] = (
+            "independent whole-plan admission did not safely admit every "
+            "route owned by this logical demand"
+        )
+        unresolved_units.append(dict(unit))
+    logical_partition = _collapse_logical_semantic_units(source_partition)
+    validation = PlanCoverageResult(
+        valid=False,
+        errors=(),
+        unresolved_clauses=tuple(
+            str(item.get("source_text") or "")
+            for item in unresolved_units
+            if str(item.get("source_text") or "")
+        ),
+        unresolved_units=tuple(unresolved_units),
+    )
+    return logical_partition, logical_units, retained_actions, validation
+
+
+def _build_semantic_draft_result(
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    *,
+    source_partition: Sequence[Mapping[str, Any]],
+    semantic_units: Sequence[Mapping[str, Any]],
+    candidate_actions: Sequence[Mapping[str, Any]],
+    validation: PlanCoverageResult,
+    reason: str,
+) -> dict[str, Any]:
+    """Persist unresolved source atoms without admitting unsafe mutations."""
+
+    original_input = "\n".join(clause.text for clause in clauses)
+    (
+        source_secret_replacements,
+        source_secret_bindings,
+        source_secret_values_by_reference,
+    ) = _source_secret_projection(
+        original_input,
+        [
+            dict(item)
+            for item in (state.get("turn_context") or {}).get(
+                "input_secret_bindings"
+            ) or ()
+            if isinstance(item, Mapping)
+        ],
+    )
+    draft = build_semantic_plan_draft(
+        state,
+        original_input=_replace_secret_values(
+            original_input,
+            source_secret_replacements,
+        ),
+        source_clauses=_replace_secret_values(
+            [clause.as_dict() for clause in clauses],
+            source_secret_replacements,
+        ),
+        source_partition=_replace_secret_values(
+            list(source_partition),
+            source_secret_replacements,
+        ),
+        semantic_units=list(semantic_units),
+        candidate_actions=_replace_secret_values(
+            list(candidate_actions),
+            source_secret_replacements,
+        ),
+        validation=validation,
+        source_secret_bindings=source_secret_bindings,
+    )
+    for binding in source_secret_bindings:
+        reference = str(binding["reference"])
+        if reference in source_secret_values_by_reference:
+            store_secret_reference(
+                source_secret_values_by_reference[reference],
+                draft_id=str(draft["draft_id"]),
+                atom_id=str(binding["atom_id"]),
+                reference=reference,
+            )
+        else:
+            authorize_secret_reference(
+                reference,
+                draft_id=str(draft["draft_id"]),
+                atom_id=str(binding["atom_id"]),
+                expected_hash=str(binding["value_hash"]),
+            )
+    return {
+        "actions": [],
+        "semantic_units": [dict(item) for item in semantic_units],
+        "semantic_draft": draft,
+        "reason": reason,
+    }
+
+
+def _is_finalizing_ready_semantic_draft(
+    state: Mapping[str, Any],
+) -> bool:
+    draft = dict(state.get("semantic_plan_draft") or {})
+    finalization = dict(
+        (state.get("turn_context") or {}).get(
+            "semantic_draft_finalization"
+        )
+        or {}
+    )
+    return bool(
+        draft.get("status") == "ready_for_review"
+        and str(finalization.get("draft_id") or "")
+        == str(draft.get("draft_id") or "")
+        and int(finalization.get("revision") or 0)
+        == int(draft.get("revision") or 0)
+    )
+
+
 def review_semantic_plan(
     state: AgentGraphState,
     document: Mapping[str, Any],
@@ -1692,21 +1947,7 @@ def review_semantic_plan(
     )
     if not validation.valid:
         if validation.unresolved_units and not validation.errors:
-            ready_draft = dict(state.get("semantic_plan_draft") or {})
-            finalization = dict(
-                (state.get("turn_context") or {}).get(
-                    "semantic_draft_finalization"
-                )
-                or {}
-            )
-            finalizing_ready_draft = bool(
-                ready_draft.get("status") == "ready_for_review"
-                and str(finalization.get("draft_id") or "")
-                == str(ready_draft.get("draft_id") or "")
-                and int(finalization.get("revision") or 0)
-                == int(ready_draft.get("revision") or 0)
-            )
-            if finalizing_ready_draft:
+            if _is_finalizing_ready_semantic_draft(state):
                 return _with_metrics(
                     _unresolved_action_queue(
                         clauses,
@@ -1728,78 +1969,24 @@ def review_semantic_plan(
                     owner_count=owner_count,
                     unit_count=unit_count,
                 )
-            original_input = "\n".join(clause.text for clause in clauses)
-            (
-                source_secret_replacements,
-                source_secret_bindings,
-                source_secret_values_by_reference,
-            ) = _source_secret_projection(
-                original_input,
-                [
-                    dict(item)
-                    for item in (
-                        state.get("turn_context") or {}
-                    ).get("input_secret_bindings") or ()
-                    if isinstance(item, Mapping)
-                ],
-            )
-            draft = build_semantic_plan_draft(
-                state,
-                original_input=_replace_secret_values(
-                    original_input,
-                    source_secret_replacements,
-                ),
-                source_clauses=_replace_secret_values(
-                    [clause.as_dict() for clause in clauses],
-                    source_secret_replacements,
-                ),
-                source_partition=_replace_secret_values(
-                    source_partition,
-                    source_secret_replacements,
-                ),
-                semantic_units=[
-                    dict(item)
-                    for item in candidate.get("semantic_units") or []
-                    if isinstance(item, Mapping)
-                ],
-                candidate_actions=_replace_secret_values(
-                    [
-                        dict(item)
-                        for item in candidate.get("actions") or []
-                        if isinstance(item, Mapping)
-                    ],
-                    source_secret_replacements,
-                ),
-                validation=validation,
-                source_secret_bindings=source_secret_bindings,
-            )
-            for binding in source_secret_bindings:
-                reference = str(binding["reference"])
-                if reference in source_secret_values_by_reference:
-                    store_secret_reference(
-                        source_secret_values_by_reference[reference],
-                        draft_id=str(draft["draft_id"]),
-                        atom_id=str(binding["atom_id"]),
-                        reference=reference,
-                    )
-                else:
-                    authorize_secret_reference(
-                        reference,
-                        draft_id=str(draft["draft_id"]),
-                        atom_id=str(binding["atom_id"]),
-                        expected_hash=str(binding["value_hash"]),
-                    )
             return _with_metrics(
-                {
-                    "actions": [],
-                    "semantic_units": [
+                _build_semantic_draft_result(
+                    state,
+                    clauses,
+                    source_partition=source_partition,
+                    semantic_units=[
                         dict(item)
                         for item in candidate.get("semantic_units") or []
                         if isinstance(item, Mapping)
                     ],
-                    "semantic_draft": draft,
-                    "reason": "semantic plan requires atom clarification",
-                },
+                    candidate_actions=[
+                        dict(item)
+                        for item in candidate.get("actions") or []
+                        if isinstance(item, Mapping)
+                    ],
+                    validation=validation,
+                    reason="semantic plan requires atom clarification",
+                ),
                 started,
                 request_sizes=request_sizes,
                 stage_a_calls=stage_a_calls,
@@ -1919,6 +2106,7 @@ def review_semantic_plan(
                 plan = repaired_plan
                 admission = repaired_admission
                 admission_errors = repaired_errors
+                candidate = repaired_candidate
     semantic_units = [
         dict(item)
         for item in candidate.get("semantic_units") or []
@@ -1931,6 +2119,43 @@ def review_semantic_plan(
             result = _unresolved_action_queue(
                 clauses,
                 (f"immutable semantic plan rejected: {exc}",),
+                semantic_units=semantic_units,
+            )
+    elif (
+        admission is not None
+        and plan is not None
+        and is_explicit_semantic_rejection(admission)
+    ):
+        (
+            logical_partition,
+            draft_units,
+            safe_candidate_actions,
+            draft_validation,
+        ) = _semantic_rejection_draft_projection(
+            source_partition,
+            candidate,
+            plan,
+            admission,
+        )
+        if (
+            draft_validation.unresolved_units
+            and not _is_finalizing_ready_semantic_draft(state)
+        ):
+            result = _build_semantic_draft_result(
+                state,
+                clauses,
+                source_partition=logical_partition,
+                semantic_units=draft_units,
+                candidate_actions=safe_candidate_actions,
+                validation=draft_validation,
+                reason=(
+                    "independent admission requires durable clarification"
+                ),
+            )
+        else:
+            result = _unresolved_action_queue(
+                clauses,
+                admission_errors,
                 semantic_units=semantic_units,
             )
     else:
@@ -2289,7 +2514,10 @@ def _stage_a_payload(
         "pending_typed_candidates": [
             value
             for clause in clauses
-            for value in typed_pending_value_candidates(clause.text, pending)
+            for value in _turn_bound_pending_typed_candidates(
+                state,
+                clause.text,
+            )
         ],
         "contract_proven_pending_prefixes": [
             {
@@ -2725,6 +2953,60 @@ def _semantic_value_for_unit(unit: Mapping[str, Any]) -> Any:
     if len(matching) != 1:
         return None
     return matching[0].get("raw_value")
+
+
+def _turn_bound_pending_typed_candidates(
+    state: Mapping[str, Any],
+    text: str,
+) -> tuple[str, ...]:
+    """Return syntax candidates without exposing ingress secret material.
+
+    Sensitive manual values are projected before LangGraph sees the turn.  The
+    opaque reference remains a typed candidate only when its process-local
+    binding resolves and the resolved value satisfies the active signed
+    question contract.  This supplies syntax, not intent; Stage A still decides
+    whether the surrounding source selects, rejects, or merely mentions it.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    candidates = list(typed_pending_value_candidates(text, pending))
+    bindings = (
+        (state.get("turn_context") or {}).get("input_secret_bindings") or ()
+    )
+    for raw in bindings:
+        if not isinstance(raw, Mapping):
+            continue
+        reference = str(raw.get("reference") or "")
+        if not reference or reference not in text:
+            continue
+        resolved = resolve_secret_reference(
+            reference,
+            draft_id=str(raw.get("draft_id") or ""),
+            atom_id=str(raw.get("atom_id") or ""),
+            expected_hash=str(raw.get("value_hash") or ""),
+        )
+        if (
+            resolved is not None
+            and value_satisfies_pending_contract(resolved, pending)
+        ):
+            candidates.append(reference)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _stage_b_semantics_for_unit(
+    state: Mapping[str, Any],
+    unit: Mapping[str, Any],
+) -> tuple[str, Any]:
+    """Bind one parser-proven pending candidate to owner compilation."""
+
+    source = _semantic_source_for_unit(unit)
+    value = _semantic_value_for_unit(unit)
+    if str(unit.get("operation") or "") != "pending_answer":
+        return source, value
+    candidates = _turn_bound_pending_typed_candidates(state, source)
+    if len(candidates) != 1:
+        return source, value
+    return candidates[0], candidates[0]
 
 
 def _validate_partition_document(
@@ -4497,8 +4779,15 @@ def _stage_b_payload(
     partition: Sequence[Mapping[str, Any]],
     unit_ids: Sequence[str],
 ) -> dict[str, Any]:
-    selected = [
-        {
+    selected = []
+    for unit in partition:
+        if str(unit["unit_id"]) not in unit_ids:
+            continue
+        semantic_source, semantic_value = _stage_b_semantics_for_unit(
+            state,
+            unit,
+        )
+        selected.append({
             **{
                 key: unit[key]
                 for key in (
@@ -4532,10 +4821,11 @@ def _stage_b_payload(
             ),
             **(
                 {
-                    "semantic_source": _semantic_source_for_unit(unit),
-                    "semantic_value": _semantic_value_for_unit(unit),
+                    "semantic_source": semantic_source,
+                    "semantic_value": semantic_value,
                 }
                 if str(unit.get("source_path") or "")
+                or semantic_value is not None
                 else {}
             ),
             **(
@@ -4543,10 +4833,7 @@ def _stage_b_payload(
                 if isinstance(unit.get("registered_intake"), Mapping)
                 else {}
             ),
-        }
-        for unit in partition
-        if str(unit["unit_id"]) in unit_ids
-    ]
+        })
     selected_operations = frozenset(
         str(unit.get("operation") or "")
         for unit in selected
@@ -4623,7 +4910,7 @@ def _compile_owner_document(
             dict.fromkeys(
                 value
                 for value in (
-                    _semantic_source_for_unit(unit),
+                    _stage_b_semantics_for_unit(state, unit)[0],
                     str(unit.get("resolution_evidence") or ""),
                 )
                 if value

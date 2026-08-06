@@ -1250,6 +1250,14 @@ def _is_explicit_semantic_rejection(
     )
 
 
+def is_explicit_semantic_rejection(
+    admission: WholePlanAdmission,
+) -> bool:
+    """Expose the fail-closed semantic rejection boundary to the Harness."""
+
+    return _is_explicit_semantic_rejection(admission)
+
+
 def validate_whole_plan_admission(
     response_text: str,
     plan: ImmutableSemanticPlan,

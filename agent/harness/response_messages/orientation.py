@@ -13,6 +13,12 @@ MESSAGES = {
         "arguments": {"details": "string"},
         "kinds": {"message"},
     },
+    "harness.orientation.unresolved_sensitive_item": {
+        "en": "The sensitive value supplied in this turn could not be mapped safely.",
+        "zh": "本轮提供的敏感值尚未被安全映射。",
+        "arguments": {},
+        "kinds": {"message"},
+    },
     "harness.orientation.session_reset": {
         "en": "Cleared the previous Agent configuration. Startup discovery and historical jobs were preserved. Tell me what to test.",
         "zh": "已清空之前的 Agent 配置。启动环境推断和历史 job 已保留。请告诉我这次要测试什么。",

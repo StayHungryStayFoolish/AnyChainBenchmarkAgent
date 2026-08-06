@@ -11338,6 +11338,249 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertTrue(result.valid, result.errors)
 
+    def test_turn_bound_secret_url_remains_a_typed_pending_candidate(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _turn_bound_pending_typed_candidates,
+        )
+        from agent.harness.secret_refs import (
+            project_secret_input,
+            release_unowned_input_secret_bindings,
+        )
+        from agent.harness.state import new_state
+
+        endpoint = "https://rpc.example.invalid/private-token"
+        reference, bindings = project_secret_input(
+            endpoint,
+            scope_id="turn-bound-url",
+            force_secret=True,
+        )
+        text = f"Use {reference} instead."
+        state = new_state("turn-bound-url", language="en")
+        state["active_group"] = "endpoint_process"
+        state["pending_question"] = {
+            "id": "new_chain_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "new_chain_endpoint",
+            "manual_input_allowed": True,
+            "sensitive_input": True,
+            "options": [],
+            "validation": {"value_type": "url"},
+        }
+        state["turn_context"] = {
+            "text": text,
+            "input_secret_bindings": [dict(item) for item in bindings],
+        }
+        try:
+            self.assertEqual(
+                _turn_bound_pending_typed_candidates(state, text),
+                (reference,),
+            )
+            payload = _stage_b_payload(
+                state,
+                "coordinator",
+                frozenset({"endpoint_process"}),
+                [{
+                    "unit_id": "endpoint-unit",
+                    "clause_id": "clause-1",
+                    "source_text": text,
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "endpoint_process",
+                    }],
+                    "reason": "typed pending candidate",
+                }],
+                ("endpoint-unit",),
+            )
+            semantic = payload["semantic_units"][0]
+            self.assertEqual(semantic["semantic_source"], reference)
+            self.assertEqual(semantic["semantic_value"], reference)
+            self.assertNotIn(endpoint, json.dumps(payload))
+        finally:
+            release_unowned_input_secret_bindings(bindings, {})
+
+    def test_unresolved_queue_collapses_route_copies_by_parent_identity(self) -> None:
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.semantic_admission import _unresolved_action_queue
+
+        source = "Configure the chain and workload."
+        queue = _unresolved_action_queue(
+            (TurnClause("clause-1", source, "prose"),),
+            ("whole-plan review rejected the candidate",),
+            semantic_units=[
+                {
+                    "unit_id": "__harness_route_1",
+                    "parent_unit_id": "chain-and-workload",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                },
+                {
+                    "unit_id": "__harness_route_2",
+                    "parent_unit_id": "chain-and-workload",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "disposition": "action",
+                    "action_indexes": [1],
+                },
+                {
+                    "unit_id": "genuinely-repeated-demand",
+                    "clause_id": "clause-2",
+                    "source_text": source,
+                    "disposition": "action",
+                    "action_indexes": [2],
+                },
+            ],
+        )
+
+        self.assertEqual(
+            queue["unresolved_clauses"],
+            [source, source],
+        )
+        self.assertEqual(
+            [unit["unit_id"] for unit in queue["semantic_units"]],
+            ["chain-and-workload", "genuinely-repeated-demand"],
+        )
+
+    def test_semantic_rejection_draft_preserves_safe_siblings(self) -> None:
+        from types import SimpleNamespace
+
+        from agent.harness.hierarchical_planner import (
+            _semantic_rejection_draft_projection,
+        )
+        from agent.harness.semantic_compiler import WholePlanAdmission
+
+        source_partition = [{
+            "unit_id": "__harness_route_1",
+            "parent_unit_id": "chain-change",
+            "clause_id": "clause-1",
+            "source_text": "Use AuroraEdge Testnet.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "chain route",
+        }, {
+            "unit_id": "__harness_route_2",
+            "parent_unit_id": "chain-change",
+            "clause_id": "clause-1",
+            "source_text": "Use AuroraEdge Testnet.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "target_mode",
+            }],
+            "reason": "mode route",
+        }, {
+            "unit_id": "mixed-workload",
+            "clause_id": "clause-2",
+            "source_text": "Use a custom mixed workload.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "workload_rpc",
+            }],
+            "reason": "independent sibling",
+        }]
+        candidate = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "AuroraEdge Testnet",
+            }, {
+                "type": "set_target_mode",
+                "target_mode": "fake-node",
+            }, {
+                "type": "set_rpc_mode",
+                "rpc_mode": "mixed",
+            }],
+            "semantic_units": [{
+                **source_partition[0],
+                "disposition": "action",
+                "action_indexes": [0],
+            }, {
+                **source_partition[1],
+                "disposition": "action",
+                "action_indexes": [1],
+            }, {
+                **source_partition[2],
+                "disposition": "action",
+                "action_indexes": [2],
+            }],
+        }
+        plan = SimpleNamespace(
+            action_ids=("chain-action", "mode-action", "workload-action"),
+        )
+        admission = WholePlanAdmission(
+            valid=False,
+            errors=(
+                "whole-plan admission rejected one or more immutable actions",
+                "whole-plan admission found unresolved or omitted demand",
+            ),
+            action_verdicts=(
+                {"action_id": "chain-action", "verdict": "reject"},
+                {"action_id": "mode-action", "verdict": "admit"},
+                {"action_id": "workload-action", "verdict": "admit"},
+            ),
+            unit_verdicts=(
+                {"unit_id": "__harness_route_1", "verdict": "unresolved"},
+                {"unit_id": "__harness_route_2", "verdict": "complete"},
+                {"unit_id": "mixed-workload", "verdict": "complete"},
+            ),
+            response={
+                "action_verdicts": [],
+                "unit_verdicts": [],
+            },
+        )
+
+        partition, units, actions, validation = (
+            _semantic_rejection_draft_projection(
+                source_partition,
+                candidate,
+                plan,
+                admission,
+            )
+        )
+
+        self.assertEqual(
+            [unit["unit_id"] for unit in partition],
+            ["chain-change", "mixed-workload"],
+        )
+        self.assertEqual(
+            [action["type"] for action in actions],
+            ["set_rpc_mode"],
+        )
+        self.assertEqual(
+            [unit["unit_id"] for unit in validation.unresolved_units],
+            ["chain-change"],
+        )
+        self.assertEqual(units[0]["disposition"], "unresolved")
+        self.assertEqual(units[1]["action_indexes"], [0])
+
+    def test_clarification_never_renders_internal_secret_reference(self) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.orientation import apply_orientation_action
+        from agent.harness.response_catalog import render_fragment
+        from agent.harness.state import new_state
+
+        reference = "semantic-secret:opaque-reference"
+        result = apply_orientation_action(
+            new_state("safe-clarification", language="en"),
+            ActionProposal(
+                "clarify-sensitive",
+                "clarify_unresolved",
+                {"clauses": [f"Use {reference} instead."]},
+                "high",
+            ),
+        )
+
+        rendered = render_fragment(result.response_fragments[0], "en").text
+        self.assertNotIn(reference, rendered)
+        self.assertIn("sensitive value", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

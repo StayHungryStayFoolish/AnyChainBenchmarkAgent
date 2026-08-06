@@ -27,6 +27,8 @@ from ..contracts import (
 from ..failures import failure_record_response_fragment, unresolved_recovery
 from ..oracle import compute_next_action
 from ..questions import choice_question as _choice_question, question_text
+from ..response_catalog import render_text_ref
+from ..secret_refs import secret_references_in_value
 from ..state import AgentGraphState
 from .chain_identity import research_chain_identity
 from .orientation_receipts import build_orientation_response_receipt
@@ -345,7 +347,17 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         )
     if action_type == "clarify_unresolved":
         clauses = [
-            str(item).strip()
+            (
+                render_text_ref(
+                    question_text(
+                        "harness.orientation.unresolved_sensitive_item"
+                    ),
+                    str(state.get("language") or "en"),
+                    kind="message",
+                )
+                if secret_references_in_value(str(item))
+                else str(item).strip()
+            )
             for item in action.arguments.get("clauses") or []
             if str(item).strip()
         ]

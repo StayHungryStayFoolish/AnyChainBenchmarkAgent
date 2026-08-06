@@ -1188,16 +1188,23 @@ def _unresolved_action_queue(
     *,
     semantic_units: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    preserved_units = [
-        {
-            **dict(unit),
-            "disposition": "unresolved",
-            "action_indexes": [],
-        }
-        for unit in semantic_units or []
-        if str(unit.get("unit_id") or "")
-        and str(unit.get("source_text") or "")
-    ]
+    preserved_units: list[dict[str, Any]] = []
+    logical_unit_ids: set[str] = set()
+    for unit in semantic_units or []:
+        unit_id = str(unit.get("unit_id") or "")
+        source_text = str(unit.get("source_text") or "")
+        if not unit_id or not source_text:
+            continue
+        logical_unit_id = str(unit.get("parent_unit_id") or unit_id)
+        if logical_unit_id in logical_unit_ids:
+            continue
+        logical_unit_ids.add(logical_unit_id)
+        preserved = dict(unit)
+        preserved["unit_id"] = logical_unit_id
+        preserved.pop("parent_unit_id", None)
+        preserved["disposition"] = "unresolved"
+        preserved["action_indexes"] = []
+        preserved_units.append(preserved)
     unresolved = tuple(
         str(unit["source_text"])
         for unit in preserved_units
