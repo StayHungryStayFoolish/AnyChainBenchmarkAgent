@@ -1705,9 +1705,15 @@ async def run_batch(
                     if frozen.controller_owned_execution
                     else _run_shard
                 )
-                return await runner(
-                    frozen, shard, broker, authority_signer
-                )
+                if frozen.controller_owned_execution:
+                    return await runner(
+                        frozen,
+                        shard,
+                        broker,
+                        authority_signer,
+                        stop_requested=stop_requested,
+                    )
+                return await runner(frozen, shard, broker, authority_signer)
         except asyncio.CancelledError as exc:
             if frozen.controller_owned_execution:
                 raise
@@ -2488,11 +2494,38 @@ def _execute_controller_owned_runner(
     }
 
 
+async def _close_controller_transport(
+    transport: _ControllerOwnedPtyTransport,
+) -> None:
+    """Close one blocking PTY without occupying the runner thread pool."""
+
+    def close_safely() -> None:
+        try:
+            transport.close()
+        except BaseException:
+            # The authoritative process guards below record cleanup failure.
+            pass
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="anychain-controller-cleanup",
+    )
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            executor,
+            close_safely,
+        )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 async def _run_controller_owned_shard(
     manifest: FrozenBatchManifest,
     shard: FrozenShardSpec,
     broker: DecisionBroker,
     authority_signer: PtyAuthoritySigner,
+    *,
+    stop_requested: asyncio.Event | None = None,
 ) -> ShardResult:
     """Produce qualifying evidence without a worker-owned observation path."""
 
@@ -2552,12 +2585,30 @@ async def _run_controller_owned_shard(
         input_commitment_key=input_commitment_key,
     ))
     exit_code: int | None = None
+    interruption_wait: asyncio.Task[bool] | None = None
     try:
-        await asyncio.wait_for(
-            asyncio.shield(runner_task),
-            timeout=manifest.timeout_policy.shard_seconds,
-        )
-        exit_code = 0
+        if stop_requested is None:
+            await asyncio.wait_for(
+                asyncio.shield(runner_task),
+                timeout=manifest.timeout_policy.shard_seconds,
+            )
+            exit_code = 0
+        else:
+            interruption_wait = asyncio.create_task(stop_requested.wait())
+            done, _pending = await asyncio.wait(
+                (runner_task, interruption_wait),
+                timeout=manifest.timeout_policy.shard_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if runner_task in done:
+                await runner_task
+                exit_code = 0
+            elif interruption_wait in done and stop_requested.is_set():
+                state.forced_classification = "infrastructure_interrupted"
+                state.reason = "batch interruption requested"
+            else:
+                state.forced_classification = "infrastructure_interrupted"
+                state.reason = "controller-owned shard wall-clock timeout"
     except ExternalDecisionBlocked as exc:
         state.forced_classification = "externally_blocked"
         state.reason = str(exc)
@@ -2574,11 +2625,12 @@ async def _run_controller_owned_shard(
         state.forced_classification = "infrastructure_interrupted"
         state.reason = f"{type(exc).__name__}: {exc}"
     finally:
+        if interruption_wait is not None:
+            if not interruption_wait.done():
+                interruption_wait.cancel()
+            await asyncio.gather(interruption_wait, return_exceptions=True)
         if not runner_task.done():
-            try:
-                transport.close()
-            except BaseException:
-                pass
+            await _close_controller_transport(transport)
             try:
                 await asyncio.wait_for(
                     asyncio.shield(runner_task),

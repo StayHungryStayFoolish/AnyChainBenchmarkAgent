@@ -53,6 +53,7 @@ from tests.agent_live.batch_orchestrator import (
     _append_discovery_results,
     _authoritative_ledger_snapshot,
     _classify,
+    _close_controller_transport,
     _controller_fact_payloads,
     _not_started_interruption_result,
     _scan_batch_execution_ids,
@@ -1708,7 +1709,9 @@ class BatchOrchestratorTests(unittest.TestCase):
         runner_started = asyncio.Event()
         runner_calls: list[str] = []
 
-        async def controlled_runner(batch, shard, _broker, _signer):
+        async def controlled_runner(
+            batch, shard, _broker, _signer, **_kwargs
+        ):
             runner_calls.append(shard.shard_id)
             runner_started.set()
             await broker.closed.wait()
@@ -1750,6 +1753,117 @@ class BatchOrchestratorTests(unittest.TestCase):
                 hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
                 result.cleanup_receipt_hash,
             )
+
+    def test_controller_interruption_reaches_runner_outside_broker_wait(
+        self,
+    ) -> None:
+        self._write_targets(2)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=(
+                self.root / ".agent" / "controller-provider-wait-manifest.json"
+            ),
+            runtime_base=(
+                self.root / ".agent" / "controller-provider-wait-runtime"
+            ),
+            shard_count=2,
+            max_concurrency=1,
+            required_env_names=(),
+        )
+
+        class CloseableBroker:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            async def __call__(self, _shard_id, _context):
+                raise AssertionError("runner is not waiting on the broker")
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        broker = CloseableBroker()
+        runner_started = asyncio.Event()
+        runner_calls: list[str] = []
+
+        async def provider_blocked_runner(
+            batch,
+            shard,
+            _broker,
+            _signer,
+            *,
+            stop_requested,
+        ):
+            runner_calls.append(shard.shard_id)
+            runner_started.set()
+            await stop_requested.wait()
+            return _not_started_interruption_result(
+                batch,
+                shard,
+                asyncio.CancelledError("provider wait interrupted"),
+            )
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=broker,
+                result_index_path=(
+                    self.root / ".agent" / "controller-provider-wait-index.json"
+                ),
+                interruption_event=interruption_event,
+            ))
+            await asyncio.wait_for(runner_started.wait(), timeout=2)
+            interruption_event.set()
+            return await asyncio.wait_for(task, timeout=2)
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_controller_owned_shard",
+            side_effect=provider_blocked_runner,
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertEqual(broker.close_count, 1)
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(index.completed, 2)
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+
+    def test_controller_transport_closes_run_in_parallel_cleanup_executors(
+        self,
+    ) -> None:
+        barrier = threading.Barrier(4)
+        close_threads: list[str] = []
+        close_thread_ids: list[int] = []
+        closed: list[int] = []
+
+        class BlockingTransport:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def close(self) -> None:
+                close_threads.append(threading.current_thread().name)
+                close_thread_ids.append(threading.get_ident())
+                barrier.wait(timeout=2)
+                closed.append(self.index)
+
+        async def scenario() -> None:
+            await asyncio.wait_for(
+                asyncio.gather(*(
+                    _close_controller_transport(BlockingTransport(index))
+                    for index in range(4)
+                )),
+                timeout=3,
+            )
+
+        asyncio.run(scenario())
+
+        self.assertEqual(sorted(closed), [0, 1, 2, 3])
+        self.assertEqual(len(set(close_thread_ids)), 4)
+        self.assertTrue(all(
+            name.startswith("anychain-controller-cleanup")
+            for name in close_threads
+        ))
 
     def test_controller_execution_rejects_a_non_closeable_broker(self) -> None:
         self._write_targets(1)
@@ -1805,7 +1919,7 @@ class BatchOrchestratorTests(unittest.TestCase):
         broker = CloseableBroker()
         runner_calls: list[str] = []
 
-        async def controlled_runner(*args):
+        async def controlled_runner(*args, **_kwargs):
             runner_calls.append(args[1].shard_id)
             raise AssertionError("interrupted shard must not start")
 
@@ -1861,7 +1975,9 @@ class BatchOrchestratorTests(unittest.TestCase):
         second_started = asyncio.Event()
         runner_calls: list[str] = []
 
-        async def controlled_runner(batch, shard, _broker, _signer):
+        async def controlled_runner(
+            batch, shard, _broker, _signer, **_kwargs
+        ):
             runner_calls.append(shard.shard_id)
             if len(runner_calls) == 2:
                 second_started.set()
@@ -1929,7 +2045,9 @@ class BatchOrchestratorTests(unittest.TestCase):
         runner_started = asyncio.Event()
         runner_cancelled = False
 
-        async def controlled_runner(batch, shard, _broker, _signer):
+        async def controlled_runner(
+            batch, shard, _broker, _signer, **_kwargs
+        ):
             nonlocal runner_cancelled
             runner_started.set()
             try:
