@@ -182,6 +182,7 @@ def with_pending_question_behavior(
     question: Mapping[str, Any],
     *,
     resume_action_queue: bool | None = None,
+    same_turn_navigation_allowed: bool | None = None,
 ) -> dict[str, Any]:
     """Return a validated question after one signed behavior transition."""
 
@@ -191,6 +192,11 @@ def with_pending_question_behavior(
             normalized["resume_action_queue"] = True
         else:
             normalized.pop("resume_action_queue", None)
+    if same_turn_navigation_allowed is not None:
+        if same_turn_navigation_allowed:
+            normalized["same_turn_navigation_allowed"] = True
+        else:
+            normalized.pop("same_turn_navigation_allowed", None)
     normalized.pop(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD, None)
     return _finalize_pending_question(normalized)
 

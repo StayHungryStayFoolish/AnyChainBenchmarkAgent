@@ -1734,6 +1734,127 @@ class SemanticPlanDraftTests(unittest.TestCase):
         )
         validate_state(committed)
 
+    def test_coordinator_resigns_next_question_after_first_atom_resolution(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import (
+            _apply_handler_result,
+            _semantic_draft_question,
+            apply_coordinator_action,
+        )
+        from agent.harness.questions import (
+            semantic_draft_question_integrity_hash,
+            validate_pending_question_contract,
+        )
+
+        state = new_state("draft-two-atoms", language="en")
+        state["turn_index"] = 7
+        _bind_product_head(state)
+        draft = build_semantic_plan_draft(
+            state,
+            original_input="replace the first value and keep the final value",
+            source_clauses=[{
+                "clause_id": "clause-1",
+                "text": "replace the first value and keep the final value",
+                "input_shape": "prose",
+            }],
+            source_partition=[
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "first value",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "first value conflicts",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "final value",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "final value conflicts",
+                },
+            ],
+            semantic_units=[
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "first value",
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "final value",
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+            ],
+            candidate_actions=[],
+            validation=PlanCoverageResult(
+                valid=False,
+                errors=(),
+                unresolved_clauses=("first value", "final value"),
+                unresolved_units=(
+                    {
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": "first value",
+                        "source_path": "",
+                        "reason": "first value conflicts",
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "clause_id": "clause-1",
+                        "source_text": "final value",
+                        "source_path": "",
+                        "reason": "final value conflicts",
+                    },
+                ),
+            ),
+        )
+        state["semantic_plan_draft"] = draft
+        state["pending_question"] = _semantic_draft_question(draft)
+
+        result = apply_coordinator_action(
+            state,
+            ActionProposal(
+                action_id="resolve-first",
+                action_type="resolve_semantic_draft_atom",
+                arguments={
+                    "draft_id": draft["draft_id"],
+                    "revision": draft["revision"],
+                    "atom_id": draft["active_atom_id"],
+                    "resolution": "use the final value",
+                    "source_evidence": "use the final value",
+                },
+                confidence="high",
+            ),
+        )
+        committed = _apply_handler_result(state, result, owner="coordinator")
+
+        next_draft = committed["semantic_plan_draft"]
+        next_question = committed["pending_question"]
+        self.assertEqual(next_draft["revision"], draft["revision"] + 1)
+        self.assertEqual(next_draft["status"], "awaiting_clarification")
+        self.assertEqual(
+            next_question["semantic_draft_binding"],
+            {
+                "draft_id": next_draft["draft_id"],
+                "revision": next_draft["revision"],
+                "atom_id": next_draft["active_atom_id"],
+                "sensitive_input": False,
+            },
+        )
+        self.assertEqual(
+            next_question["semantic_draft_question_hash"],
+            semantic_draft_question_integrity_hash(next_question),
+        )
+        validate_pending_question_contract(next_question)
+        validate_state(committed)
+
     def test_draft_command_guard_invalidates_replaced_product_head(self) -> None:
         from agent.harness.coordinator import (
             _apply_handler_result,

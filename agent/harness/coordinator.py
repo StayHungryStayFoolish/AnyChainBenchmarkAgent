@@ -3781,8 +3781,11 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
             active_group = prerequisite
         next_question = _question_for_group(committed, active_group) if active_group else None
         if next_question:
-            next_question["same_turn_navigation_allowed"] = (
-                prepared.result.completion != "blocked"
+            next_question = with_pending_question_behavior(
+                next_question,
+                same_turn_navigation_allowed=(
+                    prepared.result.completion != "blocked"
+                ),
             )
             _install_pending_question(committed, next_question)
     if committed.get("pending_question") and committed.get("action_queue"):
@@ -4661,8 +4664,11 @@ def _apply_handler_result(
     if effective_pending is not None:
         pending = asdict(effective_pending) if is_dataclass(effective_pending) else dict(effective_pending)
         if pending != previous_pending:
-            pending["same_turn_navigation_allowed"] = (
-                result.completion != "blocked"
+            pending = with_pending_question_behavior(
+                pending,
+                same_turn_navigation_allowed=(
+                    result.completion != "blocked"
+                ),
             )
             _install_pending_question(candidate, pending)
     pending_owner = str((candidate.get("pending_question") or {}).get("group") or "").strip()
