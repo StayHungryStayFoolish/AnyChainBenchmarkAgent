@@ -5677,6 +5677,122 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(source[0]["operation"], "pending_answer")
 
+    @patch(
+        "agent.harness.hierarchical_planner.request_semantic_compilation",
+    )
+    def test_stage_a_canonicalizes_fenced_request_evidence_before_field_validation(
+        self,
+        semantic_compilation: Mock,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _request_stage_a_proposal,
+            _stage_a_payload,
+            _turn_clauses,
+        )
+        from agent.harness.state import new_state
+
+        source = (
+            "Request first:\n"
+            "```json\n"
+            '{"jsonrpc":"2.0","method":"eth_blockNumber",'
+            '"params":[],"id":1}\n'
+            "```"
+        )
+        state = new_state("fenced-request-evidence", language="en")
+        state["active_group"] = "endpoint_process"
+        state["pending_question"] = {
+            "id": "new_chain_schema_evidence",
+            "group": "endpoint_process",
+            "manual_input_allowed": True,
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+        }
+        clauses = _turn_clauses(state, source)
+        semantic_compilation.return_value = json.dumps({
+            "semantic_units": [
+                {
+                    "unit_id": f"model-field-{index}",
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "endpoint_process",
+                    }],
+                    "reason": "field belongs to the pending evidence",
+                }
+                for index in range(1, 5)
+            ],
+            "reason": "request evidence",
+        })
+
+        partition, errors, _sizes = _request_stage_a_proposal(
+            object(),
+            _stage_a_payload(state, source, clauses),
+            clauses,
+            state,
+            "test prompt",
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(partition), 1)
+        self.assertEqual(
+            partition[0]["unit_id"],
+            "__harness_atomic_evidence_clause-1",
+        )
+        self.assertEqual(partition[0]["source_text"], source)
+        self.assertNotIn("source_path", partition[0])
+        semantic_compilation.assert_called_once()
+
+    def test_stage_a_atomic_evidence_does_not_swallow_independent_operation(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_atomic_evidence_partition,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-with-navigation", language="en")
+        state["pending_question"] = {
+            "id": "schema_evidence",
+            "group": "endpoint_process",
+            "validation": {"value_type": "evidence_contribution"},
+        }
+        units = [
+            {
+                "unit_id": "evidence",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+                "source_text": '{"method":"eth_blockNumber"}',
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "endpoint_process",
+                }],
+            },
+            {
+                "unit_id": "navigation",
+                "clause_id": "clause-1",
+                "operation": "navigation",
+                "source_text": "go back",
+                "owner_routes": [{"owner": "orientation", "group": ""}],
+            },
+        ]
+
+        source, compilation = _canonicalize_atomic_evidence_partition(
+            state,
+            (TurnClause(
+                "clause-1",
+                '{"method":"eth_blockNumber"}; go back',
+                "structured",
+            ),),
+            units,
+            units,
+        )
+
+        self.assertEqual(source, units)
+        self.assertEqual(compilation, units)
+
     def test_stage_a_preserves_valid_structured_route(self) -> None:
         from agent.harness.hierarchical_planner import (
             _validate_partition_document,

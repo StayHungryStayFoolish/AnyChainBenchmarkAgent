@@ -740,11 +740,6 @@ def begin_semantic_partition(
             document["unit_count"] = len(partition)
             return document
         source_partition, compilation_partition = (
-            _canonicalize_atomic_evidence_partition(
-                state, clauses, source_partition, compilation_partition
-            )
-        )
-        source_partition, compilation_partition = (
             _canonicalize_unique_manual_pending_partition(
                 state, clauses, source_partition, compilation_partition
             )
@@ -3037,6 +3032,12 @@ def _validate_partition_document(
         raw_units,
         state or {},
     )
+    raw_units, _ = _canonicalize_atomic_evidence_partition(
+        dict(state or {}),
+        clauses,
+        raw_units,
+        raw_units,
+    )
     raw_units = _bind_structured_partition_provenance(raw_units, clauses)
     raw_units = _bind_ambiguous_prose_partition_identities(raw_units, clauses)
     raw_units = _retain_unclaimed_prose_clauses(raw_units, clauses)
@@ -3086,6 +3087,11 @@ def _validate_partition_document(
     structured_intake_contracts = _structured_intake_contracts()
     observed_structured_paths: dict[str, set[str]] = defaultdict(set)
     observed_structured_atom_ids: dict[str, set[str]] = defaultdict(set)
+    atomic_evidence_contract = _atomic_evidence_contract_active(
+        state or {},
+        clauses,
+    )
+    atomic_evidence_answer_clauses: set[str] = set()
     semantic_draft_answer_clauses: set[str] = set()
     for raw in partition.units:
         unit = dict(raw)
@@ -3166,7 +3172,25 @@ def _validate_partition_document(
             unit,
             state or {},
         )
-        if bound_draft_answer:
+        bound_atomic_evidence = (
+            atomic_evidence_contract
+            and operation == "pending_answer"
+            and unit_id == f"__harness_atomic_evidence_{clause_id}"
+            and clause_id in clauses_by_id
+        )
+        if bound_atomic_evidence:
+            atomic_evidence_answer_clauses.add(clause_id)
+            if source_path:
+                errors.append(
+                    "Stage A atomic evidence answer declares source_path: "
+                    f"{unit_id}"
+                )
+            if str(unit.get("source_text") or "") != clauses_by_id[clause_id].text:
+                errors.append(
+                    "Stage A atomic evidence answer must preserve its "
+                    f"SourceClause: {unit_id}"
+                )
+        elif bound_draft_answer:
             semantic_draft_answer_clauses.add(clause_id)
             if source_path:
                 errors.append(
@@ -3247,7 +3271,10 @@ def _validate_partition_document(
         unit["owner_routes"] = normalized_routes
         output.append(unit)
     for clause_id, expected_paths in structured_paths.items():
-        if clause_id in semantic_draft_answer_clauses:
+        if (
+            clause_id in semantic_draft_answer_clauses
+            or clause_id in atomic_evidence_answer_clauses
+        ):
             continue
         missing = sorted(expected_paths - observed_structured_paths[clause_id])
         if missing:
@@ -3468,12 +3495,7 @@ def _canonicalize_atomic_evidence_partition(
     """Preserve one typed evidence contribution as one lossless owner unit."""
 
     pending = dict(state.get("pending_question") or {})
-    if (
-        str((pending.get("validation") or {}).get("value_type") or "")
-        != "evidence_contribution"
-        or len(clauses) != 1
-        or clauses[0].input_shape != "structured"
-    ):
+    if not _atomic_evidence_contract_active(state, clauses):
         return (
             [dict(unit) for unit in source_partition],
             [dict(unit) for unit in compilation_partition],
@@ -3495,7 +3517,7 @@ def _canonicalize_atomic_evidence_partition(
             [dict(unit) for unit in compilation_partition],
         )
     atomic = {
-        "unit_id": str(executable[0].get("unit_id") or "evidence-unit"),
+        "unit_id": f"__harness_atomic_evidence_{clauses[0].clause_id}",
         "clause_id": clauses[0].clause_id,
         "source_text": clauses[0].text,
         "operation": "pending_answer",
@@ -3509,6 +3531,21 @@ def _canonicalize_atomic_evidence_partition(
         ),
     }
     return [atomic], [dict(atomic)]
+
+
+def _atomic_evidence_contract_active(
+    state: Mapping[str, Any],
+    clauses: Sequence[TurnClause],
+) -> bool:
+    """Return whether one exact SourceClause owns the signed evidence value."""
+
+    pending = dict(state.get("pending_question") or {})
+    return bool(
+        str((pending.get("validation") or {}).get("value_type") or "")
+        == "evidence_contribution"
+        and len(clauses) == 1
+        and clauses[0].input_shape == "structured"
+    )
 
 
 def _canonicalize_unique_manual_pending_partition(
