@@ -14,6 +14,85 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class AgentRuntimeIsolationTests(unittest.TestCase):
+    def test_runtime_event_accepts_action_local_duplicate_sibling_fragments(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
+        from tests.agent_live.coverage_evidence import validate_runtime_turn_event
+        from tests.agent_live.dynamic_dual_ai_chaos import _runtime_event_from_mapping
+        from tests.agent_live.graph_turn import reviewed_action_plan, reviewed_stage_planner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            runtime = AnyChainGraphRuntime(
+                "action-local-fragments",
+                checkpoint_path=root / "checkpoints.sqlite",
+                session_purpose="dynamic-dual-ai-chaos",
+            )
+            state = new_state(
+                "action-local-fragments",
+                language="zh",
+                session_purpose="dynamic-dual-ai-chaos",
+            )
+            state["target_mode"] = "sync-observe"
+            state["workflow_mode"] = "sync_observe"
+            state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
+            runtime._persist_state(state)
+            text = "返回 RPC 配置。\n我想先检查端点地址和连接设置。"
+
+            def planner(planner_state, planner_text):
+                return reviewed_action_plan(
+                    planner_state,
+                    planner_text,
+                    [
+                        {
+                            "type": "answer_opening_question",
+                            "topic": "current_config",
+                            "source_evidence": "返回 RPC 配置。",
+                            "confidence": "high",
+                        },
+                        {
+                            "type": "answer_opening_question",
+                            "topic": "current_config",
+                            "source_evidence": "我想先检查端点地址和连接设置。",
+                            "confidence": "high",
+                        },
+                    ],
+                )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                reviewed_stage_planner(planner),
+            ):
+                result = runtime.invoke(text, language="zh")
+            runtime.close()
+
+            raw_event = json.loads(
+                event_file.read_text(encoding="utf-8").splitlines()[-1]
+            )
+
+        validate_runtime_turn_event(_runtime_event_from_mapping(raw_event))
+        domain_receipts = [
+            receipt
+            for receipt in raw_event["control_receipts"]
+            if receipt.get("receipt_type") == "domain_commit"
+        ]
+        self.assertEqual(len(domain_receipts), 2)
+        self.assertEqual(
+            [
+                [fragment["message_id"] for fragment in receipt["response_fragments"]]
+                for receipt in domain_receipts
+            ],
+            [
+                ["harness.orientation.consultation.current_config"],
+                ["harness.orientation.consultation.current_config"],
+            ],
+        )
+        self.assertEqual(len(result.get("visible_response") or []), 1)
+
     def test_jobs_directory_can_be_isolated_for_cli_and_chaos_processes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             isolated = Path(tmpdir, "jobs").resolve()

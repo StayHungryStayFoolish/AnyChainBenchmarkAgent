@@ -7,7 +7,7 @@ import hashlib
 import re
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from agent.runners.job_manager import verify_job_receipt
 from agent.utils.redaction import redact
@@ -82,7 +82,6 @@ from .contracts import (
     side_effect_intent_to_dict,
     side_effect_receipt_to_dict,
     turn_receipt_to_dict,
-    response_fragment_from_dict,
     response_fragment_to_dict,
     ResponseFragment,
     is_secret_reference,
@@ -241,13 +240,14 @@ def _append_response_fragments(
     state["response_fragments"] = current
 
 
-def _response_fragment_manifest(state: AgentGraphState) -> list[dict[str, str]]:
-    language = str(state.get("language") or "en")
+def _response_fragment_manifest(
+    fragments: Sequence[ResponseFragment],
+    *,
+    language: str,
+) -> list[dict[str, str]]:
     manifest: list[dict[str, str]] = []
-    for raw in state.get("response_fragments") or ():
-        if not isinstance(raw, Mapping):
-            raise StateInvariantError("response fragment state entry is not a mapping")
-        rendered = render_fragment(response_fragment_from_dict(raw), language)
+    for fragment in fragments:
+        rendered = render_fragment(fragment, language)
         manifest.append(
             {
                 "semantic_hash": rendered.semantic_hash,
@@ -4473,7 +4473,10 @@ def _apply_handler_result(
                 "consumed_action_ids": [],
                 "invalidated_groups": [],
                 "invalidated_fields": [],
-                "response_fragments": _response_fragment_manifest(candidate),
+                "response_fragments": _response_fragment_manifest(
+                    (blocker_fragment,),
+                    language=str(candidate.get("language") or "en"),
+                ),
             },
         )
         validate_state(candidate)
@@ -4796,7 +4799,10 @@ def _apply_handler_result(
             "pending_after_id": str(
                 (candidate.get("pending_question") or {}).get("id") or ""
             ),
-            "response_fragments": _response_fragment_manifest(candidate),
+            "response_fragments": _response_fragment_manifest(
+                result.response_fragments,
+                language=str(candidate.get("language") or "en"),
+            ),
         },
     )
 

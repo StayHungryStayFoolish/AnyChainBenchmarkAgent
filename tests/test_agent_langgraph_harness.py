@@ -14250,6 +14250,7 @@ response:
         self.assertEqual(result.get("action_queue"), [])
 
     def test_current_config_absorbs_duplicate_next_action_consultation(self) -> None:
+        from agent.harness.control_receipts import validate_coordinator_control_receipt
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -14273,6 +14274,135 @@ response:
         self.assertEqual(response.count("Current configuration:"), 1)
         self.assertEqual(len(result.get("visible_response") or []), 1)
         self.assertIn("original config/chains template is unchanged", response)
+        domain_receipts = [
+            receipt
+            for receipt in (result.get("turn_context") or {}).get("control_receipts") or []
+            if receipt.get("receipt_type") == "domain_commit"
+        ]
+        self.assertEqual(
+            [
+                [fragment["message_id"] for fragment in receipt["response_fragments"]]
+                for receipt in domain_receipts
+            ],
+            [
+                ["harness.orientation.consultation.current_config"],
+                ["harness.orientation.consultation.current_context_next_group"],
+            ],
+        )
+        for receipt in domain_receipts:
+            self.assertEqual(
+                validate_coordinator_control_receipt(
+                    receipt,
+                    turn_index=result["turn_index"],
+                ),
+                (True, ""),
+            )
+
+    def test_duplicate_sibling_fragments_remain_action_local_in_receipts(self) -> None:
+        from agent.harness.control_receipts import validate_coordinator_control_receipt
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = new_state("duplicate-fragment-receipts", language="zh")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
+        state["last_user_input"] = "返回 RPC 配置。\n我想先检查端点地址和连接设置。"
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            return_value={"actions": [
+                {
+                    "type": "answer_opening_question",
+                    "topic": "current_config",
+                    "source_evidence": "返回 RPC 配置。",
+                    "confidence": "high",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "current_config",
+                    "source_evidence": "我想先检查端点地址和连接设置。",
+                    "confidence": "high",
+                },
+            ]},
+        ):
+            result = process_turn(state)
+
+        domain_receipts = [
+            receipt
+            for receipt in (result.get("turn_context") or {}).get("control_receipts") or []
+            if receipt.get("receipt_type") == "domain_commit"
+        ]
+        self.assertEqual(len(domain_receipts), 2)
+        for receipt in domain_receipts:
+            self.assertEqual(
+                [
+                    fragment["message_id"]
+                    for fragment in receipt["response_fragments"]
+                ],
+                ["harness.orientation.consultation.current_config"],
+            )
+            self.assertEqual(
+                validate_coordinator_control_receipt(
+                    receipt,
+                    turn_index=result["turn_index"],
+                ),
+                (True, ""),
+            )
+        self.assertEqual(len(result.get("visible_response") or []), 1)
+
+    def test_blocker_receipt_excludes_preexisting_response_fragments(self) -> None:
+        from agent.harness.contracts import FailureDescriptor, HandlerResult, ResponseFragment
+        from agent.harness.control_receipts import validate_coordinator_control_receipt
+        from agent.harness.coordinator import _append_response_fragments, _apply_handler_result
+        from agent.harness.state import new_state
+
+        state = new_state("blocker-fragment-receipt", language="en")
+        _append_response_fragments(
+            state,
+            ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.current_config",
+                payload={},
+                source="test",
+            ),
+        )
+
+        result = _apply_handler_result(
+            state,
+            HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.failure.coordinator.no_active_question",
+                    arguments={"operation": "resume_current_flow"},
+                    source="test",
+                ),
+            ),
+            owner="coordinator",
+        )
+
+        receipt = next(
+            receipt
+            for receipt in (result.get("turn_context") or {}).get("control_receipts") or []
+            if receipt.get("receipt_type") == "domain_commit"
+        )
+        self.assertEqual(
+            [fragment["message_id"] for fragment in receipt["response_fragments"]],
+            ["harness.failure.coordinator.no_active_question"],
+        )
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                receipt,
+                turn_index=result["turn_index"],
+            ),
+            (True, ""),
+        )
+        self.assertEqual(
+            [fragment["message_id"] for fragment in result["response_fragments"]],
+            [
+                "harness.orientation.consultation.current_config",
+                "harness.failure.coordinator.no_active_question",
+            ],
+        )
 
     def test_current_config_and_job_history_remain_distinct_consultation_results(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
