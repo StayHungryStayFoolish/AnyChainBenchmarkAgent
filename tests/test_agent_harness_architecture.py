@@ -372,6 +372,66 @@ def _grounded_mutation_admission_fixture(
     return plan, _whole_plan_admission_payload(request)
 
 
+def _incomplete_intake_admission_fixture(
+    *,
+    forged: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    from agent.harness.action_registry import (
+        ACTION_BY_TYPE,
+        resolve_action_target_group,
+    )
+    from agent.harness.semantic_compiler import freeze_semantic_plan
+
+    source = "I need to benchmark a different chain."
+    action = {
+        "type": "greeting" if forged else "request_chain_selection",
+        "source_evidence": source,
+    }
+    unit = {
+        "unit_id": "unit-1",
+        "clause_id": "clause-1",
+        "source_text": source,
+        "disposition": "action",
+        "action_indexes": [0],
+    }
+    spec = ACTION_BY_TYPE[action["type"]]
+    plan = freeze_semantic_plan(
+        {"actions": [action], "semantic_units": [unit]},
+        action_records=[{
+            "action_id": "action-1",
+            "action_index": 0,
+            "action": action,
+            "registry_owner": spec.owner,
+            "registry_effect": spec.effect,
+            "registry_target_group": resolve_action_target_group(action),
+            "registry_incomplete_mutation_intake": True,
+            "registry_incomplete_read_intake": False,
+            "required_value_grounding_arguments": [],
+            "unit_ids": ["unit-1"],
+            "allowed_support_relations": [],
+            "required_evidence_relations": [{
+                "unit_id": "unit-1",
+                "relation": "direct",
+                "support_relation": "",
+            }],
+        }],
+        unit_records=[{
+            "unit_id": "unit-1",
+            "unit_index": 0,
+            "unit": unit,
+            "source_text": source,
+            "evidence_sources": [source],
+            "disposition": "action",
+            "owner_action_ids": ["action-1"],
+        }],
+        review_context={"pending_question": {}},
+    )
+    request = SimpleNamespace(
+        messages=[None, SimpleNamespace(content=plan.request_json)]
+    )
+    return plan, _whole_plan_admission_payload(request)
+
+
 def _confirmation_proposal_admission_fixture() -> tuple[Any, dict[str, Any]]:
     from agent.harness.action_registry import ACTION_BY_TYPE
     from agent.harness.semantic_compiler import freeze_semantic_plan
@@ -1088,6 +1148,192 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             "; ".join(admission.errors),
         )
         self.assertEqual(provider.complete.call_count, 3)
+
+    def test_typed_intake_primary_admission_does_not_escalate(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture()
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(valid, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertFalse(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 1)
+        self.assertEqual(admission.review_ids, ("primary/attempt_1",))
+
+    def test_typed_intake_primary_rejection_uses_adaptive_quorum(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = (
+            "the source does not request this intake"
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(
+            admission.review_ids,
+            (
+                "jury_1/attempt_1",
+                "jury_2/attempt_1",
+                "jury_3/attempt_1",
+            ),
+        )
+
+    def test_typed_intake_malformed_primary_can_reach_quorum(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture()
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text="{}"),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(len(admission.review_hashes), 3)
+
+    def test_typed_intake_adaptive_quorum_fails_closed(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = "the intake is not selected"
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertTrue(admission.consensus_required)
+        self.assertIn(
+            "typed intake semantic jury did not reach admission quorum",
+            admission.errors,
+        )
+        self.assertEqual(provider.complete.call_count, 3)
+
+    def test_typed_intake_malformed_secondary_cannot_form_quorum(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = "the intake is not selected"
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+            SimpleNamespace(text="{}"),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 3)
+
+    def test_non_intake_rejection_does_not_escalate(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _immutable_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = "the action is not selected"
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(rejected, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertFalse(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 1)
+
+    def test_forged_incomplete_intake_metadata_does_not_escalate(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _incomplete_intake_admission_fixture(forged=True)
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = "the action is not selected"
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(rejected, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertFalse(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 1)
 
     def test_strict_json_compilation_disables_provider_reasoning(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES

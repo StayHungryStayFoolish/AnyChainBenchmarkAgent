@@ -879,10 +879,12 @@ def request_whole_plan_admission(
     review_hashes: list[str] = []
     review_ids: list[str] = []
     consensus_required = _requires_grounded_mutation_consensus(plan)
+    adaptive_intake_consensus = _qualifies_for_adaptive_intake_consensus(plan)
 
     def run_review(
         *,
-        consensus_index: int,
+        reviewer_id: str,
+        independent: bool,
     ) -> tuple[WholePlanAdmission, tuple[int, ...], tuple[str, ...], tuple[str, ...]]:
         local_request_sizes: list[int] = []
         local_review_hashes: list[str] = []
@@ -901,12 +903,12 @@ def request_whole_plan_admission(
                 for key, value in base_payload.items()
                 if key != "plan_hash"
             }
-            if consensus_index:
+            if independent:
                 prompt = (
                     f"{base_prompt} This is an independent consensus review of "
-                    "the same immutable plan. Re-evaluate every value-grounded "
-                    "state mutation from its owned source units. Do not trust or "
-                    "infer any prior reviewer verdict."
+                    "the same immutable plan. Re-evaluate every admitted action "
+                    "from its owned source units and registry-declared purpose. "
+                    "Do not trust or infer any prior reviewer verdict."
                 )
             if attempt:
                 payload["admission_contract_repair"] = {
@@ -945,11 +947,6 @@ def request_whole_plan_admission(
                 plan,
                 allowed_action_types=allowed_action_types,
             )
-            reviewer_id = (
-                f"jury_{consensus_index + 1}"
-                if consensus_required
-                else "primary"
-            )
             local_review_ids.append(f"{reviewer_id}/attempt_{attempt + 1}")
             local_review_hashes.append(
                 _content_hash(admission.response or previous_output)
@@ -965,21 +962,71 @@ def request_whole_plan_admission(
         )
 
     if not consensus_required:
-        primary, sizes, hashes, identities = run_review(consensus_index=0)
+        primary, sizes, hashes, identities = run_review(
+            reviewer_id="primary",
+            independent=False,
+        )
         request_sizes.extend(sizes)
         review_hashes.extend(hashes)
         review_ids.extend(identities)
-        return replace(
+        if primary.valid or not adaptive_intake_consensus:
+            return replace(
+                primary,
+                request_count=len(request_sizes),
+                request_sizes=tuple(request_sizes),
+                consensus_required=False,
+                review_hashes=tuple(review_hashes),
+                review_ids=tuple(review_ids),
+            )
+
+        secondary_results = run_independent_llm_tasks((
+            lambda: run_review(reviewer_id="jury_2", independent=True),
+            lambda: run_review(reviewer_id="jury_3", independent=True),
+        ))
+        review_ids = [
+            identity.replace("primary/", "jury_1/", 1)
+            for identity in review_ids
+        ]
+        for _review, sizes, hashes, identities in secondary_results:
+            request_sizes.extend(sizes)
+            review_hashes.extend(hashes)
+            review_ids.extend(identities)
+        jury = (
             primary,
+            *(review for review, _sizes, _hashes, _identities in secondary_results),
+        )
+        admitted = tuple(review for review in jury if review.valid)
+        if len(admitted) < 2:
+            rejected = next(
+                (review for review in jury if not review.valid),
+                primary,
+            )
+            return replace(
+                rejected,
+                errors=tuple(dict.fromkeys([
+                    "typed intake semantic jury did not reach admission quorum",
+                    *rejected.errors,
+                ])),
+                request_count=len(request_sizes),
+                request_sizes=tuple(request_sizes),
+                consensus_required=True,
+                review_hashes=tuple(review_hashes),
+                review_ids=tuple(review_ids),
+            )
+        return replace(
+            admitted[0],
             request_count=len(request_sizes),
             request_sizes=tuple(request_sizes),
-            consensus_required=consensus_required,
+            consensus_required=True,
             review_hashes=tuple(review_hashes),
             review_ids=tuple(review_ids),
         )
 
     jury_results = run_independent_llm_tasks(tuple(
-        lambda index=index: run_review(consensus_index=index)
+        lambda index=index: run_review(
+            reviewer_id=f"jury_{index + 1}",
+            independent=bool(index),
+        )
         for index in range(3)
     ))
     for _review, sizes, hashes, identities in jury_results:
@@ -1091,6 +1138,65 @@ def _requires_grounded_mutation_consensus(
         and bool(record.get("required_value_grounding_arguments"))
         for record in actions
     )
+
+
+def _qualifies_for_adaptive_intake_consensus(
+    plan: ImmutableSemanticPlan,
+) -> bool:
+    """Authenticate one Stage A-owned, registry-declared typed intake."""
+
+    # Imported lazily because action_registry imports semantic compiler helpers
+    # while constructing the central action contract.
+    from .action_registry import ACTION_BY_TYPE, resolve_action_target_group
+
+    payload = plan.request_payload()
+    unit_records = {
+        str(record.get("unit_id") or ""): record
+        for record in payload.get("semantic_units") or ()
+        if isinstance(record, Mapping) and str(record.get("unit_id") or "")
+    }
+    for record in payload.get("actions") or ():
+        if not isinstance(record, Mapping):
+            continue
+        action = record.get("action")
+        if not isinstance(action, Mapping):
+            continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if spec is None or not (
+            spec.incomplete_mutation_intake or spec.incomplete_read_intake
+        ):
+            continue
+        if (
+            bool(record.get("registry_incomplete_mutation_intake"))
+            != bool(spec.incomplete_mutation_intake)
+            or bool(record.get("registry_incomplete_read_intake"))
+            != bool(spec.incomplete_read_intake)
+            or str(record.get("registry_owner") or "") != spec.owner
+            or str(record.get("registry_effect") or "") != spec.effect
+            or str(record.get("registry_target_group") or "")
+            != resolve_action_target_group(action)
+            or bool(record.get("required_value_grounding_arguments"))
+        ):
+            continue
+        action_id = str(record.get("action_id") or "")
+        unit_ids = tuple(str(value) for value in record.get("unit_ids") or ())
+        direct_ids = {
+            str(relation.get("unit_id") or "")
+            for relation in record.get("required_evidence_relations") or ()
+            if isinstance(relation, Mapping)
+            and str(relation.get("relation") or "") == "direct"
+            and not str(relation.get("support_relation") or "")
+        }
+        if not unit_ids or direct_ids != set(unit_ids):
+            continue
+        if all(
+            tuple(str(owner) for owner in (
+                unit_records.get(unit_id, {}).get("owner_action_ids") or ()
+            )) == (action_id,)
+            for unit_id in unit_ids
+        ):
+            return True
+    return False
 
 
 def _is_explicit_semantic_rejection(
