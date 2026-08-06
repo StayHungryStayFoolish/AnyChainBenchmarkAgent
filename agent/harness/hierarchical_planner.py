@@ -57,6 +57,7 @@ from .questions import (
     exact_option_prefix_answer,
     pending_option_value_exists,
     pending_value_identity,
+    researched_identity_value_is_valid,
     semantic_pending_question,
     typed_pending_value_candidates,
     value_satisfies_pending_contract,
@@ -3885,12 +3886,21 @@ def _review_stage_a_pending_entailment(
             if not selected_identity:
                 continue
             if not selected_identity.startswith("option:"):
-                evidence_identity = pending_value_identity(evidence, pending)
-                if (
-                    pending.get("manual_input_allowed") is not True
-                    or selected_identity != evidence_identity
-                ):
-                    continue
+                if str(pending.get("value_domain") or "") == "researched_identity":
+                    selected_text = str(selected_value or "").strip()
+                    if (
+                        pending.get("manual_input_allowed") is not True
+                        or not researched_identity_value_is_valid(selected_text)
+                        or selected_text not in evidence
+                    ):
+                        continue
+                else:
+                    evidence_identity = pending_value_identity(evidence, pending)
+                    if (
+                        pending.get("manual_input_allowed") is not True
+                        or selected_identity != evidence_identity
+                    ):
+                        continue
             answer_votes[selected_identity] += 1
         if max(answer_votes.values(), default=0) < 2:
             errors.append(

@@ -1190,6 +1190,8 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     raw = _strip_scalar(str(value or ""))
     if not raw:
         return False
+    if str(question.get("value_domain") or "") == "researched_identity":
+        return researched_identity_value_is_valid(raw)
     value_type = str(validation.get("value_type") or "")
     if value_type == "evidence_contribution":
         max_length = int(validation.get("max_length") or 65536)
@@ -1218,6 +1220,32 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     }:
         return literal_matches_validation(raw, validation)
     return answer_fits_pending(raw, question)
+
+
+def researched_identity_value_is_valid(value: Any) -> bool:
+    """Validate one identity already extracted by the semantic authorities.
+
+    This is intentionally broader than local terminal dispatch. Unknown
+    multi-word identities require semantic extraction and independent
+    entailment review, but the extracted value still needs a bounded lexical
+    contract before it can reach the declared domain owner.
+    """
+
+    raw = _strip_scalar(str(value or ""))
+    if not raw or len(raw) > 80 or "\n" in raw or "\r" in raw:
+        return False
+    if not raw[0].isalnum() or not (raw[-1].isalnum() or raw[-1] == ")"):
+        return False
+    allowed_punctuation = frozenset(" ._-/+&()'")
+    return bool(
+        any(character.isalnum() for character in raw)
+        and all(
+            character.isalnum()
+            or character.isspace()
+            or character in allowed_punctuation
+            for character in raw
+        )
+    )
 
 
 def action_settles_pending_contract(

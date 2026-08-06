@@ -7858,6 +7858,120 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             _stage_a_admission_prompt(),
         )
 
+    def test_researched_identity_accepts_source_exact_multiword_value(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+        from agent.harness.questions import (
+            answer_fits_pending,
+            researched_identity_value_is_valid,
+            value_satisfies_pending_contract,
+        )
+
+        source = "AuroraEdge Testnet is the final chain name."
+        pending = {
+            "id": "chain",
+            "group": "chain_identity",
+            "kind": "chain",
+            "manual_input_allowed": True,
+            "options": [],
+            "value_domain": "researched_identity",
+            "validation": {},
+        }
+        self.assertFalse(answer_fits_pending(source, pending))
+        self.assertTrue(
+            value_satisfies_pending_contract("AuroraEdge Testnet", pending)
+        )
+        self.assertFalse(researched_identity_value_is_valid("AuroraEdge\nTestnet"))
+        self.assertFalse(researched_identity_value_is_valid("A" * 81))
+        self.assertFalse(researched_identity_value_is_valid("AuroraEdge Testnet."))
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "selected_value": "AuroraEdge Testnet",
+                "evidence_quote": "AuroraEdge Testnet",
+                "reason": "the exact multi-word identity answers the chain question",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(),
+                {
+                    "pending_question": pending,
+                    "contract_proven_pending_prefixes": [],
+                    "pending_typed_candidates": [],
+                },
+                [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "chain_identity",
+                    }],
+                }],
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+
+    def test_researched_identity_rejects_value_absent_from_source(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "AuroraEdge Testnet is the final chain name."
+        pending = {
+            "id": "chain",
+            "group": "chain_identity",
+            "kind": "chain",
+            "manual_input_allowed": True,
+            "options": [],
+            "value_domain": "researched_identity",
+            "validation": {},
+        }
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "selected_value": "AuroraEdge Mainnet",
+                "evidence_quote": "AuroraEdge Testnet",
+                "reason": "the proposed value is not the source value",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(),
+                {
+                    "pending_question": pending,
+                    "contract_proven_pending_prefixes": [],
+                    "pending_typed_candidates": [],
+                },
+                [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "chain_identity",
+                    }],
+                }],
+            )
+
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(any("quorum rejected" in error for error in errors))
+
     def test_manual_pending_entailment_rejects_relative_change_request(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_stage_a_pending_entailment,
