@@ -9080,6 +9080,164 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             payload["pending_question"],
         )
 
+    def test_stage_a_admission_can_retire_explicitly_corrected_mutation(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Use AuroraEdge. Actually, use AuroraEdge Testnet.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Use AuroraEdge.",
+            }, {
+                "clause_id": "clause-2",
+                "text": "Actually, use AuroraEdge Testnet.",
+            }],
+            "groups": [{"name": "chain_identity", "owner": "chain_rpc"}],
+            "universal_operations": ["domain_request"],
+        }
+        partition = [{
+            "unit_id": "original-chain",
+            "clause_id": "clause-1",
+            "source_text": "Use AuroraEdge.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "initial chain selection",
+        }, {
+            "unit_id": "corrected-chain",
+            "clause_id": "clause-2",
+            "source_text": "Actually, use AuroraEdge Testnet.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "explicit chain correction",
+        }]
+        reviewed = {
+            "unit_verdicts": [{
+                "unit_id": "original-chain",
+                "verdict": "redundant",
+                "supports_unit_id": "corrected-chain",
+                "reason": "the later source explicitly supersedes this value",
+            }, {
+                "unit_id": "corrected-chain",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the correction is the final requested value",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the original value is preserved as superseded context",
+            }, {
+                "clause_id": "clause-2",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the correction owns the final mutation",
+            }],
+            "reason": "the explicit correction produces one executable value",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(reviewed),
+        ):
+            errors, _sizes, redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(redundant, frozenset({"original-chain"}))
+
+    def test_unresolved_mutation_conflict_preserves_sibling_actions(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _project_unresolved_mutation_conflicts,
+        )
+
+        candidate = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "AuroraEdge",
+                "source_evidence": "AuroraEdge",
+            }, {
+                "type": "choose_chain",
+                "chain_text": "AuroraEdge Testnet",
+                "source_evidence": "AuroraEdge Testnet",
+            }, {
+                "type": "set_rpc_mode",
+                "rpc_mode": "mixed",
+                "mutation_explicit": True,
+                "source_evidence": "mixed",
+            }],
+            "semantic_units": [{
+                "unit_id": "chain-a",
+                "clause_id": "clause-1",
+                "start": 0,
+                "end": 10,
+                "source_text": "AuroraEdge",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "first candidate",
+            }, {
+                "unit_id": "chain-b",
+                "clause_id": "clause-2",
+                "start": 0,
+                "end": 18,
+                "source_text": "AuroraEdge Testnet",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "disposition": "action",
+                "action_indexes": [1],
+                "reason": "second candidate",
+            }, {
+                "unit_id": "rpc-mode",
+                "clause_id": "clause-3",
+                "start": 0,
+                "end": 5,
+                "source_text": "mixed",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "workload_rpc",
+                }],
+                "disposition": "action",
+                "action_indexes": [2],
+                "reason": "independent sibling mutation",
+            }],
+            "semantic_support_unit_ids": ["chain-a"],
+        }
+
+        projected = _project_unresolved_mutation_conflicts(candidate)
+
+        self.assertEqual(
+            [action["type"] for action in projected["actions"]],
+            ["set_rpc_mode"],
+        )
+        self.assertEqual(
+            [unit["disposition"] for unit in projected["semantic_units"]],
+            ["unresolved", "unresolved", "action"],
+        )
+        self.assertEqual(
+            projected["semantic_units"][2]["action_indexes"],
+            [0],
+        )
+        self.assertEqual(projected["semantic_support_unit_ids"], [])
+
     def test_stage_a_admission_can_bind_manual_value_scope_to_candidate(
         self,
     ) -> None:

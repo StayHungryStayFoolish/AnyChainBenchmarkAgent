@@ -8,6 +8,7 @@ from agent.harness.queue import (
     ActionQueueConflict,
     action_can_run_while_pending,
     action_supersedes_pending_contract,
+    mutation_conflict_action_groups,
     order_action_queue,
 )
 from agent.harness.state import new_state
@@ -221,6 +222,24 @@ class ActionQueueOrderingTests(unittest.TestCase):
             "requires explicit clarification",
         ):
             order_action_queue(state, actions)
+
+        self.assertEqual(
+            mutation_conflict_action_groups(tuple(actions)),
+            (("target_mode", (0, 1)),),
+        )
+
+    def test_equivalent_same_turn_mutations_are_not_conflicts(self) -> None:
+        actions = ({
+            "type": "choose_chain",
+            "chain_text": "ethereum",
+            "source_evidence": "ethereum",
+        }, {
+            "type": "choose_chain",
+            "chain_text": "ethereum",
+            "source_evidence": "use ethereum",
+        })
+
+        self.assertEqual(mutation_conflict_action_groups(actions), ())
 
     def test_neighboring_qps_mode_and_override_are_composable(self) -> None:
         state = _configured_state()

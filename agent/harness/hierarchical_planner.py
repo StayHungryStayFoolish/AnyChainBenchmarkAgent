@@ -61,6 +61,7 @@ from .questions import (
     typed_pending_value_candidates,
     value_satisfies_pending_contract,
 )
+from .queue import mutation_conflict_action_groups
 from .semantic_compiler import (
     STRICT_JSON_REASONING_MODE,
     closed_enum_quote_names_only_competing_values,
@@ -1662,6 +1663,7 @@ def review_semantic_plan(
         routed_partition,
         owner_documents,
     )
+    candidate = _project_unresolved_mutation_conflicts(candidate)
     authoritative_direct_unit_ids = frozenset(
         str(unit.get("unit_id") or "")
         for unit in source_partition
@@ -3483,7 +3485,12 @@ def _stage_a_admission_prompt() -> str:
         "unit duplicates, contrasts with, or merely restates one other complete unit in this "
         "turn; set supports_unit_id to that exact distinct complete unit id regardless of whether "
         "the supporting prose appears before or after it, and require the redundant unit's clause "
-        "to contain no omitted demand. "
+        "to contain no omitted demand. When a later complete unit explicitly corrects, replaces, "
+        "or supersedes an earlier mutation of the same owner/group decision, classify the earlier "
+        "unit as redundant and set supports_unit_id to the later correction. Do this only when the "
+        "source itself makes supersession explicit. Alternatives, comparisons, conjunctions, "
+        "uncertain candidates, and merely different values are not supersession and must remain "
+        "unresolved rather than becoming last-value-wins. The corrected unit remains complete. "
         "registered_value_mentions proves only spelling and owner identity. When one complete "
         "unit already represents a compact registered-domain request, adjacent operation framing "
         "that adds no independent value, question, navigation, analysis, or mutation supports "
@@ -5482,6 +5489,88 @@ def _merge_owner_documents(
         "semantic_support_unit_ids": semantic_support_unit_ids,
         "reason": "hierarchical Stage A/Stage B compilation",
     }
+
+
+def _project_unresolved_mutation_conflicts(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep ambiguous same-dimension mutations out of the durable queue.
+
+    Stage A coverage review is the semantic authority that may classify an
+    earlier mutation as superseded context. If competing decisions survive
+    that review, the Harness cannot infer which one wins. Preserve their exact
+    source units as unresolved atoms while retaining independent sibling
+    actions for semantic-draft finalization.
+    """
+
+    output = json.loads(json.dumps(candidate, ensure_ascii=False))
+    actions = output.get("actions")
+    units = output.get("semantic_units")
+    if not isinstance(actions, list) or not isinstance(units, list):
+        return output
+    if not all(isinstance(action, Mapping) for action in actions):
+        return output
+    conflicts = mutation_conflict_action_groups(tuple(
+        dict(action) for action in actions
+    ))
+    conflict_indexes = {
+        index
+        for _dimension, indexes in conflicts
+        for index in indexes
+    }
+    if not conflict_indexes:
+        return output
+    retained_actions: list[Any] = []
+    old_to_new: dict[int, int] = {}
+    for index, action in enumerate(actions):
+        if index in conflict_indexes:
+            continue
+        old_to_new[index] = len(retained_actions)
+        retained_actions.append(action)
+    conflict_dimension_by_index = {
+        index: dimension
+        for dimension, indexes in conflicts
+        for index in indexes
+    }
+    unresolved_ids: set[str] = set()
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        indexes = [
+            index
+            for index in unit.get("action_indexes") or ()
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+        conflicting = [
+            index for index in indexes if index in conflict_indexes
+        ]
+        remaining = [
+            old_to_new[index]
+            for index in indexes
+            if index in old_to_new
+        ]
+        if conflicting and not remaining:
+            dimensions = sorted({
+                conflict_dimension_by_index[index]
+                for index in conflicting
+            })
+            unit["disposition"] = "unresolved"
+            unit["action_indexes"] = []
+            unit["reason"] = (
+                "The same turn contains competing values for registry-owned "
+                f"mutation dimension(s) {', '.join(dimensions)}; explicit "
+                "supersession did not reach semantic-plan consensus."
+            )
+            unresolved_ids.add(str(unit.get("unit_id") or ""))
+        else:
+            unit["action_indexes"] = list(dict.fromkeys(remaining))
+    output["actions"] = retained_actions
+    output["semantic_support_unit_ids"] = [
+        unit_id
+        for unit_id in output.get("semantic_support_unit_ids") or ()
+        if str(unit_id) not in unresolved_ids
+    ]
+    return output
 
 
 def _bind_semantic_draft_resolution_evidence(

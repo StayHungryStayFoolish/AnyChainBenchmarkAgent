@@ -333,7 +333,31 @@ def _add_dependency(
 
 
 def _reject_conflicting_mutations(actions: list[dict]) -> None:
-    decisions: dict[tuple[str, str, str], tuple[str, int]] = {}
+    conflicts = mutation_conflict_action_groups(actions)
+    if conflicts:
+        dimension, indexes = conflicts[0]
+        raise ActionQueueConflict(
+            "conflicting same-turn mutation requires explicit clarification "
+            f"before queue admission: {dimension} "
+            f"(actions {indexes[0]} and {indexes[1]})"
+        )
+
+
+def mutation_conflict_action_groups(
+    actions: list[dict] | tuple[dict, ...],
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Return same-transaction mutation conflicts without resolving intent.
+
+    This is a registry-owned structural check. It deliberately does not apply
+    source order, last-value-wins, or language-specific correction rules.
+    Semantic planning must remove an explicitly superseded decision or retain
+    the conflicting source as unresolved before durable queue admission.
+    """
+
+    decisions: dict[
+        tuple[str, str, str],
+        dict[str, list[int]],
+    ] = {}
     for index, action in enumerate(actions):
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
         if spec is None or not spec.mutation_dimension:
@@ -342,17 +366,18 @@ def _reject_conflicting_mutations(actions: list[dict]) -> None:
         transaction = _action_transaction_identity(action)
         key = (transaction, spec.mutation_dimension, semantic_family)
         identity = _mutation_decision_identity(action, spec.allowed_arguments)
-        prior = decisions.get(key)
-        if prior is None:
-            decisions[key] = (identity, index)
+        decisions.setdefault(key, {}).setdefault(identity, []).append(index)
+    conflicts: list[tuple[str, tuple[int, ...]]] = []
+    for (_transaction, dimension, _family), identities in decisions.items():
+        if len(identities) < 2:
             continue
-        prior_identity, prior_index = prior
-        if identity != prior_identity:
-            raise ActionQueueConflict(
-                "conflicting same-turn mutation requires explicit clarification "
-                f"before queue admission: {spec.mutation_dimension} "
-                f"(actions {prior_index} and {index})"
-            )
+        indexes = tuple(sorted(
+            index
+            for values in identities.values()
+            for index in values
+        ))
+        conflicts.append((dimension, indexes))
+    return tuple(conflicts)
 
 
 def _action_transaction_identity(action: Mapping[str, Any]) -> str:
