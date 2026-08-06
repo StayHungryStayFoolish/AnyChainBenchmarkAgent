@@ -366,7 +366,13 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
                     source=__name__,
                 )
             )
-        customization_requested = bool((next_state.get("qps_profile") or {}).get("customization_requested"))
+        current_qps = dict(next_state.get("qps_profile") or {})
+        if str(current_qps.get("mode") or "").strip().lower() == mode:
+            return HandlerResult(
+                consumed_action_ids=(action.action_id,),
+                completion="unchanged",
+            )
+        customization_requested = bool(current_qps.get("customization_requested"))
         next_state["qps_profile"] = {
             "mode": mode,
             "confirmed": False,

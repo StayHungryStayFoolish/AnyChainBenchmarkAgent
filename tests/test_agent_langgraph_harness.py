@@ -17539,6 +17539,130 @@ response:
         self.assertEqual(third["qps_profile"]["mode"], "quick")
         self.assertEqual(third["pending_question"]["id"], "qps_profile_confirm")
 
+    def test_confirmed_qps_noop_resumes_same_turn_navigation_and_consultation(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.performance import question_for_performance
+        from agent.harness.state import new_state
+
+        state = new_state("qps-noop-navigation", language="zh")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+            },
+            "rpc_mode": "single",
+            "workload": {"confirmed": True},
+            "qps_profile": {
+                "mode": "standard",
+                "confirmed": False,
+                "default_decision_made": False,
+            },
+            "active_group": "qps_profile",
+            "last_user_input": (
+                "Y\n保留当前默认 QPS；接着进入高级调优，并说明可调整的参数。"
+            ),
+        })
+        state["pending_question"] = question_for_performance(
+            state, "qps_profile"
+        ) or {}
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "answer_pending",
+                    "selected_value": True,
+                    "source_evidence": "Y",
+                    "confidence": "high",
+                },
+                {
+                    "type": "set_qps_mode",
+                    "qps_mode": "standard",
+                    "mutation_explicit": True,
+                    "source_evidence": "保留当前默认 QPS",
+                    "confidence": "high",
+                },
+                {
+                    "type": "change_group",
+                    "group": "advanced_tuning",
+                    "navigation_explicit": True,
+                    "source_evidence": "接着进入高级调优",
+                    "confidence": "high",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "config_explanation",
+                    "subject": "advanced_tuning",
+                    "source_evidence": "说明可调整的参数",
+                    "confidence": "high",
+                },
+            ],
+        )
+
+        self.assertTrue(result["qps_profile"]["confirmed"])
+        self.assertTrue(result["qps_profile"]["default_decision_made"])
+        self.assertEqual(result["qps_profile"]["mode"], "standard")
+        self.assertEqual(result["active_group"], "advanced_tuning")
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "advanced_tuning_confirm",
+        )
+        self.assertNotIn(
+            "qps_profile_confirm",
+            str(result.get("pending_question") or {}),
+        )
+        self.assertEqual(result.get("action_queue"), [])
+
+    def test_changed_qps_mode_invalidates_prior_confirmation_and_overrides(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("qps-real-mode-change", language="en")
+        state.update({
+            "target_mode": "real-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+            },
+            "qps_profile": {
+                "mode": "standard",
+                "confirmed": True,
+                "default_decision_made": True,
+                "overrides": {"INITIAL_QPS": "25"},
+            },
+            "active_group": "qps_profile",
+            "last_user_input": "Change the benchmark mode to quick.",
+        })
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "Change the benchmark mode to quick",
+                "confidence": "high",
+            }],
+        )
+
+        self.assertEqual(result["qps_profile"]["mode"], "quick")
+        self.assertFalse(result["qps_profile"]["confirmed"])
+        self.assertFalse(result["qps_profile"]["default_decision_made"])
+        self.assertNotIn("overrides", result["qps_profile"])
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "qps_profile_confirm",
+        )
+
     def test_pending_config_review_defers_new_actions_until_user_confirms(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.domains.environment import config_proposal_review_question
