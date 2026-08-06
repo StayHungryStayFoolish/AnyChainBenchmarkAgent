@@ -537,12 +537,9 @@ def begin_semantic_partition(
         recoverable_primary_rejection = bool(
             admission_errors and primary_review_contract_valid
         )
-        if recoverable_primary_rejection or (
-            not admission_errors
-            and _partition_requires_independent_proposal(
-                source_partition,
-                stage_a_payload,
-            )
+        if recoverable_primary_rejection or _partition_requires_independent_proposal(
+            source_partition,
+            stage_a_payload,
         ):
             (
                 independent_partition,

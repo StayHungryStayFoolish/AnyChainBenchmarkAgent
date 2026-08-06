@@ -5172,15 +5172,18 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     json.dumps(partition),
                     json.dumps(rejected),
                     json.dumps(rejected),
+                    json.dumps(partition),
+                    json.dumps(rejected),
+                    json.dumps(rejected),
                 ],
             ) as compiler,
         ):
             result = begin_semantic_partition(state, text)
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["stage_a_calls"], 1)
-        self.assertEqual(result["admission_calls"], 2)
-        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(result["admission_calls"], 4)
+        self.assertEqual(compiler.call_count, 6)
         self.assertTrue(
             any(
                 "internally inconsistent" in error
@@ -8439,6 +8442,170 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             document["stage_a_convergence"]["selection_authority"],
             "harness_eligibility",
         )
+
+    def test_unresolved_primary_with_malformed_review_uses_independent_proposal(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("malformed-primary-independent", language="en")
+        source = "I need to benchmark a different chain."
+        primary = [{
+            "unit_id": "unit-primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "no safe route selected",
+        }]
+        secondary = [{
+            "unit_id": "unit-secondary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "standalone chain replacement request",
+        }]
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                side_effect=[
+                    (primary, (), (101,)),
+                    (secondary, (), (102,)),
+                ],
+            ) as proposals,
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_partition",
+                side_effect=[
+                    (("invalid omitted route",), (201, 202), frozenset(), False),
+                    ((), (203,), frozenset(), True),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_stage_a_pending_entailment",
+                return_value=((), ()),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_stage_a_explicit_scope_authorization",
+                return_value=((), (), ()),
+            ),
+        ):
+            document = begin_semantic_partition(state, source)
+
+        self.assertEqual(document["status"], "compile_owner")
+        self.assertEqual(document["source_partition"], secondary)
+        self.assertEqual(proposals.call_count, 2)
+        self.assertEqual(
+            document["stage_a_convergence"]["selected_proposal"],
+            "secondary",
+        )
+        self.assertEqual(
+            document["stage_a_convergence"]["selection_authority"],
+            "harness_eligibility",
+        )
+
+    def test_complete_primary_with_malformed_review_does_not_speculate(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("malformed-complete-primary", language="en")
+        source = "Explain the available benchmark modes."
+        primary = [{
+            "unit_id": "unit-primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "consultation",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+            "reason": "benchmark mode consultation",
+        }]
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                return_value=(primary, (), (101,)),
+            ) as proposals,
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_partition",
+                return_value=(
+                    ("malformed review contract",),
+                    (201, 202),
+                    frozenset(),
+                    False,
+                ),
+            ),
+        ):
+            document = begin_semantic_partition(state, source)
+
+        self.assertEqual(document["status"], "failed")
+        self.assertEqual(proposals.call_count, 1)
+        self.assertIn("malformed review contract", document["errors"])
+
+    def test_invalid_independent_proposal_still_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("invalid-independent", language="en")
+        source = "I need to benchmark a different chain."
+        primary = [{
+            "unit_id": "unit-primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "no safe route selected",
+        }]
+        secondary = [{
+            "unit_id": "unit-secondary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "candidate chain request",
+        }]
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                side_effect=[
+                    (primary, (), (101,)),
+                    (secondary, (), (102,)),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_partition",
+                side_effect=[
+                    (("invalid primary review",), (201, 202), frozenset(), False),
+                    (("invalid secondary review",), (203, 204), frozenset(), False),
+                ],
+            ),
+        ):
+            document = begin_semantic_partition(state, source)
+
+        self.assertEqual(document["status"], "failed")
+        self.assertIn("invalid primary review", document["errors"])
+        self.assertIn("invalid secondary review", document["errors"])
 
     def test_stage_a_admission_repairs_only_malformed_contract_output(
         self,
