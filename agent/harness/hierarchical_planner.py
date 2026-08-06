@@ -1384,6 +1384,12 @@ def _select_stage_a_proposal(
         "pending_typed_candidates": list(
             stage_a_payload.get("pending_typed_candidates") or []
         ),
+        "contract_proven_pending_entailment_unit_ids": list(
+            stage_a_payload.get(
+                "contract_proven_pending_entailment_unit_ids"
+            )
+            or []
+        ),
         "contract_proven_pending_prefixes": list(
             stage_a_payload.get("contract_proven_pending_prefixes") or []
         ),
@@ -3820,6 +3826,11 @@ def _stage_a_admission_prompt() -> str:
         "mutation, consultation, navigation, or analysis. If a demand is absent, return omitted and identify its declared "
         "owner/group route; use unresolved when no safe route can be identified. Do not accept "
         "planner reason text as evidence and never invent source text, ids, owners, or groups. "
+        "contract_proven_pending_entailment_unit_ids are exact unit ids whose "
+        "pending-answer meaning and typed value already reached quorum in the "
+        "specialized entailment jury. Treat those units as semantically complete "
+        "for pending entailment; continue to review their clause for omitted "
+        "sibling demands and do not use that proof for any other unit. "
         "When semantic_draft_resolutions is present, treat each row as the "
         "Harness-bound user clarification for that exact source DemandAtom. "
         "It may make that atom semantically complete, but it is not a new "
@@ -3877,16 +3888,42 @@ def _review_stage_a_candidate(
 ]:
     """Apply the one authoritative Stage A review pipeline to a proposal."""
 
+    review_payload = dict(stage_a_payload)
+    pending = dict(stage_a_payload.get("pending_question") or {})
+    pre_admission_entailment = (
+        str(pending.get("value_domain") or "") == "researched_identity"
+    )
+    pending_sizes: tuple[int, ...] = ()
+    if pre_admission_entailment:
+        pending_errors, pending_sizes, proven_pending_unit_ids = (
+            _review_stage_a_pending_entailment_detailed(
+                provider,
+                stage_a_payload,
+                partition,
+            )
+        )
+        if pending_errors:
+            return (
+                pending_errors,
+                pending_sizes,
+                frozenset(),
+                True,
+                (),
+            )
+        if proven_pending_unit_ids:
+            review_payload[
+                "contract_proven_pending_entailment_unit_ids"
+            ] = sorted(proven_pending_unit_ids)
     errors, sizes, redundant, contract_valid = _stage_a_review_result(
         _review_stage_a_partition(
             provider,
-            stage_a_payload,
+            review_payload,
             partition,
             include_contract_valid=True,
         )
     )
-    request_sizes = list(sizes)
-    if not errors:
+    request_sizes = [*pending_sizes, *sizes]
+    if not errors and not pre_admission_entailment:
         pending_errors, pending_sizes = _review_stage_a_pending_entailment(
             provider,
             stage_a_payload,
@@ -4093,6 +4130,23 @@ def _review_stage_a_pending_entailment(
 ) -> tuple[tuple[str, ...], tuple[int, ...]]:
     """Require quorum before a semantic, non-literal pending claim is selectable."""
 
+    errors, sizes, _proven_unit_ids = (
+        _review_stage_a_pending_entailment_detailed(
+            provider,
+            stage_a_payload,
+            partition,
+        )
+    )
+    return errors, sizes
+
+
+def _review_stage_a_pending_entailment_detailed(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]:
+    """Return quorum failures and exact pending units proven by the jury."""
+
     pending = dict(stage_a_payload.get("pending_question") or {})
     if (
         not pending
@@ -4100,7 +4154,7 @@ def _review_stage_a_pending_entailment(
         or stage_a_payload.get("contract_proven_pending_prefixes")
         or stage_a_payload.get("pending_typed_candidates")
     ):
-        return (), ()
+        return (), (), frozenset()
     claims = [
         {
             "unit_id": str(unit.get("unit_id") or ""),
@@ -4111,11 +4165,12 @@ def _review_stage_a_pending_entailment(
         if str(unit.get("operation") or "") == "pending_answer"
     ]
     if not claims:
-        return (), ()
+        return (), (), frozenset()
 
     prompt = _pending_entailment_prompt()
     request_sizes: list[int] = []
     errors: list[str] = []
+    proven_unit_ids: set[str] = set()
     for claim in claims:
         claim_payload = {
             "pending_question": pending,
@@ -4192,7 +4247,9 @@ def _review_stage_a_pending_entailment(
                 "Stage A pending-answer entailment quorum rejected unit: "
                 f"{claim['unit_id']}"
             )
-    return tuple(errors), tuple(request_sizes)
+        else:
+            proven_unit_ids.add(claim["unit_id"])
+    return tuple(errors), tuple(request_sizes), frozenset(proven_unit_ids)
 
 
 def _review_stage_a_partition_detailed(
@@ -4326,6 +4383,23 @@ def _validate_stage_a_admission_document(
     contract_errors: list[str] = []
     semantic_errors: list[str] = []
     redundant_unit_ids: set[str] = set()
+    proven_pending_unit_ids = {
+        str(unit_id)
+        for unit_id in stage_a_payload.get(
+            "contract_proven_pending_entailment_unit_ids"
+        )
+        or ()
+        if str(unit_id)
+    }
+    partition_unit_ids = {
+        str(unit.get("unit_id") or "")
+        for unit in partition
+        if str(unit.get("unit_id") or "")
+    }
+    if not proven_pending_unit_ids.issubset(partition_unit_ids):
+        contract_errors.append(
+            "Stage A admission references an unknown proven pending unit"
+        )
     if not isinstance(document, Mapping) or set(document) != {
         "unit_verdicts",
         "clause_verdicts",
@@ -4399,6 +4473,8 @@ def _validate_stage_a_admission_document(
             )
         elif (
             verdict == "unresolved"
+            and str(row.get("unit_id") or "")
+            not in proven_pending_unit_ids
             and unit_operations.get(str(row.get("unit_id") or ""))
             not in {"context", "unresolved"}
         ):
@@ -4450,13 +4526,27 @@ def _validate_stage_a_admission_document(
             and str(unit.get("operation") or "") == "unresolved"
             for unit in partition
         )
+        clause_actionable_unit_ids = {
+            str(unit.get("unit_id") or "")
+            for unit in partition
+            if str(unit.get("clause_id") or "") == clause_id
+            and str(unit.get("operation") or "")
+            not in {"context", "unresolved"}
+        }
+        clause_is_fully_proven_pending = bool(clause_actionable_unit_ids) and (
+            clause_actionable_unit_ids.issubset(proven_pending_unit_ids)
+        )
         if verdict == "omitted":
             semantic_errors.append(
                 f"Stage A admission found {verdict or 'invalid'} demand in "
                 f"{row.get('clause_id')}"
             )
         elif verdict == "unresolved" and (
-            not clause_has_declared_unresolved or routes
+            (
+                not clause_has_declared_unresolved
+                and not clause_is_fully_proven_pending
+            )
+            or routes
         ):
             semantic_errors.append(
                 "Stage A admission returned an unresolved clause without an "

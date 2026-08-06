@@ -7921,6 +7921,175 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 3)
 
+    def test_pending_entailment_quorum_precedes_generic_stage_a_review(self) -> None:
+        from agent.harness.hierarchical_planner import _review_stage_a_candidate
+
+        payload = {
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Use AuroraEdge Testnet as the final chain name.",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_identity",
+            }],
+        }]
+
+        def coverage_review(_provider, reviewed_payload, _partition, **_kwargs):
+            self.assertEqual(
+                reviewed_payload[
+                    "contract_proven_pending_entailment_unit_ids"
+                ],
+                ["unit-1"],
+            )
+            return (), (400,), frozenset(), True
+
+        with patch(
+            "agent.harness.hierarchical_planner."
+            "_review_stage_a_pending_entailment_detailed",
+            return_value=((), (100, 200, 300), frozenset({"unit-1"})),
+        ), patch(
+            "agent.harness.hierarchical_planner._review_stage_a_partition",
+            side_effect=coverage_review,
+        ):
+            errors, sizes, redundant, contract_valid, rejected = (
+                _review_stage_a_candidate(object(), payload, partition)
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, (100, 200, 300, 400))
+        self.assertEqual(redundant, frozenset())
+        self.assertTrue(contract_valid)
+        self.assertEqual(rejected, ())
+
+    def test_proven_pending_unit_cannot_mask_unresolved_sibling(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_stage_a_admission_document,
+        )
+
+        clause = {
+            "clause_id": "clause-1",
+            "text": "Use AuroraEdge Testnet and change QPS.",
+            "input_shape": "prose",
+        }
+        payload = {
+            "clauses": [clause],
+            "groups": [
+                {"owner": "chain_rpc", "name": "chain_identity"},
+                {"owner": "performance", "name": "qps_profile"},
+            ],
+            "contract_proven_pending_entailment_unit_ids": ["unit-1"],
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "operation": "domain_request",
+            },
+        ]
+        response = json.dumps({
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "generic reviewer rejudged the proven answer",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "the sibling remains unresolved",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "unresolved",
+                "omitted_owner_routes": [],
+                "reason": "one sibling remains unresolved",
+            }],
+            "reason": "reviewed",
+        })
+
+        contract_errors, semantic_errors, _redundant = (
+            _validate_stage_a_admission_document(
+                response,
+                payload,
+                partition,
+            )
+        )
+
+        self.assertEqual(contract_errors, ())
+        self.assertTrue(
+            any("unit-2" in error for error in semantic_errors),
+            semantic_errors,
+        )
+        self.assertTrue(
+            any("clause-1" in error for error in semantic_errors),
+            semantic_errors,
+        )
+
+    def test_generic_stage_a_cannot_veto_proven_pending_entailment(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_stage_a_admission_document,
+        )
+
+        payload = {
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Use AuroraEdge Testnet as the final chain name.",
+                "input_shape": "prose",
+            }],
+            "groups": [
+                {"owner": "chain_rpc", "name": "chain_identity"},
+            ],
+            "contract_proven_pending_entailment_unit_ids": ["unit-1"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "operation": "pending_answer",
+        }]
+        response = json.dumps({
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "unresolved",
+                "supports_unit_id": "",
+                "reason": "generic reviewer rejudged the proven answer",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "unresolved",
+                "omitted_owner_routes": [],
+                "reason": "generic reviewer rejudged the proven answer",
+            }],
+            "reason": "reviewed",
+        })
+
+        contract_errors, semantic_errors, _redundant = (
+            _validate_stage_a_admission_document(
+                response,
+                payload,
+                partition,
+            )
+        )
+
+        self.assertEqual(contract_errors, ())
+        self.assertEqual(semantic_errors, ())
+
     def test_researched_identity_rejects_value_absent_from_source(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_stage_a_pending_entailment,
