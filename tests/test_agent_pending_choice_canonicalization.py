@@ -1518,6 +1518,13 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             ),
             ("eth_accounts",),
         )
+        self.assertEqual(
+            typed_pending_value_candidates(
+                "The custom RPC method name is eth_blockNumber.",
+                method_question,
+            ),
+            ("eth_blockNumber",),
+        )
         evidence = (
             "I only have the request example so far:\n"
             '{"jsonrpc":"2.0","id":1,"method":"getLatestBlock","params":[]}'
@@ -1549,6 +1556,54 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 scalar_question,
             ),
             (),
+        )
+
+    def test_manual_rpc_method_prose_has_one_immutable_turn_candidate(self) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import _freeze_bounded_semantic_plan
+
+        text = "The custom RPC method name is eth_blockNumber."
+        clauses = tuple(segment_user_turn(text))
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "value_domain": "typed_value",
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+        }
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "eth_blockNumber",
+                "source_evidence": "eth_blockNumber",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "the source answers the active method question",
+            }],
+        })
+
+        plan = _freeze_bounded_semantic_plan(candidate, state, clauses)
+
+        self.assertEqual(
+            plan.request_payload()["actions"][0]["turn_pending_value_candidates"],
+            [{
+                "candidate_id": "turn-candidate-0",
+                "identity": "scalar:eth_blockNumber",
+                "source_unit_ids": ["unit-1"],
+                "value": "eth_blockNumber",
+            }],
         )
 
 

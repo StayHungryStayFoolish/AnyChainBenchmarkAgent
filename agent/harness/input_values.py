@@ -344,14 +344,23 @@ def extract_rpc_method_token_candidates(value: Any) -> list[str]:
         candidate = normalize_scalar(f"{verb.upper()} {path}")
         if looks_like_rest_method_identity(candidate) and candidate not in methods:
             methods.append(candidate)
-    separated = re.findall(
+    separated_matches = list(re.finditer(
         r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*(?:[._:][A-Za-z0-9]+)+)(?![A-Za-z0-9])",
         text,
-    )
+    ))
+    separated = [match.group(1) for match in separated_matches]
     camel_case = [
-        token
-        for token in re.findall(r"(?<![A-Za-z0-9])([a-z][A-Za-z0-9]{2,127})(?![A-Za-z0-9])", text)
-        if re.search(r"[a-z][A-Z]", token)
+        match.group(1)
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9])([a-z][A-Za-z0-9]{2,127})(?![A-Za-z0-9])",
+            text,
+        )
+        if re.search(r"[a-z][A-Z]", match.group(1))
+        and not any(
+            match.start(1) < separated_match.end(1)
+            and separated_match.start(1) < match.end(1)
+            for separated_match in separated_matches
+        )
     ]
     for token in (*separated, *camel_case):
         candidate = normalize_scalar(token)
