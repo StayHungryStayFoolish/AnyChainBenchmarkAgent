@@ -49,6 +49,7 @@ from .semantic_admission import (
     _admitted_action_queue,
     _review_bounded_semantic_candidate,
     _semantic_fulfillment_prompt,
+    _strip_candidate_admission_metadata,
     _unresolved_action_queue,
     prepare_hierarchical_candidate,
 )
@@ -1930,20 +1931,22 @@ def review_semantic_plan(
         for unit_id in candidate.get("semantic_support_unit_ids") or ()
         if str(unit_id)
     )
-    candidate_text, validation = prepare_hierarchical_candidate(
-        json.dumps(candidate, ensure_ascii=False, sort_keys=True),
-        state,
-        clauses,
-        pending_choice_unit_ids=frozenset(
-            str(unit["unit_id"])
-            for unit in source_partition
-            if str(unit.get("operation") or "") == "pending_answer"
-        ),
-        semantic_support_unit_ids=frozenset(
-            str(unit_id)
-            for unit_id in candidate.get("semantic_support_unit_ids") or ()
-            if str(unit_id)
-        ),
+    candidate, candidate_text, validation = (
+        _prepare_candidate_with_normalized_conflict_projection(
+            candidate,
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset(
+                str(unit["unit_id"])
+                for unit in source_partition
+                if str(unit.get("operation") or "") == "pending_answer"
+            ),
+            semantic_support_unit_ids=frozenset(
+                str(unit_id)
+                for unit_id in candidate.get("semantic_support_unit_ids") or ()
+                if str(unit_id)
+            ),
+        )
     )
     if not validation.valid:
         if validation.unresolved_units and not validation.errors:
@@ -5868,6 +5871,73 @@ def _project_unresolved_mutation_conflicts(
         if str(unit_id) not in unresolved_ids
     ]
     return output
+
+
+def _prepare_candidate_with_normalized_conflict_projection(
+    candidate: Mapping[str, Any],
+    state: AgentGraphState,
+    clauses: tuple[TurnClause, ...],
+    *,
+    pending_choice_unit_ids: frozenset[str],
+    semantic_support_unit_ids: frozenset[str],
+) -> tuple[dict[str, Any], str, PlanCoverageResult]:
+    """Recheck mutation conflicts after pending actions are canonicalized.
+
+    A manual ``answer_pending`` can become its registry-declared owner mutation
+    only during candidate preparation.  Conflict detection before that
+    normalization cannot see a competing sibling of the same mutation family.
+    Project such conflicts to unresolved semantic units, discard identities
+    derived from the old action set, and run the normal preparation boundary
+    again so durable drafts receive a self-consistent candidate transaction.
+    """
+
+    candidate_text, validation = prepare_hierarchical_candidate(
+        json.dumps(candidate, ensure_ascii=False, sort_keys=True),
+        state,
+        clauses,
+        pending_choice_unit_ids=pending_choice_unit_ids,
+        semantic_support_unit_ids=semantic_support_unit_ids,
+    )
+    try:
+        normalized = json.loads(candidate_text)
+    except json.JSONDecodeError:
+        return dict(candidate), candidate_text, validation
+    if not isinstance(normalized, dict):
+        return dict(candidate), candidate_text, validation
+    if not validation.valid:
+        return normalized, candidate_text, validation
+    actions = normalized.get("actions")
+    if not isinstance(actions, list) or not all(
+        isinstance(action, Mapping) for action in actions
+    ):
+        return normalized, candidate_text, validation
+    if not mutation_conflict_action_groups(tuple(
+        dict(action) for action in actions
+    )):
+        return normalized, candidate_text, validation
+
+    projected = _strip_candidate_admission_metadata(
+        _project_unresolved_mutation_conflicts(normalized)
+    )
+    projected_support_ids = frozenset(
+        str(unit_id)
+        for unit_id in projected.get("semantic_support_unit_ids") or ()
+        if str(unit_id)
+    )
+    projected_text, projected_validation = prepare_hierarchical_candidate(
+        json.dumps(projected, ensure_ascii=False, sort_keys=True),
+        state,
+        clauses,
+        pending_choice_unit_ids=pending_choice_unit_ids,
+        semantic_support_unit_ids=projected_support_ids,
+    )
+    try:
+        prepared_projection = json.loads(projected_text)
+    except json.JSONDecodeError:
+        prepared_projection = projected
+    if not isinstance(prepared_projection, dict):
+        prepared_projection = projected
+    return prepared_projection, projected_text, projected_validation
 
 
 def _bind_semantic_draft_resolution_evidence(

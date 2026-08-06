@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from typing import Any, Mapping
 
 from ..llm.types import ReasoningMode
@@ -488,6 +489,23 @@ def _reset_candidate_action_ids(text: str) -> str:
     return _prepare_untrusted_action_document(
         json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
+
+
+def _strip_candidate_admission_metadata(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove action-set-derived metadata before candidate revalidation.
+
+    Pending canonicalization and conflict projection may change action indexes
+    after an initial structural pass.  Every admission identity and indexed
+    receipt belongs to the old action set and must be derived again from the
+    projected semantic units rather than remapped by a downstream consumer.
+    """
+
+    stripped = deepcopy(dict(payload))
+    for key in _ADMISSION_RECEIPT_KEYS:
+        stripped.pop(key, None)
+    return stripped
 
 
 def _mark_pending_owner_candidates(

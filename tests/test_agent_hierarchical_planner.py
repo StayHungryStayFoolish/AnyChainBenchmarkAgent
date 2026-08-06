@@ -9352,6 +9352,176 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(projected["semantic_support_unit_ids"], [])
 
+    def test_pending_normalization_projects_late_mutation_conflict_to_draft_atoms(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _prepare_candidate_with_normalized_conflict_projection,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.queue import mutation_conflict_action_groups
+        from agent.harness.state import new_state
+
+        state = new_state("normalized-chain-conflict", language="en")
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "id": "chain",
+            "group": "chain_identity",
+            "kind": "chain",
+            "owner": "chain_rpc",
+            "manual_input_allowed": True,
+            "value_domain": "researched_identity",
+            "manual_action": {
+                "type": "choose_chain",
+                "value_argument": "chain_text",
+            },
+            "options": [],
+        }
+        clauses = (
+            TurnClause(
+                "clause-1",
+                "I need a fake-node benchmark for AuroraEdge.",
+                "prose",
+            ),
+            TurnClause(
+                "clause-2",
+                "Actually, the final chain name is AuroraEdge Testnet.",
+                "prose",
+            ),
+            TurnClause(
+                "clause-3",
+                "Use a custom mixed RPC workload.",
+                "prose",
+            ),
+        )
+        candidate = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "target_mode_explicit": True,
+                "source_evidence": "fake-node",
+            }, {
+                "type": "choose_chain",
+                "chain_text": "AuroraEdge",
+                "source_evidence": "AuroraEdge",
+            }, {
+                "type": "answer_pending",
+                "answer": "AuroraEdge Testnet",
+                "source_evidence": "AuroraEdge Testnet",
+            }, {
+                "type": "set_rpc_mode",
+                "rpc_mode": "mixed",
+                "mutation_explicit": True,
+                "source_evidence": "mixed",
+            }, {
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": "custom mixed RPC workload",
+            }],
+            "semantic_units": [{
+                "unit_id": "target-mode",
+                "clause_id": "clause-1",
+                "start": 0,
+                "end": 44,
+                "source_text": "I need a fake-node benchmark for AuroraEdge.",
+                "parent_unit_id": "mode-and-chain",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "target mode",
+            }, {
+                "unit_id": "initial-chain",
+                "clause_id": "clause-1",
+                "start": 0,
+                "end": 44,
+                "source_text": "I need a fake-node benchmark for AuroraEdge.",
+                "parent_unit_id": "mode-and-chain",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "disposition": "action",
+                "action_indexes": [1],
+                "reason": "initial chain",
+            }, {
+                "unit_id": "final-chain",
+                "clause_id": "clause-2",
+                "start": 0,
+                "end": 54,
+                "source_text": (
+                    "Actually, the final chain name is AuroraEdge Testnet."
+                ),
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "chain_identity",
+                }],
+                "disposition": "action",
+                "action_indexes": [2],
+                "reason": "manual pending answer",
+            }, {
+                "unit_id": "rpc-mode",
+                "clause_id": "clause-3",
+                "start": 0,
+                "end": 32,
+                "source_text": "Use a custom mixed RPC workload.",
+                "parent_unit_id": "custom-workload",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "workload_rpc",
+                }],
+                "disposition": "action",
+                "action_indexes": [3],
+                "reason": "RPC mode",
+            }, {
+                "unit_id": "rpc-catalog",
+                "clause_id": "clause-3",
+                "start": 0,
+                "end": 32,
+                "source_text": "Use a custom mixed RPC workload.",
+                "parent_unit_id": "custom-workload",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "endpoint_process",
+                }],
+                "disposition": "action",
+                "action_indexes": [4],
+                "reason": "custom RPC catalog",
+            }],
+        }
+
+        projected, _text, validation = (
+            _prepare_candidate_with_normalized_conflict_projection(
+                candidate,
+                state,
+                clauses,
+                pending_choice_unit_ids=frozenset({"final-chain"}),
+                semantic_support_unit_ids=frozenset(),
+            )
+        )
+
+        self.assertFalse(validation.valid)
+        self.assertEqual(validation.errors, ())
+        self.assertEqual(
+            [action["type"] for action in projected["actions"]],
+            ["choose_target_mode", "set_rpc_mode", "rpc_catalog_command"],
+        )
+        self.assertEqual(
+            mutation_conflict_action_groups(tuple(projected["actions"])),
+            (),
+        )
+        self.assertEqual(
+            [unit["unit_id"] for unit in validation.unresolved_units],
+            ["initial-chain", "final-chain"],
+        )
+        self.assertEqual(
+            len(projected.get("admission_action_ids") or []),
+            len(projected["actions"]),
+        )
+        self.assertNotIn("pending_choice_contracts", projected)
+
     def test_stage_a_admission_can_bind_manual_value_scope_to_candidate(
         self,
     ) -> None:
