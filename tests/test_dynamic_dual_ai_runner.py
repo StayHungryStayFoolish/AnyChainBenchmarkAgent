@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -3504,6 +3505,35 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
         self.assertEqual(response, "Agent> complete")
         self.assertLessEqual(len(transport._stderr_buffer), transport._stderr_cap_bytes)
+
+    def test_container_bridge_partial_frame_obeys_response_deadline(self) -> None:
+        program = (
+            "import sys,time\n"
+            "for _line in sys.stdin:\n"
+            " sys.stdout.write('{\"ok\":'); sys.stdout.flush()\n"
+            " time.sleep(30)\n"
+        )
+        transport = ContainerPtyBridgeTransport(
+            (sys.executable, "-c", program),
+            cwd=Path.cwd(),
+            poll_interval_seconds=0.01,
+        )
+        transport.start(env=dict(os.environ))
+        process = transport._process
+        assert process is not None and process.stdout is not None
+        started = time.monotonic()
+        try:
+            self.assertFalse(os.get_blocking(process.stdout.fileno()))
+            with self.assertRaisesRegex(TimeoutError, "container PTY bridge"):
+                transport._request(
+                    {"op": "read", "timeout_seconds": 30},
+                    timeout_seconds=0.1,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            if process.poll() is None:
+                transport._terminate_process_group(process)
+            transport.close()
 
 
 if __name__ == "__main__":

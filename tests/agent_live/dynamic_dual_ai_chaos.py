@@ -1602,6 +1602,9 @@ class ContainerPtyBridgeTransport:
             start_new_session=True,
             close_fds=True,
         )
+        if self._process.stdout is None:
+            raise RuntimeError("container PTY bridge stdout is unavailable")
+        os.set_blocking(self._process.stdout.fileno(), False)
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
             args=(self._process,),
@@ -1743,7 +1746,10 @@ class ContainerPtyBridgeTransport:
             )
             if not ready:
                 continue
-            chunk = os.read(process.stdout.fileno(), 65536)
+            try:
+                chunk = os.read(process.stdout.fileno(), 65536)
+            except (BlockingIOError, InterruptedError):
+                continue
             if not chunk:
                 continue
             self._stdout_buffer.extend(chunk)
