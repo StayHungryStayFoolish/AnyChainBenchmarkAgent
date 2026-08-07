@@ -2284,13 +2284,19 @@ def _turn_clauses(
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     pending = dict(state.get("pending_question") or {})
     validation = dict(pending.get("validation") or {})
+    segmented = segment_user_turn(raw)
+    has_contract_option_prefix = bool(pending.get("options")) and any(
+        exact_option_prefix_answer(clause.text, pending)[0]
+        for clause in segmented
+    )
     if (
         raw
         and pending.get("manual_input_allowed") is True
         and str(validation.get("value_type") or "") == "evidence_contribution"
+        and not has_contract_option_prefix
     ):
         return (TurnClause("clause-1", raw, "structured"),)
-    return segment_user_turn(raw)
+    return segmented
 
 
 def _stage_a_prompt() -> str:
@@ -3868,6 +3874,11 @@ def _stage_a_admission_prompt() -> str:
         "specialized entailment jury. Treat those units as semantically complete "
         "for pending entailment; continue to review their clause for omitted "
         "sibling demands and do not use that proof for any other unit. "
+        "contract_rejected_pending_entailment_unit_ids are exact pending-answer "
+        "units that failed the specialized jury. Such a unit may be redundant "
+        "only when its supports_unit_id names another complete unit in "
+        "contract_proven_pending_entailment_unit_ids; otherwise keep it "
+        "unresolved. This relation never authorizes last-value-wins. "
         "When semantic_draft_resolutions is present, treat each row as the "
         "Harness-bound user clarification for that exact source DemandAtom. "
         "It may make that atom semantically complete, but it is not a new "
@@ -3931,26 +3942,29 @@ def _review_stage_a_candidate(
         str(pending.get("value_domain") or "") == "researched_identity"
     )
     pending_sizes: tuple[int, ...] = ()
+    pending_errors: tuple[str, ...] = ()
+    rejected_pending_unit_ids: frozenset[str] = frozenset()
     if pre_admission_entailment:
-        pending_errors, pending_sizes, proven_pending_unit_ids = (
+        (
+            pending_errors,
+            pending_sizes,
+            proven_pending_unit_ids,
+            rejected_pending_unit_ids,
+        ) = (
             _review_stage_a_pending_entailment_detailed(
                 provider,
                 stage_a_payload,
                 partition,
             )
         )
-        if pending_errors:
-            return (
-                pending_errors,
-                pending_sizes,
-                frozenset(),
-                True,
-                (),
-            )
         if proven_pending_unit_ids:
             review_payload[
                 "contract_proven_pending_entailment_unit_ids"
             ] = sorted(proven_pending_unit_ids)
+        if rejected_pending_unit_ids:
+            review_payload[
+                "contract_rejected_pending_entailment_unit_ids"
+            ] = sorted(rejected_pending_unit_ids)
     errors, sizes, redundant, contract_valid = _stage_a_review_result(
         _review_stage_a_partition(
             provider,
@@ -3960,6 +3974,14 @@ def _review_stage_a_candidate(
         )
     )
     request_sizes = [*pending_sizes, *sizes]
+    if pre_admission_entailment:
+        required_rejections = rejected_pending_unit_ids - redundant
+        pending_errors = tuple(
+            "Stage A pending-answer entailment quorum rejected unit: "
+            f"{unit_id}"
+            for unit_id in sorted(required_rejections)
+        )
+        errors = tuple(dict.fromkeys((*errors, *pending_errors)))
     if not errors and not pre_admission_entailment:
         pending_errors, pending_sizes = _review_stage_a_pending_entailment(
             provider,
@@ -4167,7 +4189,7 @@ def _review_stage_a_pending_entailment(
 ) -> tuple[tuple[str, ...], tuple[int, ...]]:
     """Require quorum before a semantic, non-literal pending claim is selectable."""
 
-    errors, sizes, _proven_unit_ids = (
+    errors, sizes, _proven_unit_ids, _rejected_unit_ids = (
         _review_stage_a_pending_entailment_detailed(
             provider,
             stage_a_payload,
@@ -4181,7 +4203,12 @@ def _review_stage_a_pending_entailment_detailed(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
-) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    frozenset[str],
+    frozenset[str],
+]:
     """Return quorum failures and exact pending units proven by the jury."""
 
     pending = dict(stage_a_payload.get("pending_question") or {})
@@ -4191,7 +4218,7 @@ def _review_stage_a_pending_entailment_detailed(
         or stage_a_payload.get("contract_proven_pending_prefixes")
         or stage_a_payload.get("pending_typed_candidates")
     ):
-        return (), (), frozenset()
+        return (), (), frozenset(), frozenset()
     claims = [
         {
             "unit_id": str(unit.get("unit_id") or ""),
@@ -4202,12 +4229,13 @@ def _review_stage_a_pending_entailment_detailed(
         if str(unit.get("operation") or "") == "pending_answer"
     ]
     if not claims:
-        return (), (), frozenset()
+        return (), (), frozenset(), frozenset()
 
     prompt = _pending_entailment_prompt()
     request_sizes: list[int] = []
     errors: list[str] = []
     proven_unit_ids: set[str] = set()
+    rejected_unit_ids: set[str] = set()
     for claim in claims:
         claim_payload = {
             "pending_question": pending,
@@ -4280,13 +4308,19 @@ def _review_stage_a_pending_entailment_detailed(
                         continue
             answer_votes[selected_identity] += 1
         if max(answer_votes.values(), default=0) < 2:
+            rejected_unit_ids.add(claim["unit_id"])
             errors.append(
                 "Stage A pending-answer entailment quorum rejected unit: "
                 f"{claim['unit_id']}"
             )
         else:
             proven_unit_ids.add(claim["unit_id"])
-    return tuple(errors), tuple(request_sizes), frozenset(proven_unit_ids)
+    return (
+        tuple(errors),
+        tuple(request_sizes),
+        frozenset(proven_unit_ids),
+        frozenset(rejected_unit_ids),
+    )
 
 
 def _review_stage_a_partition_detailed(
@@ -4312,6 +4346,18 @@ def _review_stage_a_partition_detailed(
         "contract_proven_semantic_draft_resolution": dict(
             stage_a_payload.get("contract_proven_semantic_draft_resolution")
             or {}
+        ),
+        "contract_proven_pending_entailment_unit_ids": list(
+            stage_a_payload.get(
+                "contract_proven_pending_entailment_unit_ids"
+            )
+            or []
+        ),
+        "contract_rejected_pending_entailment_unit_ids": list(
+            stage_a_payload.get(
+                "contract_rejected_pending_entailment_unit_ids"
+            )
+            or []
         ),
         "registered_semantic_value_domains": list(
             stage_a_payload.get("registered_semantic_value_domains") or []
@@ -4428,6 +4474,14 @@ def _validate_stage_a_admission_document(
         or ()
         if str(unit_id)
     }
+    rejected_pending_unit_ids = {
+        str(unit_id)
+        for unit_id in stage_a_payload.get(
+            "contract_rejected_pending_entailment_unit_ids"
+        )
+        or ()
+        if str(unit_id)
+    }
     partition_unit_ids = {
         str(unit.get("unit_id") or "")
         for unit in partition
@@ -4436,6 +4490,14 @@ def _validate_stage_a_admission_document(
     if not proven_pending_unit_ids.issubset(partition_unit_ids):
         contract_errors.append(
             "Stage A admission references an unknown proven pending unit"
+        )
+    if not rejected_pending_unit_ids.issubset(partition_unit_ids):
+        contract_errors.append(
+            "Stage A admission references an unknown rejected pending unit"
+        )
+    if proven_pending_unit_ids & rejected_pending_unit_ids:
+        contract_errors.append(
+            "Stage A admission pending entailment sets overlap"
         )
     if not isinstance(document, Mapping) or set(document) != {
         "unit_verdicts",
@@ -4650,6 +4712,18 @@ def _validate_stage_a_admission_document(
         ):
             contract_errors.append(
                 f"Stage A admission redundant unit has invalid support: {unit_id}"
+            )
+        if (
+            unit_id in rejected_pending_unit_ids
+            and (
+                unit_operations.get(unit_id) != "pending_answer"
+                or support_unit_id not in proven_pending_unit_ids
+                or unit_operations.get(support_unit_id) != "pending_answer"
+            )
+        ):
+            contract_errors.append(
+                "Stage A rejected pending unit is not redundant to a proven "
+                f"pending unit: {unit_id}"
             )
     return (
         tuple(dict.fromkeys(contract_errors)),

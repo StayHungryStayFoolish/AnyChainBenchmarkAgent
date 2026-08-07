@@ -5677,6 +5677,69 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(source[0]["operation"], "pending_answer")
 
+    def test_evidence_question_preserves_signed_option_prefix_and_siblings(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _turn_clauses
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-option-siblings", language="en")
+        state["pending_question"] = {
+            "id": "observed_sample_confirm",
+            "group": "endpoint_process",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "options": [
+                {"id": "yes", "value": True},
+                {"id": "no", "value": False},
+            ],
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+        }
+
+        clauses = _turn_clauses(
+            state,
+            "Yes. Keep the observed sample. Use real-node next.",
+        )
+
+        self.assertGreaterEqual(len(clauses), 2)
+        self.assertTrue(all(clause.input_shape == "prose" for clause in clauses))
+        self.assertEqual(clauses[0].text, "Yes.")
+
+    def test_evidence_question_without_option_prefix_remains_atomic(self) -> None:
+        from agent.harness.hierarchical_planner import _turn_clauses
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-without-option", language="en")
+        state["pending_question"] = {
+            "id": "schema_evidence",
+            "group": "endpoint_process",
+            "kind": "evidence",
+            "manual_input_allowed": True,
+            "options": [
+                {"id": "yes", "value": True},
+                {"id": "no", "value": False},
+            ],
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+        }
+        source = (
+            "Request follows:\n"
+            "```json\n"
+            '{"jsonrpc":"2.0","method":"net_version","params":[],"id":7}\n'
+            "```"
+        )
+
+        clauses = _turn_clauses(state, source)
+
+        self.assertEqual(len(clauses), 1)
+        self.assertEqual(clauses[0].input_shape, "structured")
+        self.assertEqual(clauses[0].text, source)
+
     @patch(
         "agent.harness.hierarchical_planner.request_semantic_compilation",
     )
@@ -8071,7 +8134,12 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         with patch(
             "agent.harness.hierarchical_planner."
             "_review_stage_a_pending_entailment_detailed",
-            return_value=((), (100, 200, 300), frozenset({"unit-1"})),
+            return_value=(
+                (),
+                (100, 200, 300),
+                frozenset({"unit-1"}),
+                frozenset(),
+            ),
         ), patch(
             "agent.harness.hierarchical_planner._review_stage_a_partition",
             side_effect=coverage_review,
@@ -8085,6 +8153,216 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(redundant, frozenset())
         self.assertTrue(contract_valid)
         self.assertEqual(rejected, ())
+
+    def test_researched_identity_allows_only_redundant_rejected_predecessor(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _review_stage_a_candidate
+
+        payload = {
+            "pending_question": {
+                "id": "resource_identity",
+                "group": "chain_identity",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [
+            {
+                "unit_id": "earlier-value",
+                "clause_id": "clause-1",
+                "source_text": "Northstar",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "chain_identity",
+                }],
+            },
+            {
+                "unit_id": "final-value",
+                "clause_id": "clause-2",
+                "source_text": "Use Northstar Testnet as the final value.",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "chain_identity",
+                }],
+            },
+        ]
+
+        def coverage_review(_provider, reviewed_payload, _partition, **_kwargs):
+            self.assertEqual(
+                reviewed_payload[
+                    "contract_proven_pending_entailment_unit_ids"
+                ],
+                ["final-value"],
+            )
+            return (), (400,), frozenset({"earlier-value"}), True
+
+        with patch(
+            "agent.harness.hierarchical_planner."
+            "_review_stage_a_pending_entailment_detailed",
+            return_value=(
+                (
+                    "Stage A pending-answer entailment quorum rejected unit: "
+                    "earlier-value",
+                ),
+                (100, 200, 300, 301, 302, 303),
+                frozenset({"final-value"}),
+                frozenset({"earlier-value"}),
+            ),
+        ), patch(
+            "agent.harness.hierarchical_planner._review_stage_a_partition",
+            side_effect=coverage_review,
+        ):
+            errors, _sizes, redundant, contract_valid, _rejected = (
+                _review_stage_a_candidate(object(), payload, partition)
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(redundant, frozenset({"earlier-value"}))
+        self.assertTrue(contract_valid)
+
+    def test_researched_identity_keeps_nonredundant_quorum_rejection(self) -> None:
+        from agent.harness.hierarchical_planner import _review_stage_a_candidate
+
+        payload = {
+            "pending_question": {
+                "id": "resource_identity",
+                "group": "chain_identity",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [{
+            "unit_id": "unproven-value",
+            "clause_id": "clause-1",
+            "source_text": "switch to something else",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_identity",
+            }],
+        }]
+
+        with patch(
+            "agent.harness.hierarchical_planner."
+            "_review_stage_a_pending_entailment_detailed",
+            return_value=(
+                (
+                    "Stage A pending-answer entailment quorum rejected unit: "
+                    "unproven-value",
+                ),
+                (100, 200, 300),
+                frozenset(),
+                frozenset({"unproven-value"}),
+            ),
+        ), patch(
+            "agent.harness.hierarchical_planner._review_stage_a_partition",
+            return_value=((), (400,), frozenset(), True),
+        ):
+            errors, _sizes, redundant, contract_valid, _rejected = (
+                _review_stage_a_candidate(object(), payload, partition)
+            )
+
+        self.assertEqual(
+            errors,
+            (
+                "Stage A pending-answer entailment quorum rejected unit: "
+                "unproven-value",
+            ),
+        )
+        self.assertEqual(redundant, frozenset())
+        self.assertTrue(contract_valid)
+
+    def test_rejected_identity_redundancy_must_support_proven_identity(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_stage_a_admission_document,
+        )
+
+        payload = {
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Replace one resource identity and keep another setting.",
+                "input_shape": "prose",
+            }],
+            "groups": [{"owner": "chain_rpc", "name": "chain_identity"}],
+            "contract_proven_pending_entailment_unit_ids": ["final-value"],
+            "contract_rejected_pending_entailment_unit_ids": ["old-value"],
+        }
+        partition = [
+            {
+                "unit_id": "old-value",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+            },
+            {
+                "unit_id": "final-value",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+            },
+            {
+                "unit_id": "unrelated-setting",
+                "clause_id": "clause-1",
+                "operation": "domain_request",
+            },
+        ]
+
+        def response(support: str) -> str:
+            return json.dumps({
+                "unit_verdicts": [
+                    {
+                        "unit_id": "old-value",
+                        "verdict": "redundant",
+                        "supports_unit_id": support,
+                        "reason": "the old value is superseded",
+                    },
+                    {
+                        "unit_id": "final-value",
+                        "verdict": "complete",
+                        "supports_unit_id": "",
+                        "reason": "the final identity is complete",
+                    },
+                    {
+                        "unit_id": "unrelated-setting",
+                        "verdict": "complete",
+                        "supports_unit_id": "",
+                        "reason": "the sibling setting is complete",
+                    },
+                ],
+                "clause_verdicts": [{
+                    "clause_id": "clause-1",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "all source demands are represented",
+                }],
+                "reason": "reviewed",
+            })
+
+        valid_contract, valid_semantics, redundant = (
+            _validate_stage_a_admission_document(
+                response("final-value"),
+                payload,
+                partition,
+            )
+        )
+        invalid_contract, _invalid_semantics, invalid_redundant = (
+            _validate_stage_a_admission_document(
+                response("unrelated-setting"),
+                payload,
+                partition,
+            )
+        )
+
+        self.assertEqual(valid_contract, ())
+        self.assertEqual(valid_semantics, ())
+        self.assertEqual(redundant, frozenset({"old-value"}))
+        self.assertTrue(
+            any("not redundant to a proven" in error for error in invalid_contract)
+        )
+        self.assertEqual(invalid_redundant, frozenset())
 
     def test_proven_pending_unit_cannot_mask_unresolved_sibling(self) -> None:
         from agent.harness.hierarchical_planner import (
