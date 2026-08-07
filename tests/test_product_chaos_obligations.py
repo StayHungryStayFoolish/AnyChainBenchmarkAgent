@@ -22,6 +22,8 @@ from tests.agent_live.formal_journey_catalog import (
 )
 from tests.agent_live.product_chaos_obligations import (
     PRODUCT_CHAOS_SEED,
+    _max_turns_for,
+    _witness_feasibility_contract,
     build_product_chaos_obligations,
     product_chaos_obligation_report,
     validate_product_chaos_obligations,
@@ -643,6 +645,62 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
             ValueError,
             "max_turns cannot witness its factors",
         ):
+            validate_product_chaos_obligations(rows, revision=REVISION)
+
+    def test_witness_plan_rejects_incompatible_fake_case2_before_execution(self) -> None:
+        factors = {
+            "workflow_mode": "fake",
+            "chain_case": "case2",
+            "subject_group": "accounts_disk",
+            "workload": "custom_mixed",
+            "evidence_shape": "split",
+            "input_shape": "contradictory",
+            "interruption_depth": "0",
+            "recovery": "jump",
+        }
+        plan = _witness_feasibility_contract(factors)
+        self.assertFalse(plan["compatible"])
+        self.assertTrue(plan["incompatibility_reasons"])
+        with self.assertRaisesRegex(ValueError, "incompatible terminal receipts"):
+            _max_turns_for(factors)
+        self.assertFalse(any(
+            row["factors"].get("workflow_mode") == "fake"
+            and row["factors"].get("chain_case") == "case2"
+            for row in self.rows
+        ))
+
+    def test_witness_plan_binds_receipts_and_conservative_case2_budget(self) -> None:
+        row = next(
+            item
+            for item in self.rows
+            if item["factors"].get("workflow_mode") == "real"
+            and item["factors"].get("chain_case") == "case2"
+            and item["factors"].get("workload") == "custom_mixed"
+        )
+        plan = row["simulator_contract"]["witness_feasibility"]
+        receipt_ids = {
+            item["receipt_id"] for item in plan["receipt_milestones"]
+        }
+        self.assertTrue(plan["compatible"])
+        self.assertIn("confirmed_case2_terminal_receipt", receipt_ids)
+        self.assertIn("mixed_weight_total_confirmation", receipt_ids)
+        self.assertGreaterEqual(plan["minimum_turns"], 16)
+        self.assertEqual(
+            row["simulator_contract"]["max_turns"],
+            plan["minimum_turns"] + plan["slack_turns"],
+        )
+
+    def test_validation_rejects_tampered_witness_milestone(self) -> None:
+        rows = copy.deepcopy(list(self.rows))
+        plan = rows[0]["simulator_contract"]["witness_feasibility"]
+        plan["receipt_milestones"].pop()
+        with self.assertRaisesRegex(ValueError, "witness feasibility drifted"):
+            validate_product_chaos_obligations(rows, revision=REVISION)
+
+        rows = copy.deepcopy(list(self.rows))
+        plan = rows[0]["simulator_contract"]["witness_feasibility"]
+        plan["receipt_milestones"][0]["turn_budget"] += 1
+        with self.assertRaisesRegex(ValueError, "witness feasibility drifted"):
             validate_product_chaos_obligations(rows, revision=REVISION)
 
     def test_validation_fails_closed_on_stale_revision(self) -> None:

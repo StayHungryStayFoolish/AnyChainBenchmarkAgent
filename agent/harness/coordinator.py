@@ -400,6 +400,10 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
                 resolution=safe_resolution,
                 resolution_hash=resolution_hash,
                 resolution_ref=resolution_ref,
+                resolution_disposition=str(
+                    action.arguments.get("resolution_disposition")
+                    or "semantic_value"
+                ),
             )
             resolved = resolve_semantic_draft_atom(
                 draft,
@@ -409,6 +413,7 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
                 resolution=command.resolution,
                 resolution_hash=command.resolution_hash,
                 resolution_ref=command.resolution_ref,
+                resolution_disposition=command.resolution_disposition,
             )
         except (TypeError, ValueError):
             return HandlerResult(
@@ -4645,6 +4650,7 @@ def _apply_handler_result(
                 resolution=command.resolution,
                 resolution_hash=command.resolution_hash,
                 resolution_ref=command.resolution_ref,
+                resolution_disposition=command.resolution_disposition,
             )
         elif command.operation == "cancel":
             if (

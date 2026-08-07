@@ -27,7 +27,8 @@ from .contracts import (
 from .plan_coverage import PlanCoverageResult
 
 
-SEMANTIC_DRAFT_CONTRACT_VERSION = 2
+SEMANTIC_DRAFT_CONTRACT_VERSION = 3
+_RESOLUTION_DISPOSITIONS = frozenset({"semantic_value", "background"})
 _TERMINAL_STATUSES = frozenset({"stale", "cancelled"})
 _OPEN_STATUSES = frozenset({"awaiting_clarification", "ready_for_review"})
 _WORKFLOW_PRECONDITION_ROOTS = (
@@ -189,6 +190,9 @@ def semantic_draft_atom_resolution_binding(
         "reason": str(atom.get("reason") or ""),
         "resolution_hash": str(atom.get("resolution_hash") or ""),
         "resolution_ref": str(atom.get("resolution_ref") or ""),
+        "resolution_disposition": str(
+            atom.get("resolution_disposition") or ""
+        ),
     }
     if not payload["draft_id"] or not atom_id or not _is_sha256(
         payload["resolution_hash"]
@@ -521,9 +525,22 @@ def validate_semantic_plan_draft(
         resolution = str(atom.get("resolution") or "")
         resolution_hash = str(atom.get("resolution_hash") or "")
         resolution_ref = str(atom.get("resolution_ref") or "")
+        resolution_disposition = str(
+            atom.get("resolution_disposition") or ""
+        )
         if bool(resolution) != bool(resolution_hash):
             raise ValueError(
                 "semantic plan draft atom resolution projection is incomplete"
+            )
+        if bool(resolution_hash) != bool(resolution_disposition):
+            raise ValueError(
+                "semantic plan draft atom resolution disposition is incomplete"
+            )
+        if resolution_disposition and (
+            resolution_disposition not in _RESOLUTION_DISPOSITIONS
+        ):
+            raise ValueError(
+                "semantic plan draft atom resolution disposition is invalid"
             )
         if resolution_hash and not _is_sha256(resolution_hash):
             raise ValueError(
@@ -735,6 +752,7 @@ def _validate_semantic_draft_lifecycle(
 
     atom_ids = [str(item.get("atom_id") or "") for item in atoms]
     resolution_hashes = {atom_id: "" for atom_id in atom_ids}
+    resolution_dispositions = {atom_id: "" for atom_id in atom_ids}
     expected_revision = 1
     terminal_status = ""
     for receipt in receipts[1:]:
@@ -760,7 +778,13 @@ def _validate_semantic_draft_lifecycle(
                 receipt.get("resolution_hash")
             ):
                 raise ValueError("semantic plan draft resolution order is invalid")
+            disposition = str(receipt.get("resolution_disposition") or "")
+            if disposition not in _RESOLUTION_DISPOSITIONS:
+                raise ValueError(
+                    "semantic plan draft resolution disposition is invalid"
+                )
             resolution_hashes[atom_id] = str(receipt["resolution_hash"])
+            resolution_dispositions[atom_id] = disposition
         elif event == "semantic_draft_previous_atom_selected":
             atom_id = str(receipt.get("atom_id") or "")
             if atom_id not in resolution_hashes:
@@ -768,6 +792,7 @@ def _validate_semantic_draft_lifecycle(
             start = atom_ids.index(atom_id)
             for item in atom_ids[start:]:
                 resolution_hashes[item] = ""
+                resolution_dispositions[item] = ""
         elif event == "semantic_draft_invalidated":
             reasons = [
                 str(item).strip()
@@ -792,6 +817,12 @@ def _validate_semantic_draft_lifecycle(
         expected_hash = resolution_hashes[atom_id]
         if resolution_hash != expected_hash:
             raise ValueError("semantic plan draft resolution does not match lifecycle")
+        if str(atom.get("resolution_disposition") or "") != (
+            resolution_dispositions[atom_id]
+        ):
+            raise ValueError(
+                "semantic plan draft resolution disposition does not match lifecycle"
+            )
     expected_status = terminal_status or (
         "ready_for_review"
         if all(resolution_hashes.values())
@@ -1009,6 +1040,9 @@ def build_semantic_draft_finalization_receipt(
         {
             "atom_id": str(item.get("atom_id") or ""),
             "resolution_hash": str(item.get("resolution_hash") or ""),
+            "resolution_disposition": str(
+                item.get("resolution_disposition") or ""
+            ),
         }
         for item in draft.get("unresolved_atoms") or ()
         if isinstance(item, Mapping)
@@ -1313,6 +1347,7 @@ def resolve_semantic_draft_atom(
     resolution: str,
     resolution_hash: str = "",
     resolution_ref: str = "",
+    resolution_disposition: str = "semantic_value",
 ) -> dict[str, Any]:
     """Resolve exactly one bound atom and select the next unresolved atom."""
 
@@ -1327,6 +1362,9 @@ def resolve_semantic_draft_atom(
     answer = str(redact(raw_answer)).strip()
     if not answer:
         raise ValueError("semantic draft resolution cannot be empty")
+    disposition = str(resolution_disposition or "")
+    if disposition not in _RESOLUTION_DISPOSITIONS:
+        raise ValueError("semantic draft resolution disposition is invalid")
     value_hash = str(resolution_hash or semantic_hash(raw_answer))
     if not _is_sha256(value_hash):
         raise ValueError("semantic draft resolution hash is invalid")
@@ -1345,6 +1383,7 @@ def resolve_semantic_draft_atom(
             atom["resolution"] = answer
             atom["resolution_hash"] = value_hash
             atom["resolution_ref"] = str(resolution_ref)
+            atom["resolution_disposition"] = disposition
             found = True
         atoms.append(atom)
     if not found:
@@ -1369,6 +1408,7 @@ def resolve_semantic_draft_atom(
                 "atom_id": atom_id,
                 "revision": next_revision,
                 "resolution_hash": value_hash,
+                "resolution_disposition": disposition,
             },
         ],
     })
@@ -1436,6 +1476,7 @@ def reopen_previous_semantic_draft_atom(
             atom["resolution"] = ""
             atom["resolution_hash"] = ""
             atom["resolution_ref"] = ""
+            atom["resolution_disposition"] = ""
         atoms.append(atom)
     next_revision = revision + 1
     draft.update({

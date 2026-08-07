@@ -142,6 +142,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
                 "contract_hash": request_payload["contract_hash"],
                 "verdict": "clarifies_atom",
                 "evidence_quote": request_payload["user_text"],
+                "resolution_disposition": "semantic_value",
                 "reason": "the complete turn replaces the active atom meaning",
             })
 
@@ -177,6 +178,144 @@ class SemanticPlanDraftTests(unittest.TestCase):
             [{"owner": "coordinator", "group": "opening"}],
         )
 
+    def test_bound_clarification_jury_authorizes_background_by_quorum(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        text = "Keep this only as background; it requires no action."
+        dispositions = iter(("background", "semantic_value", "background"))
+
+        def review(_provider, *, request_payload, **_kwargs):
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": request_payload["user_text"],
+                "resolution_disposition": next(dispositions),
+                "reason": "the source explicitly classifies the active atom",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(), state, text, segment_user_turn(text)
+                )
+            )
+
+        self.assertEqual(candidate["resolution_disposition"], "background")
+        self.assertEqual(receipt["clarifying_vote_count"], 2)
+        self.assertEqual(receipt["resolution_disposition"], "background")
+
+    def test_background_resolution_is_lifecycle_bound_and_tamper_evident(self) -> None:
+        draft = self._draft()
+        resolved = resolve_semantic_draft_atom(
+            draft,
+            draft_id=draft["draft_id"],
+            revision=draft["revision"],
+            atom_id=draft["active_atom_id"],
+            resolution="retain as non-executable context",
+            resolution_disposition="background",
+        )
+        atom = resolved["unresolved_atoms"][0]
+        self.assertEqual(atom["resolution_disposition"], "background")
+        self.assertEqual(
+            resolved["lifecycle_receipts"][-1]["resolution_disposition"],
+            "background",
+        )
+        tampered = deepcopy(resolved)
+        tampered["unresolved_atoms"][0]["resolution_disposition"] = (
+            "semantic_value"
+        )
+        with self.assertRaisesRegex(ValueError, "does not match lifecycle"):
+            validate_semantic_plan_draft(tampered)
+
+    def test_ready_background_atom_projects_to_supported_context(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _project_ready_semantic_draft_backgrounds,
+        )
+
+        source = {
+            "unit_id": "unit-background",
+            "clause_id": "clause-1",
+            "source_path": "",
+            "source_text": "Keep the handoff as background.",
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "meaning was unresolved",
+        }
+        payload = {
+            "semantic_draft_resolutions": [{
+                "atom_id": "atom-background",
+                "unit_id": source["unit_id"],
+                "clause_id": source["clause_id"],
+                "source_path": source["source_path"],
+                "source_text": source["source_text"],
+                "user_resolution": "no action is required",
+                "resolution_disposition": "background",
+            }],
+        }
+        projected, errors = _project_ready_semantic_draft_backgrounds(
+            [source], payload
+        )
+        self.assertFalse(errors)
+        self.assertEqual(projected[0]["operation"], "context")
+        self.assertEqual(projected[0]["owner_routes"], [])
+        self.assertIs(projected[0]["_admission_support"], True)
+
+    def test_model_authored_background_disposition_is_rejected(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bind_owner_semantic_draft_dispositions,
+        )
+
+        document = {
+            "actions": [{
+                "type": "resolve_semantic_draft_atom",
+                "draft_id": "draft-1",
+                "revision": 1,
+                "atom_id": "atom-1",
+                "resolution": "no action",
+                "resolution_disposition": "background",
+                "source_evidence": "no action",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "model output",
+            }],
+        }
+        payload = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "semantic_draft_resolution_disposition": "background",
+            }],
+        }
+        _bound, errors = _bind_owner_semantic_draft_dispositions(
+            document, payload
+        )
+        self.assertTrue(any("model-authored" in error for error in errors))
+
+        document["actions"][0].pop("resolution_disposition")
+        bound, errors = _bind_owner_semantic_draft_dispositions(
+            document, payload
+        )
+        self.assertFalse(errors)
+        self.assertEqual(
+            bound["actions"][0]["resolution_disposition"],
+            "background",
+        )
+
+    def test_old_semantic_draft_contract_version_fails_closed(self) -> None:
+        draft = self._draft()
+        draft["contract_version"] = 2
+        with self.assertRaisesRegex(ValueError, "unsupported contract version"):
+            validate_semantic_plan_draft(draft)
+
     def test_bound_clarification_jury_does_not_consume_unrelated_turn(self) -> None:
         from agent.harness.hierarchical_planner import (
             _bound_semantic_draft_resolution_partition,
@@ -192,6 +331,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
                 "contract_hash": request_payload["contract_hash"],
                 "verdict": "does_not_clarify",
                 "evidence_quote": request_payload["user_text"],
+                "resolution_disposition": "",
                 "reason": "this is an independent report request",
             })
 
@@ -239,6 +379,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
                 "contract_hash": request_payload["contract_hash"],
                 "verdict": "clarifies_atom",
                 "evidence_quote": quote,
+                "resolution_disposition": "semantic_value",
                 "reason": "the quoted span supplies the requested meaning",
             })
 
@@ -299,6 +440,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
                 "contract_hash": request_payload["contract_hash"],
                 "verdict": "clarifies_atom",
                 "evidence_quote": quote,
+                "resolution_disposition": "semantic_value",
                 "reason": "the quote appears to answer the active atom",
             })
 
@@ -1203,6 +1345,7 @@ class SemanticPlanDraftTests(unittest.TestCase):
             revision=draft["revision"],
             atom_id=first_atom,
             resolution="QPS profile",
+            resolution_disposition="background",
         )
         self.assertNotEqual(second["active_atom_id"], first_atom)
         question = _semantic_draft_question(second)
@@ -1268,6 +1411,9 @@ class SemanticPlanDraftTests(unittest.TestCase):
         )
         self.assertEqual(reopened["active_atom_id"], first_atom)
         self.assertFalse(reopened["unresolved_atoms"][0]["resolution"])
+        self.assertFalse(
+            reopened["unresolved_atoms"][0]["resolution_disposition"]
+        )
         cancelled = cancel_semantic_plan_draft(reopened, reason="user_cancelled")
         self.assertEqual(cancelled["status"], "cancelled")
 

@@ -7047,6 +7047,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         "contract_hash": payload["contract_hash"],
                         "verdict": "clarifies_atom",
                         "evidence_quote": payload["user_text"],
+                        "resolution_disposition": "semantic_value",
                         "reason": "the complete turn supplies the profile value",
                     }
                 elif "Stage A proposal convergence authority" in system:

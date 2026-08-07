@@ -1126,7 +1126,14 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "resolve_semantic_draft_atom",
         "coordinator",
         "Resolve exactly one pending semantic draft atom under its bound draft identity and revision.",
-        ("draft_id", "revision", "atom_id", "resolution", "source_evidence"),
+        (
+            "draft_id",
+            "revision",
+            "atom_id",
+            "resolution",
+            "resolution_disposition",
+            "source_evidence",
+        ),
         execution_phase=0,
         effect="workflow_state_mutation",
         crosses_pending_barrier=True,
@@ -2429,6 +2436,10 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "owner_revision": {"type": "integer", "minimum": 0},
     "atom_id": {"type": "string", "minLength": 1},
     "resolution": {"type": "string", "minLength": 1},
+    "resolution_disposition": {
+        "type": "string",
+        "enum": ["semantic_value", "background"],
+    },
     "reference": {
         "type": "string",
         "pattern": r"^semantic-secret:[A-Za-z0-9_-]+$",

@@ -19,6 +19,7 @@ RecoveryOperation = Literal["activate", "resolve"]
 NavigationOperation = Literal["change_group", "go_back"]
 WorkflowGoalOperation = Literal["enqueue", "remove_first"]
 SemanticDraftOperation = Literal["resolve", "cancel", "previous", "invalidate"]
+SemanticDraftResolutionDisposition = Literal["semantic_value", "background"]
 ActionEffect = Literal["pure", "read_only", "external"]
 SECRET_REFERENCE_RE = re.compile(r"semantic-secret:[A-Za-z0-9_-]+")
 ActionEnvelopeStatus = Literal[
@@ -183,6 +184,7 @@ class SemanticDraftCommand:
     resolution: str = ""
     resolution_hash: str = ""
     resolution_ref: str = ""
+    resolution_disposition: str = ""
     reason: str = ""
 
     def __post_init__(self) -> None:
@@ -192,6 +194,13 @@ class SemanticDraftCommand:
             not self.atom_id or not self.resolution.strip()
         ):
             raise ValueError("resolve semantic draft command requires atom and value")
+        if self.operation == "resolve" and self.resolution_disposition not in {
+            "semantic_value",
+            "background",
+        }:
+            raise ValueError(
+                "resolve semantic draft command requires a disposition"
+            )
         if self.operation == "resolve" and (
             len(self.resolution_hash) != 64
             or any(
@@ -608,6 +617,7 @@ class SemanticUnresolvedAtom:
     resolution: str = ""
     resolution_hash: str = ""
     resolution_ref: str = ""
+    resolution_disposition: str = ""
 
 
 @dataclass(frozen=True)
@@ -868,6 +878,9 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
                 "resolution": result.semantic_draft_command.resolution,
                 "resolution_hash": result.semantic_draft_command.resolution_hash,
                 "resolution_ref": result.semantic_draft_command.resolution_ref,
+                "resolution_disposition": (
+                    result.semantic_draft_command.resolution_disposition
+                ),
                 "reason": result.semantic_draft_command.reason,
             }
             if result.semantic_draft_command
@@ -990,6 +1003,9 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
                 ),
                 resolution_ref=str(
                     semantic_draft.get("resolution_ref") or ""
+                ),
+                resolution_disposition=str(
+                    semantic_draft.get("resolution_disposition") or ""
                 ),
                 reason=str(semantic_draft.get("reason") or ""),
             )

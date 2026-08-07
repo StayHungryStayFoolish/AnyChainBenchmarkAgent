@@ -195,13 +195,18 @@ def _semantic_draft_clarification_prompt() -> str:
     return (
         "You are an independent semantic-draft clarification reviewer for "
         "AnyChain Benchmark Agent. Return one strict JSON object with exactly "
-        "contract_hash, verdict, evidence_quote, and reason. verdict is one of "
+        "contract_hash, verdict, evidence_quote, resolution_disposition, and "
+        "reason. verdict is one of "
         "clarifies_atom, does_not_clarify, or uncertain. The active_atom is the "
         "exact unresolved demand currently shown to the user. Select "
         "clarifies_atom only when one exact contiguous span of the current user "
         "turn answers, corrects, replaces, supersedes, or explicitly declines "
         "that exact demand. Copy that complete span byte-for-byte into "
-        "evidence_quote. Do not include an independent sibling request in the "
+        "evidence_quote. resolution_disposition must be semantic_value when the "
+        "span supplies or changes the atom's meaning, and background when the "
+        "span explicitly establishes that the atom is retained context requiring "
+        "no product action. For does_not_clarify or uncertain use an empty "
+        "resolution_disposition. Do not include an independent sibling request in the "
         "quote; normal whole-turn routing must preserve every unquoted span. "
         "Select does_not_clarify or uncertain when no single exact source span "
         "is a complete clarification. Questions about the clarification prompt, "
@@ -290,11 +295,13 @@ def _review_bound_semantic_draft_clarification(
             "contract_hash",
             "verdict",
             "evidence_quote",
+            "resolution_disposition",
             "reason",
         }:
             return {}
         verdict = str(document.get("verdict") or "")
         quote = str(document.get("evidence_quote") or "")
+        disposition = str(document.get("resolution_disposition") or "")
         if (
             str(document.get("contract_hash") or "") != contract_hash
             or verdict not in {
@@ -305,6 +312,14 @@ def _review_bound_semantic_draft_clarification(
             or not str(document.get("reason") or "").strip()
             or not quote
             or quote not in user_text
+            or (
+                verdict == "clarifies_atom"
+                and disposition not in {"semantic_value", "background"}
+            )
+            or (
+                verdict != "clarifies_atom"
+                and disposition
+            )
             or (
                 verdict == "clarifies_atom"
                 and user_text.count(quote) != 1
@@ -323,21 +338,29 @@ def _review_bound_semantic_draft_clarification(
         ).encode("utf-8")
     )
     valid_reviews = [dict(item) for item in reviews if item]
-    clarifying_quotes = [
-        str(item.get("evidence_quote") or "")
+    clarifying_identities = [
+        (
+            str(item.get("evidence_quote") or ""),
+            str(item.get("resolution_disposition") or ""),
+        )
         for item in valid_reviews
         if str(item.get("verdict") or "") == "clarifies_atom"
     ]
-    quote_votes = {
-        quote: clarifying_quotes.count(quote)
-        for quote in set(clarifying_quotes)
+    identity_votes = {
+        identity: clarifying_identities.count(identity)
+        for identity in set(clarifying_identities)
     }
-    selected_quote = max(
-        quote_votes,
-        key=lambda quote: (quote_votes[quote], len(quote), quote),
-        default="",
+    selected_identity = max(
+        identity_votes,
+        key=lambda identity: (
+            identity_votes[identity],
+            len(identity[0]),
+            identity,
+        ),
+        default=("", ""),
     )
-    clarifying_votes = quote_votes.get(selected_quote, 0)
+    selected_quote, selected_disposition = selected_identity
+    clarifying_votes = identity_votes.get(selected_identity, 0)
     candidate = (
         {
             "contract_hash": contract_hash,
@@ -345,6 +368,7 @@ def _review_bound_semantic_draft_clarification(
             "revision": contract["revision"],
             "atom_id": contract["atom_id"],
             "evidence_quote": selected_quote,
+            "resolution_disposition": selected_disposition,
         }
         if clarifying_votes >= 2
         else {}
@@ -353,6 +377,9 @@ def _review_bound_semantic_draft_clarification(
         "contract_hash": contract_hash,
         "valid_review_count": len(valid_reviews),
         "clarifying_vote_count": clarifying_votes,
+        "resolution_disposition": (
+            selected_disposition if clarifying_votes >= 2 else ""
+        ),
         "verdict_hashes": [
             hashlib.sha256(
                 json.dumps(
@@ -410,6 +437,43 @@ def _bound_semantic_draft_resolution_partition(
             "exact active atom."
         ),
     }]
+
+
+def _bind_active_semantic_draft_disposition(
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+    """Attach the jury disposition to its exact admitted source unit."""
+
+    contract = dict(
+        stage_a_payload.get("contract_proven_semantic_draft_resolution") or {}
+    )
+    if not contract:
+        return [dict(unit) for unit in partition], ()
+    evidence = str(contract.get("evidence_quote") or "")
+    disposition = str(contract.get("resolution_disposition") or "")
+    if disposition not in {"semantic_value", "background"}:
+        return [dict(unit) for unit in partition], (
+            "semantic draft clarification disposition is invalid",
+        )
+    matches = [
+        index
+        for index, unit in enumerate(partition)
+        if str(unit.get("operation") or "") == "pending_answer"
+        and str(unit.get("source_text") or "") == evidence
+        and any(
+            str(route.get("owner") or "") == "coordinator"
+            for route in unit.get("owner_routes") or ()
+            if isinstance(route, Mapping)
+        )
+    ]
+    if len(matches) != 1:
+        return [dict(unit) for unit in partition], (
+            "semantic draft clarification disposition has no unique source unit",
+        )
+    output = [dict(unit) for unit in partition]
+    output[matches[0]]["_semantic_draft_resolution_disposition"] = disposition
+    return output, ()
 
 
 def begin_semantic_partition(
@@ -749,6 +813,26 @@ def begin_semantic_partition(
                 state, clauses, source_partition, compilation_partition
             )
         )
+        source_partition, source_disposition_errors = (
+            _bind_active_semantic_draft_disposition(
+                source_partition,
+                stage_a_payload,
+            )
+        )
+        compilation_partition, compilation_disposition_errors = (
+            _bind_active_semantic_draft_disposition(
+                compilation_partition,
+                stage_a_payload,
+            )
+        )
+        if source_disposition_errors or compilation_disposition_errors:
+            document["status"] = "failed"
+            document["errors"] = list(dict.fromkeys((
+                *source_disposition_errors,
+                *compilation_disposition_errors,
+            )))
+            document["unit_count"] = len(source_partition)
+            return document
         source_partition = _expand_partition_routes(source_partition)
         compilation_partition = _expand_partition_routes(
             compilation_partition
@@ -874,8 +958,15 @@ def _request_stage_a_proposal(
             clauses,
             state=state,
         )
+        partition, background_errors = (
+            _project_ready_semantic_draft_backgrounds(
+                partition,
+                stage_a_payload,
+            )
+        )
         errors = tuple(dict.fromkeys((
             *errors,
+            *background_errors,
             *_pending_answer_contract_errors(partition, state),
             *_semantic_draft_resolution_contract_errors(
                 partition,
@@ -886,6 +977,45 @@ def _request_stage_a_proposal(
         if not errors:
             break
     return partition, errors, tuple(request_sizes)
+
+
+def _project_ready_semantic_draft_backgrounds(
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+    """Project reviewed background atoms without granting the model authority."""
+
+    backgrounds = [
+        dict(row)
+        for row in stage_a_payload.get("semantic_draft_resolutions") or ()
+        if isinstance(row, Mapping)
+        and str(row.get("resolution_disposition") or "") == "background"
+    ]
+    if not backgrounds:
+        return [dict(unit) for unit in partition], ()
+    output = [dict(unit) for unit in partition]
+    errors: list[str] = []
+    for row in backgrounds:
+        matches = [
+            index
+            for index, unit in enumerate(output)
+            if str(unit.get("unit_id") or "") == str(row.get("unit_id") or "")
+            and str(unit.get("clause_id") or "") == str(row.get("clause_id") or "")
+            and str(unit.get("source_path") or "") == str(row.get("source_path") or "")
+            and str(unit.get("source_text") or "") == str(row.get("source_text") or "")
+        ]
+        if len(matches) != 1:
+            errors.append(
+                "semantic draft background atom has no unique final source: "
+                f"{str(row.get('atom_id') or '')}"
+            )
+            continue
+        unit = output[matches[0]]
+        unit["operation"] = "context"
+        unit["owner_routes"] = []
+        unit["reason"] = "Harness-proven semantic draft background disposition."
+        unit["_admission_support"] = True
+    return output, tuple(dict.fromkeys(errors))
 
 
 def _stage_a_output_token_budget(
@@ -2510,7 +2640,9 @@ def _stage_a_prompt() -> str:
         "user-confirmed interpretation of the identified source DemandAtom. "
         "Use it to resolve that atom while still partitioning and routing the "
         "complete original source. Do not treat the resolution rows as new "
-        "sibling demands and do not omit any original source atom."
+        "sibling demands and do not omit any original source atom. A background "
+        "disposition is Harness authority and will be projected to context after "
+        "your source-complete partition; do not invent or alter dispositions."
     )
 
 
@@ -2562,6 +2694,9 @@ def _stage_a_payload(
             "source_path": str(item.get("source_path") or ""),
             "source_text": str(item.get("source_text") or ""),
             "user_resolution": str(item.get("resolution") or ""),
+            "resolution_disposition": str(
+                item.get("resolution_disposition") or ""
+            ),
         }
         for item in draft.get("unresolved_atoms") or ()
         if isinstance(item, Mapping)
@@ -3955,7 +4090,9 @@ def _stage_a_admission_prompt() -> str:
         "When semantic_draft_resolutions is present, treat each row as the "
         "Harness-bound user clarification for that exact source DemandAtom. "
         "It may make that atom semantically complete, but it is not a new "
-        "sibling demand and cannot justify changing another atom."
+        "sibling demand and cannot justify changing another atom. A supplied "
+        "background disposition is Harness-owned and must not be reclassified "
+        "as an executable demand."
     )
 
 
@@ -5048,6 +5185,9 @@ def _stage_b_prompt(owner: str) -> str:
         "unit or include text owned by another action. "
         "resolution_evidence is present only when the user clarified that exact source DemandAtom; "
         "it supplies the resolved value while source_text preserves the original request. "
+        "semantic_draft_resolution_disposition, when present, is Harness-owned; "
+        "compile the normal bound resolution action and do not author, change, or "
+        "reinterpret that disposition. The Harness binds it after validation. "
         "For a concrete closed-enum selection, use the shortest exact "
         "affirmative source span that semantically selects that value; exclude contrast text and "
         "rejected alternatives from source_evidence. Configuration values remain proposals until the owning workflow "
@@ -5254,6 +5394,17 @@ def _stage_b_payload(
                 if isinstance(unit.get("registered_intake"), Mapping)
                 else {}
             ),
+            **(
+                {
+                    "semantic_draft_resolution_disposition": str(
+                        unit["_semantic_draft_resolution_disposition"]
+                    )
+                }
+                if str(
+                    unit.get("_semantic_draft_resolution_disposition") or ""
+                )
+                else {}
+            ),
         })
     selected_operations = frozenset(
         str(unit.get("operation") or "")
@@ -5383,6 +5534,14 @@ def _compile_owner_document(
             expected_sources=expected_sources,
             pending_question=dict(state.get("pending_question") or {}),
         )
+        if not errors:
+            document, disposition_errors = (
+                _bind_owner_semantic_draft_dispositions(
+                    document,
+                    payload,
+                )
+            )
+            errors = disposition_errors
         if not errors and _owner_document_requires_semantic_review(
             payload,
             document,
@@ -5423,6 +5582,80 @@ def _compile_owner_document(
     if semantic_receipts:
         document["semantic_review_receipts"] = semantic_receipts
     return document, errors, tuple(request_sizes)
+
+
+def _bind_owner_semantic_draft_dispositions(
+    document: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Inject only Harness-reviewed draft dispositions into bound actions."""
+
+    expected = {
+        str(unit.get("unit_id") or ""): str(
+            unit.get("semantic_draft_resolution_disposition") or ""
+        )
+        for unit in payload.get("semantic_units") or ()
+        if isinstance(unit, Mapping)
+        and str(unit.get("semantic_draft_resolution_disposition") or "")
+    }
+    normalized = {
+        "actions": [
+            dict(action)
+            for action in document.get("actions") or ()
+            if isinstance(action, Mapping)
+        ],
+        "bindings": [
+            dict(binding)
+            for binding in document.get("bindings") or ()
+            if isinstance(binding, Mapping)
+        ],
+    }
+    if not expected:
+        return normalized, ()
+    errors: list[str] = []
+    bindings = {
+        str(binding.get("unit_id") or ""): binding
+        for binding in normalized["bindings"]
+    }
+    for unit_id, disposition in expected.items():
+        if disposition not in {"semantic_value", "background"}:
+            errors.append(
+                f"semantic draft disposition is invalid for unit: {unit_id}"
+            )
+            continue
+        binding = bindings.get(unit_id) or {}
+        indexes = binding.get("action_indexes") or []
+        if binding.get("disposition") != "action" or len(indexes) != 1:
+            errors.append(
+                f"semantic draft disposition lacks one bound action: {unit_id}"
+            )
+            continue
+        index = indexes[0]
+        if not isinstance(index, int) or index >= len(normalized["actions"]):
+            errors.append(
+                f"semantic draft disposition action index is invalid: {unit_id}"
+            )
+            continue
+        action = normalized["actions"][index]
+        if str(action.get("type") or "") != "resolve_semantic_draft_atom":
+            errors.append(
+                f"semantic draft disposition targets wrong action: {unit_id}"
+            )
+            continue
+        authored = str(action.get("resolution_disposition") or "")
+        if authored:
+            errors.append(
+                f"model-authored semantic draft disposition is forbidden: {unit_id}"
+            )
+            continue
+        action["resolution_disposition"] = disposition
+        try:
+            normalized["actions"][index] = validate_action_contract(action)
+        except ValueError as exc:
+            errors.append(
+                f"semantic draft disposition action is invalid: {unit_id}: {exc}"
+            )
+    return normalized, tuple(dict.fromkeys(errors))
 
 
 def _repair_stage_b_closed_enum_intakes(
@@ -6427,6 +6660,7 @@ def _bind_semantic_draft_resolution_evidence(
         atom = dict(raw_atom)
         unit_id = str(atom.get("unit_id") or "")
         resolution = str(atom.get("resolution") or "").strip()
+        disposition = str(atom.get("resolution_disposition") or "")
         reference = str(atom.get("resolution_ref") or "")
         if reference:
             resolution = str(
@@ -6438,7 +6672,11 @@ def _bind_semantic_draft_resolution_evidence(
                 )
                 or ""
             )
-        if unit_id and resolution:
+        if (
+            unit_id
+            and resolution
+            and disposition in {"semantic_value", "background"}
+        ):
             atom["_runtime_resolution"] = resolution
             resolved[unit_id] = atom
     if len(resolved) != len(draft.get("unresolved_atoms") or ()):
@@ -6466,6 +6704,9 @@ def _bind_semantic_draft_resolution_evidence(
                     if isinstance(route, Mapping)
                 ]
                 authoritative_route_changed = (
+                    str(atom.get("resolution_disposition") or "")
+                    != "background"
+                    and
                     str(atom.get("reason") or "") == "missing_user_evidence"
                     and (
                         len(routes) != 1
@@ -6473,6 +6714,15 @@ def _bind_semantic_draft_resolution_evidence(
                         != str(atom.get("owner") or "")
                         or str(routes[0].get("group") or "")
                         != str(atom.get("group") or "")
+                    )
+                )
+                background_projection_invalid = (
+                    str(atom.get("resolution_disposition") or "")
+                    == "background"
+                    and (
+                        str(unit.get("operation") or "") != "context"
+                        or bool(routes)
+                        or unit.get("_admission_support") is not True
                     )
                 )
                 if (
@@ -6485,6 +6735,7 @@ def _bind_semantic_draft_resolution_evidence(
                     or _semantic_source_for_unit(unit)
                     != str(atom.get("semantic_source") or "")
                     or authoritative_route_changed
+                    or background_projection_invalid
                 ):
                     errors.append(
                         "semantic draft resolution atom provenance changed: "
@@ -6501,6 +6752,9 @@ def _bind_semantic_draft_resolution_evidence(
                     )
                     unit["resolution_atom_id"] = binding["atom_id"]
                     unit["resolution_binding_hash"] = binding["binding_hash"]
+                    unit["resolution_disposition"] = str(
+                        atom.get("resolution_disposition") or ""
+                    )
             output.append(unit)
         missing = set(resolved) - seen
         if missing:

@@ -26,7 +26,7 @@ from tests.agent_live.covering_arrays import (
 
 
 PRODUCT_CHAOS_MODEL_ID = "anychain-agent-product-chaos"
-PRODUCT_CHAOS_MODEL_VERSION = FACTOR_MODEL_SCHEMA_VERSION
+PRODUCT_CHAOS_MODEL_VERSION = FACTOR_MODEL_SCHEMA_VERSION + 1
 
 STATE_CONTROL_FACTOR_NAMES = (
     "workflow_mode",
@@ -128,6 +128,15 @@ def build_product_factor_model() -> FactorModel:
 
     def forbid(constraint_id: str, **values: str) -> None:
         forbidden.append(ForbiddenCombination.from_mapping(constraint_id, values))
+
+    # A new chain in an existing adapter family cannot terminate as a confirmed
+    # Case 2 while retaining fake-node. Missing fixture evidence requires either
+    # promotion to real-node or a secondary-development handoff.
+    forbid(
+        "fake-case2-terminal-incompatible",
+        workflow_mode="fake",
+        chain_case="case2",
+    )
 
     for workflow_mode in _WORKFLOW_STATE_BY_FACTOR:
         for subject_group in GROUP_ORDER:

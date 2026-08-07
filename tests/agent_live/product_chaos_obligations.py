@@ -28,7 +28,7 @@ from tests.agent_live.product_chaos_factors import (
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
 
 
-PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 4
+PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 5
 PRODUCT_CHAOS_SEED = 20260724
 PRODUCT_CHAOS_STATUS = "not_run"
 
@@ -497,27 +497,74 @@ def _mission_for(factors: Mapping[str, str]) -> str:
 
 
 def _max_turns_for(factors: Mapping[str, str]) -> int:
-    return _minimum_witness_turns(factors) + 2
+    feasibility = _witness_feasibility_contract(factors)
+    if feasibility["compatible"] is not True:
+        raise ValueError(
+            "product Chaos factor row has incompatible terminal receipts: "
+            + ", ".join(feasibility["incompatibility_reasons"])
+        )
+    return int(feasibility["minimum_turns"]) + int(feasibility["slack_turns"])
 
 
 def _minimum_witness_turns(factors: Mapping[str, str]) -> int:
+    feasibility = _witness_feasibility_contract(factors)
+    if feasibility["compatible"] is not True:
+        raise ValueError(
+            "product Chaos factor row has incompatible terminal receipts: "
+            + ", ".join(feasibility["incompatibility_reasons"])
+        )
+    return int(feasibility["minimum_turns"])
+
+
+def _witness_feasibility_contract(
+    factors: Mapping[str, str],
+) -> dict[str, Any]:
     chain_case = str(factors.get("chain_case") or "")
-    chain_path = {
-        "known": 4,
-        "case1": 11,
-        "case2": 13,
-        "case3": 7,
-    }.get(chain_case)
-    if chain_path is None:
+    workflow_mode = str(factors.get("workflow_mode") or "")
+    incompatibility_reasons = []
+    if workflow_mode == "fake" and chain_case == "case2":
+        incompatibility_reasons.append(
+            "fake-node Case 2 cannot retain both a fake workflow commit and a "
+            "confirmed Case 2 terminal after missing-fixture handling"
+        )
+
+    chain_milestones: dict[str, tuple[tuple[str, int], ...]] = {
+        "known": (
+            ("known_chain_confirmation", 2),
+            ("chain_terminal_receipt", 1),
+        ),
+        "case1": (
+            ("known_chain_custom_rpc_entry", 1),
+            ("endpoint_probe_receipt", 2),
+            ("split_request_response_evidence", 3),
+            ("rpc_schema_validation_receipt", 2),
+            ("custom_workload_receipt", 2),
+            ("chain_terminal_receipt", 1),
+        ),
+        "case2": (
+            ("unknown_chain_identity_and_protocol_receipt", 3),
+            ("endpoint_probe_receipt", 2),
+            ("split_request_response_evidence", 3),
+            ("rpc_schema_validation_receipt", 2),
+            ("new_chain_workload_receipt", 2),
+            ("confirmed_case2_terminal_receipt", 1),
+        ),
+        "case3": (
+            ("unknown_chain_identity_and_protocol_receipt", 3),
+            ("official_development_evidence_receipt", 2),
+            ("secondary_handoff_terminal_receipt", 1),
+        ),
+    }
+    if chain_case not in chain_milestones:
         return _mapping_gap(factors, "chain_case")
-    interruption = {
+    interruption_turns = {
         "0": 0,
         "1": 2,
         "2+": 4,
     }.get(str(factors.get("interruption_depth") or ""))
-    if interruption is None:
+    if interruption_turns is None:
         return _mapping_gap(factors, "interruption_depth")
-    recovery = {
+    recovery_turns = {
         "none": 0,
         "back": 1,
         "jump": 1,
@@ -525,32 +572,48 @@ def _minimum_witness_turns(factors: Mapping[str, str]) -> int:
         "retry": 3,
         "reset": 2,
     }.get(str(factors.get("recovery") or "none"))
-    if recovery is None:
+    if recovery_turns is None:
         return _mapping_gap(factors, "recovery")
-    contradictory = 2 if factors.get("input_shape") == "contradictory" else 0
-    return chain_path + interruption + recovery + contradictory
 
-
-def _witness_feasibility_contract(
-    factors: Mapping[str, str],
-) -> dict[str, Any]:
-    witnesses = [
-        f"{name}:{factors[name]}"
-        for name in (
-            "chain_case",
-            "workflow_mode",
-            "subject_group",
-            "workload",
-            "evidence_shape",
-            "input_shape",
-            "recovery",
-        )
-        if name in factors
+    milestones = [
+        {"receipt_id": "workflow_mode_domain_commit", "turn_budget": 1},
+        *(
+            {"receipt_id": receipt_id, "turn_budget": turn_budget}
+            for receipt_id, turn_budget in chain_milestones[chain_case]
+        ),
+        {"receipt_id": "subject_group_domain_commit", "turn_budget": 1},
+        {"receipt_id": "terminal_pending_advance", "turn_budget": 1},
     ]
+    if factors.get("workload") == "custom_mixed":
+        milestones.append({
+            "receipt_id": "mixed_weight_total_confirmation",
+            "turn_budget": 1,
+        })
+    if interruption_turns:
+        milestones.append({
+            "receipt_id": "interruption_push_and_resume_receipts",
+            "turn_budget": interruption_turns,
+        })
+    if recovery_turns:
+        milestones.append({
+            "receipt_id": "recovery_transition_receipts",
+            "turn_budget": recovery_turns,
+        })
+    if factors.get("input_shape") == "contradictory":
+        milestones.append({
+            "receipt_id": "contradiction_clarification_receipts",
+            "turn_budget": 2,
+        })
+    minimum_turns = sum(int(item["turn_budget"]) for item in milestones)
+    slack_turns = max(3, (minimum_turns + 5) // 6)
     return {
-        "contract_version": 1,
-        "minimum_turns": _minimum_witness_turns(factors),
-        "required_witnesses": witnesses,
+        "contract_version": 2,
+        "compatible": not incompatibility_reasons,
+        "incompatibility_reasons": incompatibility_reasons,
+        "terminal_postcondition_ids": list(_required_postconditions(factors)),
+        "receipt_milestones": milestones,
+        "minimum_turns": minimum_turns,
+        "slack_turns": slack_turns,
         "pre_execution_rejection": True,
     }
 
