@@ -2080,7 +2080,6 @@ def _planner_authority_chain(
                     "response_shape_valid": (
                         member.get("response_shape_valid") is True
                     ),
-                    "claim_hash_valid": member.get("claim_hash_valid") is True,
                     "verdict": str(member.get("verdict") or ""),
                     "selected_value_present": (
                         member.get("selected_value_present") is True

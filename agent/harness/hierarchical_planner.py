@@ -4036,9 +4036,8 @@ def _pending_entailment_prompt() -> str:
         "assigns one concrete, directly usable value to the active pending field. "
         "A natural-language answer is valid only when it "
         "commits to one declared option or directly authorizes the pending effect. "
-        "Return exactly one JSON object with exactly claim_hash, verdict, "
-        "selected_value, evidence_quote, and reason. Copy claim_hash exactly. "
-        "verdict must be "
+        "Return exactly one JSON object with exactly verdict, selected_value, "
+        "evidence_quote, and reason. verdict must be "
         "answers, different_request, or uncertain. For answers, evidence_quote "
         "must be the shortest non-empty exact substring that commits to the pending "
         "answer. For an option question, selected_value must copy the exact JSON "
@@ -4233,7 +4232,6 @@ def _pending_entailment_member_receipt(
     response: str,
     *,
     member_index: int,
-    claim_hash: str,
     proposed_source: str,
     pending: Mapping[str, Any],
 ) -> tuple[str, dict[str, Any]]:
@@ -4244,7 +4242,6 @@ def _pending_entailment_member_receipt(
         "response_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
         "response_json_valid": False,
         "response_shape_valid": False,
-        "claim_hash_valid": False,
         "verdict": "",
         "selected_value_present": False,
         "selected_identity_hash": "",
@@ -4262,7 +4259,6 @@ def _pending_entailment_member_receipt(
         return "", receipt
     receipt["response_json_valid"] = True
     if not isinstance(verdict, Mapping) or set(verdict) != {
-        "claim_hash",
         "verdict",
         "selected_value",
         "evidence_quote",
@@ -4281,16 +4277,12 @@ def _pending_entailment_member_receipt(
         else ""
     )
     receipt.update({
-        "claim_hash_valid": str(verdict.get("claim_hash") or "") == claim_hash,
         "verdict": normalized_verdict,
         "selected_value_present": selected_value is not None,
         "evidence_quote_hash": _audit_value_hash(evidence) if evidence else "",
         "reason_hash": _audit_value_hash(reason) if reason else "",
         "evidence_source_bound": bool(evidence and evidence in proposed_source),
     })
-    if not receipt["claim_hash_valid"]:
-        receipt["rejection_code"] = "claim_hash_mismatch"
-        return "", receipt
     if verdict_name not in {"answers", "different_request", "uncertain"}:
         receipt["rejection_code"] = "invalid_verdict"
         return "", receipt
@@ -4409,7 +4401,7 @@ def _review_stage_a_pending_entailment_detailed(
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        payload = {"claim_hash": claim_hash, **claim_payload}
+        payload = claim_payload
         answer_votes: dict[str, int] = defaultdict(int)
         member_receipts: list[dict[str, Any]] = []
         claim_request_sizes: list[int] = []
@@ -4428,7 +4420,6 @@ def _review_stage_a_pending_entailment_detailed(
                 _pending_entailment_member_receipt(
                     response,
                     member_index=member_index,
-                    claim_hash=claim_hash,
                     proposed_source=claim["proposed_source"],
                     pending=pending,
                 )

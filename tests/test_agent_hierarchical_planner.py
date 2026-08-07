@@ -7894,13 +7894,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "operation": "pending_answer",
             "owner_routes": [{"owner": "coordinator", "group": "opening"}],
         }]
-        claim_hash = ""
-
         def response(*_args, **kwargs):
-            nonlocal claim_hash
-            claim_hash = kwargs["request_payload"]["claim_hash"]
             return json.dumps({
-                "claim_hash": claim_hash,
                 "verdict": "different_request",
                 "selected_value": None,
                 "evidence_quote": "different chain",
@@ -7949,7 +7944,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         def response(*_args, **kwargs):
             verdict = next(votes)
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": verdict,
                 "selected_value": True if verdict == "answers" else None,
                 "evidence_quote": "clear the workflow",
@@ -7987,13 +7981,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
     def test_manual_pending_entailment_requires_semantic_quorum(self) -> None:
         from agent.harness.hierarchical_planner import (
+            _pending_entailment_prompt,
             _review_stage_a_pending_entailment,
             _stage_a_admission_prompt,
         )
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": "us-1",
                 "evidence_quote": "us-1",
@@ -8031,6 +8025,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 3)
         self.assertEqual(compiler.call_count, 3)
+        self.assertNotIn("claim_hash", _pending_entailment_prompt())
+        self.assertTrue(all(
+            "claim_hash" not in call.kwargs["request_payload"]
+            for call in compiler.call_args_list
+        ))
         self.assertIn(
             "a prose pending_answer is complete only when its exact source "
             "supplies one concrete value",
@@ -8067,7 +8066,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": "AuroraEdge Testnet",
                 "evidence_quote": "AuroraEdge Testnet",
@@ -8125,7 +8123,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         selected, malformed = _pending_entailment_member_receipt(
             "not-json",
             member_index=1,
-            claim_hash="a" * 64,
             proposed_source="AuroraEdge Testnet is final.",
             pending={
                 "id": "chain",
@@ -8138,7 +8135,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertFalse(malformed["accepted_vote"])
 
         response = json.dumps({
-            "claim_hash": "a" * 64,
             "verdict": "uncertain",
             "selected_value": None,
             "evidence_quote": "AuroraEdge Testnet",
@@ -8147,7 +8143,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         selected, uncertain = _pending_entailment_member_receipt(
             response,
             member_index=2,
-            claim_hash="a" * 64,
             proposed_source="AuroraEdge Testnet is final.",
             pending={
                 "id": "chain",
@@ -8159,6 +8154,26 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(uncertain["rejection_code"], "semantic_non_answer")
         self.assertFalse(uncertain["accepted_vote"])
         self.assertNotIn("the source does not", json.dumps(uncertain))
+
+        correlated_response = json.dumps({
+            "claim_hash": "a" * 64,
+            "verdict": "answers",
+            "selected_value": "AuroraEdge Testnet",
+            "evidence_quote": "AuroraEdge Testnet",
+            "reason": "the source provides one concrete chain identity",
+        })
+        selected, extra_field = _pending_entailment_member_receipt(
+            correlated_response,
+            member_index=3,
+            proposed_source="AuroraEdge Testnet is final.",
+            pending={
+                "id": "chain",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        )
+        self.assertEqual(selected, "")
+        self.assertEqual(extra_field["rejection_code"], "invalid_shape")
 
     def test_pending_entailment_contract_accepts_concrete_corrected_value(
         self,
@@ -8587,7 +8602,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": "AuroraEdge Mainnet",
                 "evidence_quote": "AuroraEdge Testnet",
@@ -8649,7 +8663,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "different_request",
                 "selected_value": None,
                 "evidence_quote": "different chain",
@@ -8719,7 +8732,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
             def response(*_args, **kwargs):
                 return json.dumps({
-                    "claim_hash": kwargs["request_payload"]["claim_hash"],
                     "verdict": "answers",
                     "selected_value": selected,
                     "evidence_quote": evidence,
@@ -8768,7 +8780,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": 50,
                 "evidence_quote": "25",
@@ -8814,7 +8825,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": True,
                 "evidence_quote": "clear the workflow",
@@ -8864,7 +8874,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         def response(*_args, **kwargs):
             return json.dumps({
-                "claim_hash": kwargs["request_payload"]["claim_hash"],
                 "verdict": "answers",
                 "selected_value": "finish",
                 "evidence_quote": source,
@@ -8917,7 +8926,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             def response(*_args, **kwargs):
                 selected = next(votes)
                 return json.dumps({
-                    "claim_hash": kwargs["request_payload"]["claim_hash"],
                     "verdict": "uncertain" if selected is None else "answers",
                     "selected_value": selected,
                     "evidence_quote": source,

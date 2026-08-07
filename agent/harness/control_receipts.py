@@ -610,7 +610,6 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         "response_hash",
         "response_json_valid",
         "response_shape_valid",
-        "claim_hash_valid",
         "verdict",
         "selected_value_present",
         "selected_identity_hash",
@@ -626,7 +625,6 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         "accepted",
         "invalid_json",
         "invalid_shape",
-        "claim_hash_mismatch",
         "invalid_verdict",
         "missing_evidence_quote",
         "evidence_not_source_bound",
@@ -686,7 +684,6 @@ def _valid_planner_authority_chain(value: Any) -> bool:
             boolean_fields = {
                 "response_json_valid",
                 "response_shape_valid",
-                "claim_hash_valid",
                 "selected_value_present",
                 "evidence_source_bound",
                 "selected_value_evidence_bound",
@@ -718,8 +715,6 @@ def _valid_planner_authority_chain(value: Any) -> bool:
                 compatible_rejection_codes = {"invalid_json"}
             elif not member["response_shape_valid"]:
                 compatible_rejection_codes = {"invalid_shape"}
-            elif not member["claim_hash_valid"]:
-                compatible_rejection_codes = {"claim_hash_mismatch"}
             elif not member["verdict"]:
                 compatible_rejection_codes = {"invalid_verdict"}
             elif not member["evidence_quote_hash"]:
@@ -756,7 +751,6 @@ def _valid_planner_authority_chain(value: Any) -> bool:
                     or member.get("verdict") != "answers"
                     or not member.get("response_json_valid")
                     or not member.get("response_shape_valid")
-                    or not member.get("claim_hash_valid")
                     or not member.get("evidence_source_bound")
                     or not member.get("selected_value_evidence_bound")
                     or not member.get("pending_contract_valid")
