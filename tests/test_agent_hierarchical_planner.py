@@ -8074,6 +8074,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "reason": "the exact multi-word identity answers the chain question",
             })
 
+        receipts = []
         with patch(
             "agent.harness.hierarchical_planner.request_semantic_compilation",
             side_effect=response,
@@ -8095,10 +8096,69 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         "group": "chain_identity",
                     }],
                 }],
+                receipt_sink=receipts,
+                proposal_hash="a" * 64,
             )
 
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 3)
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertTrue(receipt["quorum_reached"])
+        self.assertEqual(receipt["request_count"], 3)
+        self.assertEqual(
+            [member["member_index"] for member in receipt["members"]],
+            [1, 2, 3],
+        )
+        self.assertTrue(all(
+            member["accepted_vote"] for member in receipt["members"]
+        ))
+        serialized_receipt = json.dumps(receipt)
+        self.assertNotIn("AuroraEdge Testnet", serialized_receipt)
+        self.assertNotIn("the exact multi-word identity", serialized_receipt)
+
+    def test_pending_entailment_member_receipt_records_typed_rejection(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _pending_entailment_member_receipt,
+        )
+
+        selected, malformed = _pending_entailment_member_receipt(
+            "not-json",
+            member_index=1,
+            claim_hash="a" * 64,
+            proposed_source="AuroraEdge Testnet is final.",
+            pending={
+                "id": "chain",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        )
+        self.assertEqual(selected, "")
+        self.assertEqual(malformed["rejection_code"], "invalid_json")
+        self.assertFalse(malformed["accepted_vote"])
+
+        response = json.dumps({
+            "claim_hash": "a" * 64,
+            "verdict": "uncertain",
+            "selected_value": None,
+            "evidence_quote": "AuroraEdge Testnet",
+            "reason": "the source does not establish enough context",
+        })
+        selected, uncertain = _pending_entailment_member_receipt(
+            response,
+            member_index=2,
+            claim_hash="a" * 64,
+            proposed_source="AuroraEdge Testnet is final.",
+            pending={
+                "id": "chain",
+                "manual_input_allowed": True,
+                "value_domain": "researched_identity",
+            },
+        )
+        self.assertEqual(selected, "")
+        self.assertEqual(uncertain["rejection_code"], "semantic_non_answer")
+        self.assertFalse(uncertain["accepted_vote"])
+        self.assertNotIn("the source does not", json.dumps(uncertain))
 
     def test_pending_entailment_contract_accepts_concrete_corrected_value(
         self,

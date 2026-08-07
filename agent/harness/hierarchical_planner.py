@@ -434,6 +434,7 @@ def begin_semantic_partition(
         "stage_b_calls": 0,
         "admission_calls": 0,
         "stage_a_relation_reviews": [],
+        "pending_entailment_reviews": [],
         "errors": [],
     }
     if not clauses:
@@ -529,6 +530,7 @@ def begin_semantic_partition(
             provider,
             stage_a_payload,
             partition,
+            receipt_sink=document["pending_entailment_reviews"],
         )
         document["request_sizes"].extend(stage_a_admission_sizes)
         document["admission_calls"] += len(stage_a_admission_sizes)
@@ -595,6 +597,7 @@ def begin_semantic_partition(
                 provider,
                 stage_a_payload,
                 independent_partition,
+                receipt_sink=document["pending_entailment_reviews"],
             )
             document["request_sizes"].extend(independent_admission_sizes)
             document["admission_calls"] += len(independent_admission_sizes)
@@ -641,6 +644,7 @@ def begin_semantic_partition(
                         provider,
                         stage_a_payload,
                         replacement_partition,
+                        receipt_sink=document["pending_entailment_reviews"],
                     )
                     document["request_sizes"].extend(replacement_admission_sizes)
                     document["admission_calls"] += len(replacement_admission_sizes)
@@ -3927,6 +3931,8 @@ def _review_stage_a_candidate(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
+    *,
+    receipt_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[
     tuple[str, ...],
     tuple[int, ...],
@@ -3955,6 +3961,8 @@ def _review_stage_a_candidate(
                 provider,
                 stage_a_payload,
                 partition,
+                receipt_sink=receipt_sink,
+                proposal_hash=_partition_hash(partition),
             )
         )
         if proven_pending_unit_ids:
@@ -3987,6 +3995,8 @@ def _review_stage_a_candidate(
             provider,
             stage_a_payload,
             partition,
+            receipt_sink=receipt_sink,
+            proposal_hash=_partition_hash(partition),
         )
         request_sizes.extend(pending_sizes)
         errors = tuple(dict.fromkeys((*errors, *pending_errors)))
@@ -4190,6 +4200,9 @@ def _review_stage_a_pending_entailment(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
+    *,
+    receipt_sink: list[dict[str, Any]] | None = None,
+    proposal_hash: str = "",
 ) -> tuple[tuple[str, ...], tuple[int, ...]]:
     """Require quorum before a semantic, non-literal pending claim is selectable."""
 
@@ -4198,15 +4211,158 @@ def _review_stage_a_pending_entailment(
             provider,
             stage_a_payload,
             partition,
+            receipt_sink=receipt_sink,
+            proposal_hash=proposal_hash,
         )
     )
     return errors, sizes
+
+
+def _audit_value_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pending_entailment_member_receipt(
+    response: str,
+    *,
+    member_index: int,
+    claim_hash: str,
+    proposed_source: str,
+    pending: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Validate one member vote and retain only secret-safe typed evidence."""
+
+    receipt: dict[str, Any] = {
+        "member_index": member_index,
+        "response_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+        "response_json_valid": False,
+        "response_shape_valid": False,
+        "claim_hash_valid": False,
+        "verdict": "",
+        "selected_value_present": False,
+        "selected_identity_hash": "",
+        "evidence_quote_hash": "",
+        "reason_hash": "",
+        "evidence_source_bound": False,
+        "selected_value_evidence_bound": False,
+        "pending_contract_valid": False,
+        "accepted_vote": False,
+        "rejection_code": "invalid_json",
+    }
+    try:
+        verdict = json.loads(response)
+    except json.JSONDecodeError:
+        return "", receipt
+    receipt["response_json_valid"] = True
+    if not isinstance(verdict, Mapping) or set(verdict) != {
+        "claim_hash",
+        "verdict",
+        "selected_value",
+        "evidence_quote",
+        "reason",
+    }:
+        receipt["rejection_code"] = "invalid_shape"
+        return "", receipt
+    receipt["response_shape_valid"] = True
+    evidence = str(verdict.get("evidence_quote") or "")
+    reason = str(verdict.get("reason") or "")
+    verdict_name = str(verdict.get("verdict") or "")
+    selected_value = verdict.get("selected_value")
+    normalized_verdict = (
+        verdict_name
+        if verdict_name in {"answers", "different_request", "uncertain"}
+        else ""
+    )
+    receipt.update({
+        "claim_hash_valid": str(verdict.get("claim_hash") or "") == claim_hash,
+        "verdict": normalized_verdict,
+        "selected_value_present": selected_value is not None,
+        "evidence_quote_hash": _audit_value_hash(evidence) if evidence else "",
+        "reason_hash": _audit_value_hash(reason) if reason else "",
+        "evidence_source_bound": bool(evidence and evidence in proposed_source),
+    })
+    if not receipt["claim_hash_valid"]:
+        receipt["rejection_code"] = "claim_hash_mismatch"
+        return "", receipt
+    if verdict_name not in {"answers", "different_request", "uncertain"}:
+        receipt["rejection_code"] = "invalid_verdict"
+        return "", receipt
+    if not evidence:
+        receipt["rejection_code"] = "missing_evidence_quote"
+        return "", receipt
+    if not receipt["evidence_source_bound"]:
+        receipt["rejection_code"] = "evidence_not_source_bound"
+        return "", receipt
+    if not reason.strip():
+        receipt["rejection_code"] = "missing_reason"
+        return "", receipt
+    if verdict_name != "answers":
+        receipt["rejection_code"] = (
+            "non_answer_selected_value"
+            if selected_value is not None
+            else "semantic_non_answer"
+        )
+        return "", receipt
+
+    selected_identity = pending_value_identity(selected_value, pending)
+    if selected_identity:
+        receipt["selected_identity_hash"] = _audit_value_hash(
+            selected_identity
+        )
+    if not selected_identity:
+        receipt["rejection_code"] = "missing_selected_identity"
+        return "", receipt
+    if selected_identity.startswith("option:"):
+        receipt["selected_value_evidence_bound"] = True
+        receipt["pending_contract_valid"] = True
+    elif str(pending.get("value_domain") or "") == "researched_identity":
+        selected_text = str(selected_value or "").strip()
+        receipt["selected_value_evidence_bound"] = bool(
+            selected_text and selected_text in evidence
+        )
+        receipt["pending_contract_valid"] = bool(
+            pending.get("manual_input_allowed") is True
+            and researched_identity_value_is_valid(selected_text)
+        )
+        if not receipt["pending_contract_valid"]:
+            receipt["rejection_code"] = "researched_identity_contract_rejected"
+            return "", receipt
+        if not receipt["selected_value_evidence_bound"]:
+            receipt["rejection_code"] = "selected_value_not_evidence_bound"
+            return "", receipt
+    else:
+        evidence_identity = pending_value_identity(evidence, pending)
+        receipt["selected_value_evidence_bound"] = (
+            selected_identity == evidence_identity
+        )
+        receipt["pending_contract_valid"] = bool(
+            pending.get("manual_input_allowed") is True
+        )
+        if (
+            not receipt["pending_contract_valid"]
+            or not receipt["selected_value_evidence_bound"]
+        ):
+            receipt["rejection_code"] = "manual_identity_mismatch"
+            return "", receipt
+    receipt["accepted_vote"] = True
+    receipt["rejection_code"] = "accepted"
+    return selected_identity, receipt
 
 
 def _review_stage_a_pending_entailment_detailed(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
+    *,
+    receipt_sink: list[dict[str, Any]] | None = None,
+    proposal_hash: str = "",
 ) -> tuple[
     tuple[str, ...],
     tuple[int, ...],
@@ -4255,8 +4411,12 @@ def _review_stage_a_pending_entailment_detailed(
         ).hexdigest()
         payload = {"claim_hash": claim_hash, **claim_payload}
         answer_votes: dict[str, int] = defaultdict(int)
-        for _member in range(3):
-            request_sizes.append(_wire_size(prompt, payload))
+        member_receipts: list[dict[str, Any]] = []
+        claim_request_sizes: list[int] = []
+        for member_index in range(1, 4):
+            request_size = _wire_size(prompt, payload)
+            request_sizes.append(request_size)
+            claim_request_sizes.append(request_size)
             response = request_semantic_compilation(
                 provider,
                 system_prompt=prompt,
@@ -4264,54 +4424,47 @@ def _review_stage_a_pending_entailment_detailed(
                 max_tokens=700,
                 reasoning_mode=STRICT_JSON_REASONING_MODE,
             )
-            try:
-                verdict = json.loads(response)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(verdict, Mapping) or set(verdict) != {
-                "claim_hash",
-                "verdict",
-                "selected_value",
-                "evidence_quote",
-                "reason",
-            }:
-                continue
-            evidence = str(verdict.get("evidence_quote") or "")
-            verdict_name = str(verdict.get("verdict") or "")
-            selected_value = verdict.get("selected_value")
-            if (
-                str(verdict.get("claim_hash") or "") != claim_hash
-                or verdict_name not in {"answers", "different_request", "uncertain"}
-                or not evidence
-                or evidence not in claim["proposed_source"]
-                or not str(verdict.get("reason") or "").strip()
-            ):
-                continue
-            if verdict_name != "answers":
-                if selected_value is not None:
-                    continue
-                continue
-            selected_identity = pending_value_identity(selected_value, pending)
-            if not selected_identity:
-                continue
-            if not selected_identity.startswith("option:"):
-                if str(pending.get("value_domain") or "") == "researched_identity":
-                    selected_text = str(selected_value or "").strip()
-                    if (
-                        pending.get("manual_input_allowed") is not True
-                        or not researched_identity_value_is_valid(selected_text)
-                        or selected_text not in evidence
-                    ):
-                        continue
-                else:
-                    evidence_identity = pending_value_identity(evidence, pending)
-                    if (
-                        pending.get("manual_input_allowed") is not True
-                        or selected_identity != evidence_identity
-                    ):
-                        continue
-            answer_votes[selected_identity] += 1
-        if max(answer_votes.values(), default=0) < 2:
+            selected_identity, member_receipt = (
+                _pending_entailment_member_receipt(
+                    response,
+                    member_index=member_index,
+                    claim_hash=claim_hash,
+                    proposed_source=claim["proposed_source"],
+                    pending=pending,
+                )
+            )
+            member_receipts.append(member_receipt)
+            if selected_identity:
+                answer_votes[selected_identity] += 1
+        quorum_identities = sorted(
+            identity for identity, count in answer_votes.items() if count >= 2
+        )
+        quorum_reached = len(quorum_identities) == 1
+        if receipt_sink is not None:
+            receipt_sink.append({
+                "proposal_hash": proposal_hash or _partition_hash(partition),
+                "claim_hash": claim_hash,
+                "unit_id": claim["unit_id"],
+                "pending_contract_hash": _audit_value_hash(pending),
+                "source_hash": _audit_value_hash(claim["proposed_source"]),
+                "request_count": 3,
+                "request_sizes": claim_request_sizes,
+                "members": member_receipts,
+                "identity_vote_counts": [
+                    {
+                        "identity_hash": _audit_value_hash(identity),
+                        "count": count,
+                    }
+                    for identity, count in sorted(answer_votes.items())
+                ],
+                "quorum_identity_hash": (
+                    _audit_value_hash(quorum_identities[0])
+                    if quorum_reached
+                    else ""
+                ),
+                "quorum_reached": quorum_reached,
+            })
+        if not quorum_reached:
             rejected_unit_ids.add(claim["unit_id"])
             errors.append(
                 "Stage A pending-answer entailment quorum rejected unit: "

@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from .contracts import SECRET_REFERENCE_RE
+
 
 def normalize_scalar(value: Any) -> str:
     """Trim one scalar using the Harness answer contract."""
@@ -112,14 +114,21 @@ def extract_url_candidate(value: Any) -> str:
     if not text:
         return ""
     scalar = text.strip("`'\"").rstrip(".,;，。；")
+    if SECRET_REFERENCE_RE.fullmatch(scalar):
+        return ""
     if looks_like_url_value(scalar):
         return scalar
-    match = re.search(r"\b(?:https?|wss?)://[^\s'\"`，。；;]+", text, flags=re.IGNORECASE)
+    searchable = SECRET_REFERENCE_RE.sub(" ", text)
+    match = re.search(
+        r"\b(?:https?|wss?)://[^\s'\"`，。；;]+",
+        searchable,
+        flags=re.IGNORECASE,
+    )
     if match:
         return match.group(0).rstrip(".,;，。；")
     match = re.search(
         r"\b(?:localhost|127\.0\.0\.1|\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):[0-9]{2,5}(?:/[^\s'\"`，。；;]*)?",
-        text,
+        searchable,
     )
     return match.group(0).rstrip(".,;，。；") if match else ""
 
@@ -127,7 +136,7 @@ def extract_url_candidate(value: Any) -> str:
 def extract_url_candidates(value: Any) -> tuple[str, ...]:
     """Return every distinct endpoint token found in source order."""
 
-    text = str(value or "")
+    text = SECRET_REFERENCE_RE.sub(" ", str(value or ""))
     matches = re.findall(
         r"\b(?:https?|wss?)://[^\s'\"`，。；;]+"
         r"|\b(?:localhost|127\.0\.0\.1|\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):"

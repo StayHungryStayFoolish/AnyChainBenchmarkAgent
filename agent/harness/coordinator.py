@@ -2054,6 +2054,74 @@ def _planner_authority_chain(
             ],
             "valid": receipt.get("valid") is True,
         })
+    pending_entailment_reviews: list[dict[str, Any]] = []
+    for receipt in document.get("pending_entailment_reviews") or ():
+        if not isinstance(receipt, Mapping):
+            continue
+        pending_entailment_reviews.append({
+            "proposal_hash": str(receipt.get("proposal_hash") or ""),
+            "claim_hash": str(receipt.get("claim_hash") or ""),
+            "unit_id": str(receipt.get("unit_id") or ""),
+            "pending_contract_hash": str(
+                receipt.get("pending_contract_hash") or ""
+            ),
+            "source_hash": str(receipt.get("source_hash") or ""),
+            "request_count": int(receipt.get("request_count") or 0),
+            "request_sizes": [
+                int(value) for value in receipt.get("request_sizes") or ()
+            ],
+            "members": [
+                {
+                    "member_index": int(member.get("member_index") or 0),
+                    "response_hash": str(member.get("response_hash") or ""),
+                    "response_json_valid": (
+                        member.get("response_json_valid") is True
+                    ),
+                    "response_shape_valid": (
+                        member.get("response_shape_valid") is True
+                    ),
+                    "claim_hash_valid": member.get("claim_hash_valid") is True,
+                    "verdict": str(member.get("verdict") or ""),
+                    "selected_value_present": (
+                        member.get("selected_value_present") is True
+                    ),
+                    "selected_identity_hash": str(
+                        member.get("selected_identity_hash") or ""
+                    ),
+                    "evidence_quote_hash": str(
+                        member.get("evidence_quote_hash") or ""
+                    ),
+                    "reason_hash": str(member.get("reason_hash") or ""),
+                    "evidence_source_bound": (
+                        member.get("evidence_source_bound") is True
+                    ),
+                    "selected_value_evidence_bound": (
+                        member.get("selected_value_evidence_bound") is True
+                    ),
+                    "pending_contract_valid": (
+                        member.get("pending_contract_valid") is True
+                    ),
+                    "accepted_vote": member.get("accepted_vote") is True,
+                    "rejection_code": str(
+                        member.get("rejection_code") or ""
+                    ),
+                }
+                for member in receipt.get("members") or ()
+                if isinstance(member, Mapping)
+            ],
+            "identity_vote_counts": [
+                {
+                    "identity_hash": str(row.get("identity_hash") or ""),
+                    "count": int(row.get("count") or 0),
+                }
+                for row in receipt.get("identity_vote_counts") or ()
+                if isinstance(row, Mapping)
+            ],
+            "quorum_identity_hash": str(
+                receipt.get("quorum_identity_hash") or ""
+            ),
+            "quorum_reached": receipt.get("quorum_reached") is True,
+        })
     owner_reviews: list[dict[str, Any]] = []
     for owner, owner_document in sorted(
         dict(document.get("owner_documents") or {}).items()
@@ -2084,6 +2152,7 @@ def _planner_authority_chain(
     return {
         "stage_a_convergence": stage_a,
         "stage_a_relation_reviews": relation_reviews,
+        "pending_entailment_reviews": pending_entailment_reviews,
         "stage_b_semantic_reviews": owner_reviews,
     }
 

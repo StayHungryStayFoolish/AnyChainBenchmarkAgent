@@ -103,6 +103,7 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                 "authority_chain": {
                     "stage_a_convergence": {},
                     "stage_a_relation_reviews": [],
+                    "pending_entailment_reviews": [],
                     "stage_b_semantic_reviews": [],
                 },
             },
@@ -238,6 +239,74 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                     }],
                     "valid": True,
                 }],
+                "pending_entailment_reviews": [{
+                    "proposal_hash": "c" * 64,
+                    "claim_hash": "d" * 64,
+                    "unit_id": "unit-3",
+                    "pending_contract_hash": "e" * 64,
+                    "source_hash": "f" * 64,
+                    "request_count": 3,
+                    "request_sizes": [768, 768, 768],
+                    "members": [
+                        {
+                            "member_index": 1,
+                            "response_hash": "1" * 64,
+                            "response_json_valid": True,
+                            "response_shape_valid": True,
+                            "claim_hash_valid": True,
+                            "verdict": "answers",
+                            "selected_value_present": True,
+                            "selected_identity_hash": "0" * 64,
+                            "evidence_quote_hash": "2" * 64,
+                            "reason_hash": "3" * 64,
+                            "evidence_source_bound": True,
+                            "selected_value_evidence_bound": True,
+                            "pending_contract_valid": True,
+                            "accepted_vote": True,
+                            "rejection_code": "accepted",
+                        },
+                        {
+                            "member_index": 2,
+                            "response_hash": "4" * 64,
+                            "response_json_valid": True,
+                            "response_shape_valid": True,
+                            "claim_hash_valid": True,
+                            "verdict": "answers",
+                            "selected_value_present": True,
+                            "selected_identity_hash": "0" * 64,
+                            "evidence_quote_hash": "5" * 64,
+                            "reason_hash": "6" * 64,
+                            "evidence_source_bound": True,
+                            "selected_value_evidence_bound": True,
+                            "pending_contract_valid": True,
+                            "accepted_vote": True,
+                            "rejection_code": "accepted",
+                        },
+                        {
+                            "member_index": 3,
+                            "response_hash": "7" * 64,
+                            "response_json_valid": True,
+                            "response_shape_valid": True,
+                            "claim_hash_valid": True,
+                            "verdict": "uncertain",
+                            "selected_value_present": False,
+                            "selected_identity_hash": "",
+                            "evidence_quote_hash": "8" * 64,
+                            "reason_hash": "9" * 64,
+                            "evidence_source_bound": True,
+                            "selected_value_evidence_bound": False,
+                            "pending_contract_valid": False,
+                            "accepted_vote": False,
+                            "rejection_code": "semantic_non_answer",
+                        },
+                    ],
+                    "identity_vote_counts": [{
+                        "identity_hash": "0" * 64,
+                        "count": 2,
+                    }],
+                    "quorum_identity_hash": "0" * 64,
+                    "quorum_reached": True,
+                }],
                 "stage_b_semantic_reviews": [{
                     "owner": "orientation",
                     "proposal_hash": "4" * 64,
@@ -256,12 +325,50 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             ),
             (True, ""),
         )
+        serialized_authority = json.dumps(payload["authority_chain"])
+        self.assertNotIn("AuroraEdge Testnet", serialized_authority)
+        self.assertNotIn("evidence_quote\"", serialized_authority)
+        self.assertNotIn("selected_value\"", serialized_authority)
+        self.assertNotIn("reason\"", serialized_authority)
         forged = json.loads(json.dumps(payload))
         forged["authority_chain"]["stage_a_convergence"][
             "request_count"
         ] = 2
         valid, reason = validate_coordinator_control_receipt(
             _signed_receipt(forged), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        forged_pending_reason = json.loads(json.dumps(payload))
+        pending_member = forged_pending_reason["authority_chain"][
+            "pending_entailment_reviews"
+        ][0]["members"][2]
+        pending_member["rejection_code"] = "invalid_json"
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged_pending_reason), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        forged_pending_member = json.loads(json.dumps(payload))
+        pending_member = forged_pending_member["authority_chain"][
+            "pending_entailment_reviews"
+        ][0]["members"][1]
+        pending_member["member_index"] = 3
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged_pending_member), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        forged_pending_quorum = json.loads(json.dumps(payload))
+        pending_review = forged_pending_quorum["authority_chain"][
+            "pending_entailment_reviews"
+        ][0]
+        pending_review["identity_vote_counts"][0]["count"] = 3
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged_pending_quorum), turn_index=3
         )
         self.assertFalse(valid)
         self.assertIn("semantics", reason)

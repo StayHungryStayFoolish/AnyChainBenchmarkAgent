@@ -456,6 +456,7 @@ def _valid_planner_authority_chain(value: Any) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
         "stage_a_convergence",
         "stage_a_relation_reviews",
+        "pending_entailment_reviews",
         "stage_b_semantic_reviews",
     }:
         return False
@@ -599,6 +600,202 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         if review["valid"] is not all(
             decision["quorum_reached"] is True
             for decision in decisions
+        ):
+            return False
+    pending_reviews = value.get("pending_entailment_reviews")
+    if not isinstance(pending_reviews, list):
+        return False
+    member_fields = {
+        "member_index",
+        "response_hash",
+        "response_json_valid",
+        "response_shape_valid",
+        "claim_hash_valid",
+        "verdict",
+        "selected_value_present",
+        "selected_identity_hash",
+        "evidence_quote_hash",
+        "reason_hash",
+        "evidence_source_bound",
+        "selected_value_evidence_bound",
+        "pending_contract_valid",
+        "accepted_vote",
+        "rejection_code",
+    }
+    rejection_codes = {
+        "accepted",
+        "invalid_json",
+        "invalid_shape",
+        "claim_hash_mismatch",
+        "invalid_verdict",
+        "missing_evidence_quote",
+        "evidence_not_source_bound",
+        "missing_reason",
+        "non_answer_selected_value",
+        "semantic_non_answer",
+        "missing_selected_identity",
+        "researched_identity_contract_rejected",
+        "selected_value_not_evidence_bound",
+        "manual_identity_mismatch",
+    }
+    for review in pending_reviews:
+        if not isinstance(review, Mapping) or set(review) != {
+            "proposal_hash",
+            "claim_hash",
+            "unit_id",
+            "pending_contract_hash",
+            "source_hash",
+            "request_count",
+            "request_sizes",
+            "members",
+            "identity_vote_counts",
+            "quorum_identity_hash",
+            "quorum_reached",
+        }:
+            return False
+        members = review.get("members")
+        vote_counts = review.get("identity_vote_counts")
+        if (
+            not all(
+                _valid_hash(review.get(field))
+                for field in (
+                    "proposal_hash",
+                    "claim_hash",
+                    "pending_contract_hash",
+                    "source_hash",
+                )
+            )
+            or not str(review.get("unit_id") or "")
+            or review.get("request_count") != 3
+            or not _valid_request_sizes(review.get("request_sizes"))
+            or len(review["request_sizes"]) != 3
+            or not isinstance(members, list)
+            or len(members) != 3
+            or not isinstance(vote_counts, list)
+            or not isinstance(review.get("quorum_reached"), bool)
+            or not _valid_hash(
+                review.get("quorum_identity_hash"),
+                allow_empty=True,
+            )
+        ):
+            return False
+        accepted_identity_hashes: list[str] = []
+        for index, member in enumerate(members, start=1):
+            if not isinstance(member, Mapping) or set(member) != member_fields:
+                return False
+            boolean_fields = {
+                "response_json_valid",
+                "response_shape_valid",
+                "claim_hash_valid",
+                "selected_value_present",
+                "evidence_source_bound",
+                "selected_value_evidence_bound",
+                "pending_contract_valid",
+                "accepted_vote",
+            }
+            if (
+                member.get("member_index") != index
+                or not _valid_hash(member.get("response_hash"))
+                or any(
+                    not isinstance(member.get(field), bool)
+                    for field in boolean_fields
+                )
+                or str(member.get("verdict") or "")
+                not in {"", "answers", "different_request", "uncertain"}
+                or not _valid_hash(
+                    member.get("selected_identity_hash"), allow_empty=True
+                )
+                or not _valid_hash(
+                    member.get("evidence_quote_hash"), allow_empty=True
+                )
+                or not _valid_hash(member.get("reason_hash"), allow_empty=True)
+                or member.get("rejection_code") not in rejection_codes
+            ):
+                return False
+            accepted = member["accepted_vote"] is True
+            rejection_code = str(member["rejection_code"])
+            if not member["response_json_valid"]:
+                compatible_rejection_codes = {"invalid_json"}
+            elif not member["response_shape_valid"]:
+                compatible_rejection_codes = {"invalid_shape"}
+            elif not member["claim_hash_valid"]:
+                compatible_rejection_codes = {"claim_hash_mismatch"}
+            elif not member["verdict"]:
+                compatible_rejection_codes = {"invalid_verdict"}
+            elif not member["evidence_quote_hash"]:
+                compatible_rejection_codes = {"missing_evidence_quote"}
+            elif not member["evidence_source_bound"]:
+                compatible_rejection_codes = {"evidence_not_source_bound"}
+            elif not member["reason_hash"]:
+                compatible_rejection_codes = {"missing_reason"}
+            elif member["verdict"] != "answers":
+                compatible_rejection_codes = {
+                    "non_answer_selected_value"
+                    if member["selected_value_present"]
+                    else "semantic_non_answer"
+                }
+            elif not member["selected_identity_hash"]:
+                compatible_rejection_codes = {"missing_selected_identity"}
+            elif not member["pending_contract_valid"]:
+                compatible_rejection_codes = {
+                    "researched_identity_contract_rejected",
+                    "manual_identity_mismatch",
+                }
+            elif not member["selected_value_evidence_bound"]:
+                compatible_rejection_codes = {
+                    "selected_value_not_evidence_bound",
+                    "manual_identity_mismatch",
+                }
+            else:
+                compatible_rejection_codes = {"accepted"}
+            if rejection_code not in compatible_rejection_codes:
+                return False
+            if accepted:
+                if (
+                    rejection_code != "accepted"
+                    or member.get("verdict") != "answers"
+                    or not member.get("response_json_valid")
+                    or not member.get("response_shape_valid")
+                    or not member.get("claim_hash_valid")
+                    or not member.get("evidence_source_bound")
+                    or not member.get("selected_value_evidence_bound")
+                    or not member.get("pending_contract_valid")
+                    or not _valid_hash(member.get("selected_identity_hash"))
+                ):
+                    return False
+                accepted_identity_hashes.append(
+                    str(member["selected_identity_hash"])
+                )
+            elif rejection_code == "accepted":
+                return False
+        normalized_counts: dict[str, int] = {}
+        for row in vote_counts:
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != {"identity_hash", "count"}
+                or not _valid_hash(row.get("identity_hash"))
+                or not _valid_nonnegative_integer(row.get("count"))
+                or int(row["count"]) <= 0
+                or int(row["count"]) > 3
+                or str(row["identity_hash"]) in normalized_counts
+            ):
+                return False
+            normalized_counts[str(row["identity_hash"])] = int(row["count"])
+        observed_counts = {
+            identity_hash: accepted_identity_hashes.count(identity_hash)
+            for identity_hash in sorted(set(accepted_identity_hashes))
+        }
+        quorum_hashes = sorted(
+            identity_hash
+            for identity_hash, count in observed_counts.items()
+            if count >= 2
+        )
+        quorum_reached = len(quorum_hashes) == 1
+        if (
+            normalized_counts != observed_counts
+            or review["quorum_reached"] is not quorum_reached
+            or str(review.get("quorum_identity_hash") or "")
+            != (quorum_hashes[0] if quorum_reached else "")
         ):
             return False
     reviews = value.get("stage_b_semantic_reviews")

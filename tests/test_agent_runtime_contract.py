@@ -128,7 +128,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(normalize_scalar("eth0；"), "eth0")
 
     def test_endpoint_extraction_removes_terminal_copy_punctuation(self) -> None:
-        from agent.harness.input_values import extract_url_candidate
+        from agent.harness.input_values import (
+            extract_url_candidate,
+            extract_url_candidates,
+        )
 
         self.assertEqual(
             extract_url_candidate("  http://geth-dev:8545,  "),
@@ -138,6 +141,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
             extract_url_candidate("endpoint: https://rpc.example/v1。"),
             "https://rpc.example/v1",
         )
+        reference = "semantic-secret:60FomrgVQ8d470RPHw5_NKbB-xyh-0PS"
+        text = f"Use {reference} instead."
+        self.assertEqual(extract_url_candidate(text), "")
+        self.assertEqual(extract_url_candidates(text), ())
 
     def test_orientation_consultation_cannot_steal_pending_workflow_control(self) -> None:
         from agent.harness.contracts import ActionProposal
