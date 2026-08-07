@@ -8609,6 +8609,9 @@ network:
             domain_commit["navigation_target_group"],
             "workload_rpc",
         )
+        self.assertIn("active_group", {
+            item["path"] for item in domain_commit["material_delta"]
+        })
 
     def test_custom_rpc_choice_transfers_control_to_endpoint_group(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -8802,15 +8805,25 @@ network:
         )
         state["last_user_input"] = "我想测试另一条链"
 
-        with patch(
-            "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
-            return_value={
-                "reference_kind": "generic_reference",
-                "chain_exists": None,
-                "canonical_chain_name": "",
-                "adapter_family": "unknown",
-                "confidence": "high",
-            },
+        with (
+            patch(
+                "agent.harness.domains.chain_rpc.extract_chain_mention",
+                return_value={
+                    "found": True,
+                    "chain_text": "另一条链",
+                    "confidence": "high",
+                },
+            ),
+            patch(
+                "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
+                return_value={
+                    "reference_kind": "generic_reference",
+                    "chain_exists": None,
+                    "canonical_chain_name": "",
+                    "adapter_family": "unknown",
+                    "confidence": "high",
+                },
+            ),
         ):
             result = _reviewed_pending_answer(
                 state,

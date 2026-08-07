@@ -4856,6 +4856,16 @@ def _apply_handler_result(
         }
         for path in result.delta.deletes
     )
+    if navigation_binding:
+        recorded_paths = {str(item.get("path") or "") for item in delta_paths}
+        for path in ("active_group", "group_history", "interruption_stack"):
+            if state.get(path) == candidate.get(path) or path in recorded_paths:
+                continue
+            delta_paths.append({
+                "operation": "write",
+                "path": path,
+                "value_hash": _receipt_hash(candidate.get(path)),
+            })
     before_group_states = dict(state.get("group_states") or {})
     after_group_states = dict(candidate.get("group_states") or {})
     group_state_transitions = []

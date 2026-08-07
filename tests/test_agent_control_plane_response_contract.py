@@ -610,6 +610,50 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             "system reconcile cannot mutate business workflow state",
         )
 
+    def test_navigation_commit_requires_authoritative_group_delta(self) -> None:
+        base = {
+            "receipt_type": "domain_commit",
+            "turn_index": 7,
+            "owner": "coordinator",
+            "cause_kind": "admitted_action",
+            "completion": "completed",
+            "group_registry_contract_hash": "4" * 64,
+            "pending_before_hash": "5" * 64,
+            "pending_after_hash": "6" * 64,
+            "pending_after_id": "",
+            "consumed_action_ids": ["action-1"],
+            "invalidated_groups": [],
+            "invalidated_fields": [],
+            "reconfigured_groups": [],
+            "group_state_transitions": [],
+            "navigation_operation": "go_back",
+            "navigation_origin_group": "qps_profile",
+            "navigation_target_group": "workload_rpc",
+            "material_delta": [],
+            "response_fragments": [],
+        }
+        invalid = _signed_receipt(base)
+        accepted, reason = validate_coordinator_control_receipt(
+            invalid,
+            turn_index=7,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(
+            reason,
+            "domain-commit navigation delta is incomplete",
+        )
+
+        base["material_delta"] = [{
+            "operation": "write",
+            "path": "active_group",
+            "value_hash": "7" * 64,
+        }]
+        valid = _signed_receipt(base)
+        self.assertEqual(
+            validate_coordinator_control_receipt(valid, turn_index=7),
+            (True, ""),
+        )
+
     def test_v17_migration_clears_retired_turn_local_response_state(self) -> None:
         old = new_state("response-v17", language="en")
         old["schema_version"] = 17

@@ -1066,11 +1066,18 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         body["navigation_operation"] = "go_back"
         body["navigation_origin_group"] = "qps_profile"
         body["navigation_target_group"] = "workload_rpc"
-        body["material_delta"] = [{
-            "operation": "delete",
-            "path": "confirmed_config.DATA_VOL_SIZE",
-            "value_hash": "",
-        }]
+        body["material_delta"] = [
+            {
+                "operation": "write",
+                "path": "active_group",
+                "value_hash": "7" * 64,
+            },
+            {
+                "operation": "delete",
+                "path": "confirmed_config.DATA_VOL_SIZE",
+                "value_hash": "",
+            },
+        ]
         lost, details = POSTCONDITION_EVALUATORS[
             "backtrack_lost_configuration_state"
         ](_context(_event(_hashed(body))))

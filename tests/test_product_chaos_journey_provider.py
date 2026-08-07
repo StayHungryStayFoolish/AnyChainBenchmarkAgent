@@ -853,12 +853,12 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             self.obligations,
             revision=REVISION,
         )
-        self.assertEqual(report["required_denominator"], 535)
+        self.assertEqual(report["required_denominator"], 510)
         self.assertEqual(
             report["by_model"],
             {
-                "anychain-agent-product-chaos": 163,
-                "anychain-agent-product-chaos-state-control": 372,
+                "anychain-agent-product-chaos": 162,
+                "anychain-agent-product-chaos-state-control": 348,
             },
         )
 

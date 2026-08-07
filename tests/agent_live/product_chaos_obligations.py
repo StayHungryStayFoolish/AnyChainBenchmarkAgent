@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
+from agent.workflows.group_registry import GROUPS
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.formal_journey_catalog import (
     FORMAL_JOURNEY_VERIFIER_REGISTRY,
@@ -477,6 +478,17 @@ def _mission_for(factors: Mapping[str, str]) -> str:
             "Provide the RPC request contract and the observed endpoint response "
             "on separate turns"
         )
+    if factors.get("group_state") == "invalidated":
+        subject_group = str(factors.get("subject_group") or "")
+        invalidators = sorted(
+            group.name for group in GROUPS if subject_group in group.invalidates
+        )
+        if invalidators:
+            witness_instructions.append(
+                f"Complete or enter {subject_group}, then change one owning "
+                f"prerequisite ({', '.join(invalidators)}) so a validated "
+                f"domain commit marks {subject_group} invalidated"
+            )
     if factors.get("recovery") in {"correct", "retry"}:
         witness_instructions.append(
             "Trigger one typed recoverable validation or execution failure, then "
@@ -526,6 +538,14 @@ def _witness_feasibility_contract(
         incompatibility_reasons.append(
             "fake-node Case 2 cannot retain both a fake workflow commit and a "
             "confirmed Case 2 terminal after missing-fixture handling"
+        )
+    subject_group = str(factors.get("subject_group") or "")
+    if factors.get("group_state") == "invalidated" and not any(
+        subject_group in group.invalidates for group in GROUPS
+    ):
+        incompatibility_reasons.append(
+            f"{subject_group or '<missing subject group>'} has no registered "
+            "inbound invalidation transition"
         )
 
     chain_milestones: dict[str, tuple[tuple[str, int], ...]] = {
@@ -602,6 +622,11 @@ def _witness_feasibility_contract(
     if factors.get("input_shape") == "contradictory":
         milestones.append({
             "receipt_id": "contradiction_clarification_receipts",
+            "turn_budget": 2,
+        })
+    if factors.get("group_state") == "invalidated":
+        milestones.append({
+            "receipt_id": "subject_group_invalidation_domain_commit",
             "turn_budget": 2,
         })
     minimum_turns = sum(int(item["turn_budget"]) for item in milestones)

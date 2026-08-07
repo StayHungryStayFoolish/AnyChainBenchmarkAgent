@@ -9,7 +9,11 @@ import unittest
 from types import SimpleNamespace
 
 from agent.harness.domains.rpc_receipts import evidence_hash
-from tests.agent_live.coverage_evidence import RuntimeTurnEvent, content_hash
+from tests.agent_live.coverage_evidence import (
+    PtyCliTurnRecord,
+    RuntimeTurnEvent,
+    content_hash,
+)
 from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyDecisionProvenance,
     JourneyVerifierContext,
@@ -145,6 +149,27 @@ def _factor_context(
         0,
         fingerprint=initial_fingerprint,
     )
+    turns = tuple(
+        PtyCliTurnRecord(
+            session_id="factor-test",
+            turn_index=event.turn_index,
+            previous_agent_response="Agent previous",
+            user_message=str(message),
+            agent_response="Agent response",
+            provider="deepseek",
+            model="deepseek-test",
+            before_fingerprint=event.before_fingerprint,
+            after_fingerprint=event.after_fingerprint,
+            transcript_hash=content_hash({
+                "turn_index": event.turn_index,
+                "user_message": str(message),
+            }),
+            previous_response_received_at_ns=event.turn_index * 3,
+            user_message_submitted_at_ns=event.turn_index * 3 + 1,
+            agent_response_received_at_ns=event.turn_index * 3 + 2,
+        )
+        for message, event in zip(messages, events, strict=False)
+    )
     return JourneyVerifierContext(
         schedule=SimpleNamespace(
             start_scenario=scenario_id,
@@ -152,10 +177,10 @@ def _factor_context(
         ),
         initial_event=initial,
         current_event=events[-1] if events else initial,
-        completed_turns=(),
+        completed_turns=turns,
         transcript=tuple((message, "Agent response") for message in messages),
         observed_edge_keys=(),
-        latest_turn=None,
+        latest_turn=turns[-1] if turns else None,
         completed_events=tuple(events),
         completed_decisions=decisions,
         seed_receipt=seed_receipt or _seed_receipt(scenario_id),
@@ -208,7 +233,12 @@ def _planner_receipt(turn_index):
     })
 
 
-def _chain_resolution_receipt(turn_index, *, family="jsonrpc"):
+def _chain_resolution_receipt(
+    turn_index,
+    *,
+    family="jsonrpc",
+    canonical_name_hash=None,
+):
     return _receipt({
         "receipt_type": "chain_identity_resolution",
         "schema_version": 2,
@@ -218,7 +248,7 @@ def _chain_resolution_receipt(turn_index, *, family="jsonrpc"):
         "resolver_source": "llm",
         "reference_kind": "named_identity",
         "chain_exists": "true",
-        "canonical_name_hash": "2" * 64,
+        "canonical_name_hash": canonical_name_hash or _hash("test-chain"),
         "possible_known_chain_hash": "3" * 64,
         "adapter_family": family,
         "confidence": "high",
@@ -240,6 +270,8 @@ def _domain_commit(
     group_state_transitions=(),
 ):
     paths = (path,) if isinstance(path, str) else tuple(path)
+    if navigation:
+        paths = tuple(dict.fromkeys((*paths, "active_group", "interruption_stack")))
     return _receipt({
         "receipt_type": "domain_commit",
         "turn_index": turn_index,
@@ -666,6 +698,30 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
         self.assertFalse(any(
             row["factors"].get("workflow_mode") == "fake"
             and row["factors"].get("chain_case") == "case2"
+            for row in self.rows
+        ))
+
+    def test_witness_plan_rejects_unreachable_subject_invalidation(self) -> None:
+        factors = {
+            "workflow_mode": "real",
+            "chain_case": "case2",
+            "subject_group": "accounts_disk",
+            "group_state": "invalidated",
+            "workload": "custom_mixed",
+            "evidence_shape": "split",
+            "input_shape": "multiline",
+            "interruption_depth": "2+",
+            "recovery": "back",
+        }
+        plan = _witness_feasibility_contract(factors)
+        self.assertFalse(plan["compatible"])
+        self.assertIn(
+            "accounts_disk has no registered inbound invalidation transition",
+            plan["incompatibility_reasons"],
+        )
+        self.assertFalse(any(
+            row["factors"].get("subject_group") == "accounts_disk"
+            and row["factors"].get("group_state") == "invalidated"
             for row in self.rows
         ))
 
@@ -1103,9 +1159,13 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
         for case in FACTOR_OBSERVATION_VALUES["chain_case"]:
             product_case = "known" if case == "case1" else case
             status = "needs_review_handoff" if case == "case3" else "confirmed"
+            canonical = "test-chain"
             receipts = []
             if case in {"case2", "case3"}:
-                receipts.append(_chain_resolution_receipt(1))
+                receipts.append(_chain_resolution_receipt(
+                    1,
+                    canonical_name_hash=_hash(canonical),
+                ))
             receipts.append(_domain_commit(
                 1, "chain_identity", owner="chain_rpc"
             ))
@@ -1127,6 +1187,7 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
                     values={
                         "chain_identity.case": product_case,
                         "chain_identity.status": status,
+                        "chain_identity.canonical": canonical,
                         **(
                             {"secondary_handoff.status": "ready"}
                             if case == "case3"

@@ -42,6 +42,13 @@ class ProductChaosFactorCoverageTest(unittest.TestCase):
             }.items())),
             forbidden,
         )
+        self.assertIn(
+            tuple(sorted({
+                "subject_group": "accounts_disk",
+                "group_state": "invalidated",
+            }.items())),
+            forbidden,
+        )
 
     def test_model_contains_every_required_product_dimension(self) -> None:
         model = build_product_factor_model()

@@ -1051,6 +1051,15 @@ def _validate_domain_commit(
         if identity in seen_paths:
             return False, "domain-commit material delta is duplicated"
         seen_paths.add(identity)
+    if navigation_operation:
+        navigation_paths = {
+            str(item.get("path") or "")
+            for item in delta
+            if isinstance(item, Mapping)
+            and item.get("operation") in {"write", "delete"}
+        }
+        if "active_group" not in navigation_paths:
+            return False, "domain-commit navigation delta is incomplete"
     if cause_kind == "system_reconcile" and (
         delta
         or receipt.get("invalidated_groups")

@@ -762,10 +762,14 @@ def _input_shape_observed(
     value: str,
 ) -> tuple[bool, Mapping[str, Any]]:
     observations: list[dict[str, Any]] = []
-    for index, ((message, _), event) in enumerate(
-        zip(context.transcript, context.completed_events, strict=False),
-        start=1,
-    ):
+    events_by_turn = {
+        int(event.turn_index): event for event in context.completed_events
+    }
+    for turn in context.completed_turns:
+        event = events_by_turn.get(int(turn.turn_index))
+        if event is None:
+            continue
+        message = str(turn.user_message)
         clauses = segment_user_turn(str(message))
         shapes = {clause.input_shape for clause in clauses}
         turn_shape = str(event.turn_receipt_summary.get("input_shape") or "")
@@ -1219,13 +1223,19 @@ def _factor_structural_observation(
             seed_identity.get("case") in accepted_cases
             and seed_identity.get("status") in accepted_statuses
         )
+        terminal_canonical_hash = str(
+            context.current_event.after_value_hashes.get(
+                "chain_identity.canonical"
+            )
+            or ""
+        )
         resolution_turns = [
             int(event.turn_index)
             for event, receipt in owner_receipts
             if receipt.get("receipt_type") == "chain_identity_resolution"
-            and _event_has_state_value(
-                event, "chain_identity.case", *accepted_cases
-            )
+            and receipt.get("chain_exists") == "true"
+            and bool(terminal_canonical_hash)
+            and receipt.get("canonical_name_hash") == terminal_canonical_hash
         ]
         confirmation_turns = [
             int(event.turn_index)

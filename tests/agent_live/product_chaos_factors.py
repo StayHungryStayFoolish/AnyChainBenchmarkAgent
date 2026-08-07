@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from agent.workflows.group_registry import (
+    GROUPS,
     GROUP_ORDER,
     GROUP_SPEC_BY_NAME,
     group_applicable,
@@ -26,7 +27,7 @@ from tests.agent_live.covering_arrays import (
 
 
 PRODUCT_CHAOS_MODEL_ID = "anychain-agent-product-chaos"
-PRODUCT_CHAOS_MODEL_VERSION = FACTOR_MODEL_SCHEMA_VERSION + 1
+PRODUCT_CHAOS_MODEL_VERSION = FACTOR_MODEL_SCHEMA_VERSION + 2
 
 STATE_CONTROL_FACTOR_NAMES = (
     "workflow_mode",
@@ -166,6 +167,19 @@ def build_product_factor_model() -> FactorModel:
                     chain_case=chain_case,
                     subject_group=subject_group,
                 )
+
+    inbound_invalidators = {
+        invalidated
+        for group in GROUPS
+        for invalidated in group.invalidates
+    }
+    for subject_group in GROUP_ORDER:
+        if subject_group not in inbound_invalidators:
+            forbid(
+                f"registry-no-inbound-invalidation-{subject_group}",
+                subject_group=subject_group,
+                group_state="invalidated",
+            )
 
     # Sync observation has no RPC workload. RPC workflows require a workload,
     # except Case 3, which exits to secondary-development handoff.
