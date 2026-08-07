@@ -690,8 +690,8 @@ def begin_semantic_partition(
             if (
                 primary_eligible
                 and secondary_eligible
-                and _partition_hash(source_partition)
-                != _partition_hash(independent_source_partition)
+                and _partition_semantic_hash(source_partition)
+                != _partition_semantic_hash(independent_source_partition)
             ):
                 compilation_reviews = run_independent_llm_tasks((
                     lambda: _proposal_compilation_eligible(
@@ -1199,6 +1199,37 @@ def _partition_hash(partition: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _partition_semantic_hash(
+    partition: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash Harness-effective semantics without model-local presentation fields."""
+
+    projection: list[dict[str, Any]] = []
+    for raw in partition:
+        unit = {
+            key: value
+            for key, value in dict(raw).items()
+            if key not in {"unit_id", "parent_unit_id", "reason"}
+        }
+        routes = unit.get("owner_routes")
+        if isinstance(routes, list):
+            unit["owner_routes"] = sorted(
+                (dict(route) for route in routes if isinstance(route, Mapping)),
+                key=lambda route: (
+                    str(route.get("owner") or ""),
+                    str(route.get("group") or ""),
+                ),
+            )
+        projection.append(unit)
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _proposal_selection_eligible(
     partition: Sequence[Mapping[str, Any]],
 ) -> bool:
@@ -1374,6 +1405,43 @@ def _select_stage_a_proposal(
             "valid": True,
         }
         return [dict(unit) for unit in selected_partition], (), (), receipt
+    primary_semantic_hash = _partition_semantic_hash(primary)
+    secondary_semantic_hash = _partition_semantic_hash(secondary)
+    if (
+        primary_can_select
+        and secondary_can_select
+        and primary_semantic_hash == secondary_semantic_hash
+    ):
+        verdict = {
+            "selected_proposal": "primary",
+            "primary_hash": primary_hash,
+            "secondary_hash": secondary_hash,
+            "semantic_hash": primary_semantic_hash,
+            "reason": (
+                "Harness selected semantically equivalent independently "
+                "eligible proposals without another model decision."
+            ),
+        }
+        receipt = {
+            "primary_hash": primary_hash,
+            "primary_eligible": True,
+            "secondary_hash": secondary_hash,
+            "secondary_eligible": True,
+            "selected_proposal": "primary",
+            "selection_authority": "harness_semantic_equivalence",
+            "verdict_hash": hashlib.sha256(
+                json.dumps(
+                    verdict,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "request_count": 0,
+            "request_sizes": [],
+            "valid": True,
+        }
+        return [dict(unit) for unit in primary], (), (), receipt
     payload = {
         "user_text": stage_a_payload["user_text"],
         "clauses": stage_a_payload["clauses"],

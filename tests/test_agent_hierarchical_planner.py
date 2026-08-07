@@ -193,6 +193,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         }]
         secondary = [{
             **primary[0],
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "target_mode",
+            }],
             "reason": "independent registered mode request",
         }]
         stage_a_payload = {
@@ -3755,9 +3760,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "unit_id": "secondary",
             "clause_id": "clause-1",
             "source_text": "change it",
-            "operation": "navigation",
-            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
-            "reason": "navigation",
+            "operation": "domain_request",
+            "owner_routes": [{"owner": "performance", "group": "qps_profile"}],
+            "reason": "configuration mutation",
         }]
         payload = {
             "user_text": "change it",
@@ -3837,6 +3842,66 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(receipt["selection_authority"], "harness_eligibility")
         self.assertFalse(receipt["primary_eligible"])
         self.assertTrue(receipt["secondary_eligible"])
+        self.assertEqual(receipt["request_count"], 0)
+
+    def test_stage_a_convergence_deterministically_selects_equivalent_proposals(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _select_stage_a_proposal
+
+        primary = [{
+            "unit_id": "primary-model-id",
+            "clause_id": "clause-1",
+            "start": 0,
+            "end": 19,
+            "source_text": "AuroraEdge Testnet",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "chain_identity",
+            }],
+            "reason": "the replacement chain supplied by the user",
+        }]
+        secondary = [{
+            **primary[0],
+            "unit_id": "secondary-model-id",
+            "reason": "an exact answer to the active chain question",
+        }]
+        payload = {
+            "user_text": "AuroraEdge Testnet",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "AuroraEdge Testnet",
+                "input_shape": "prose",
+            }],
+            "pending_question": {"group": "chain_identity"},
+            "groups": [],
+            "universal_operation_purposes": {},
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+        ) as compiler:
+            selected, errors, sizes, receipt = _select_stage_a_proposal(
+                object(),
+                payload,
+                primary,
+                secondary,
+                primary_eligible=True,
+                secondary_eligible=True,
+            )
+
+        compiler.assert_not_called()
+        self.assertEqual(selected, primary)
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, ())
+        self.assertTrue(receipt["valid"])
+        self.assertEqual(receipt["selected_proposal"], "primary")
+        self.assertEqual(
+            receipt["selection_authority"],
+            "harness_semantic_equivalence",
+        )
+        self.assertNotEqual(receipt["primary_hash"], receipt["secondary_hash"])
         self.assertEqual(receipt["request_count"], 0)
 
     def test_stage_a_compilation_preflight_rejects_wrong_owner_before_selection(

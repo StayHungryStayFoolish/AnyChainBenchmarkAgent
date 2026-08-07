@@ -420,6 +420,17 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("semantics", reason)
 
+        convergence["selection_authority"] = "harness_semantic_equivalence"
+        convergence["selected_proposal"] = "primary"
+        convergence["primary_eligible"] = True
+        convergence["secondary_eligible"] = True
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                _signed_receipt(deterministic), turn_index=3
+            ),
+            (True, ""),
+        )
+
     def test_every_registered_control_message_renders_in_both_languages(self) -> None:
         value_by_type = {
             "string": "value",

@@ -490,7 +490,11 @@ def _valid_planner_authority_chain(value: Any) -> bool:
             or stage_a.get("selected_proposal")
             not in {"primary", "secondary", "none", "rejected"}
             or stage_a.get("selection_authority")
-            not in {"harness_eligibility", "model_convergence"}
+            not in {
+                "harness_eligibility",
+                "harness_semantic_equivalence",
+                "model_convergence",
+            }
             or not _valid_nonnegative_integer(stage_a.get("request_count"))
             or not _valid_request_sizes(stage_a.get("request_sizes"))
             or int(stage_a["request_count"]) != len(stage_a["request_sizes"])
@@ -499,7 +503,8 @@ def _valid_planner_authority_chain(value: Any) -> bool:
                 and int(stage_a["request_count"]) == 0
             )
             or (
-                stage_a.get("selection_authority") == "harness_eligibility"
+                stage_a.get("selection_authority")
+                in {"harness_eligibility", "harness_semantic_equivalence"}
                 and int(stage_a["request_count"]) != 0
             )
             or (
@@ -513,6 +518,16 @@ def _valid_planner_authority_chain(value: Any) -> bool:
                         if stage_a["primary_eligible"]
                         else "secondary"
                     )
+                    or stage_a.get("valid") is not True
+                )
+            )
+            or (
+                stage_a.get("selection_authority")
+                == "harness_semantic_equivalence"
+                and (
+                    stage_a["primary_eligible"] is not True
+                    or stage_a["secondary_eligible"] is not True
+                    or stage_a.get("selected_proposal") != "primary"
                     or stage_a.get("valid") is not True
                 )
             )
