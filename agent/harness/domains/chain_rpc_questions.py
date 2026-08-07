@@ -881,6 +881,7 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
             ],
             accepted_action_types=("rpc_workload_command",),
             queue_barrier=True,
+            requires_capabilities=("target_mode", "chain_identity"),
             rpc_case=case,
         )
     return _choice(
@@ -910,6 +911,7 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         ],
         accepted_action_types=("rpc_workload_command",),
         queue_barrier=True,
+        requires_capabilities=("target_mode", "chain_identity"),
         rpc_case=case,
     )
 
@@ -931,6 +933,7 @@ def _single_method_question(state: AgentGraphState, case: str) -> dict[str, Any]
             )
             for method in methods
         ],
+        requires_capabilities=("target_mode", "chain_identity"),
         rpc_case=case,
     )
 
@@ -961,6 +964,7 @@ def _weights_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         field=question_id,
         validation={"input_mode": "rpc_weights"},
         structured_input_owner=True,
+        requires_capabilities=("target_mode", "chain_identity"),
         domain_context={"rpc_case": case},
         candidate_bindings=({
             "type": "rpc_workload_command",
@@ -983,6 +987,7 @@ def _choice(
     queue_barrier: bool = False,
     validation: dict[str, Any] | None = None,
     structured_input_owner: bool = False,
+    requires_capabilities: tuple[str, ...] = (),
     rpc_case: str = "",
 ) -> dict[str, Any]:
     return choice_question(
@@ -999,6 +1004,7 @@ def _choice(
         barrier_policy="exclusive_owner" if queue_barrier else "",
         validation=validation,
         structured_input_owner=structured_input_owner,
+        requires_capabilities=requires_capabilities,
         domain_context={"rpc_case": rpc_case} if rpc_case else {},
     )
 

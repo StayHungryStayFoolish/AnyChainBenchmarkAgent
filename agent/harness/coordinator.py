@@ -4725,10 +4725,38 @@ def _apply_handler_result(
     if result.clear_pending:
         candidate["pending_question"] = {}
     effective_next_group = "failure_recovery" if recovery_pending else result.next_group
+    effective_pending = recovery_pending if recovery_pending is not None else result.pending_question
+    if effective_pending is not None:
+        proposed_pending = (
+            asdict(effective_pending)
+            if is_dataclass(effective_pending)
+            else dict(effective_pending)
+        )
+        proposed_group = str(proposed_pending.get("group") or "").strip()
+        prerequisite = next(
+            (
+                capability
+                for capability in proposed_pending.get("requires_capabilities") or []
+                if capability in ALLOWED_GROUPS
+                and not _state_has_capability(candidate, str(capability))
+            ),
+            "",
+        )
+        if prerequisite:
+            control = dict(candidate.get("control") or {})
+            control["deferred_group"] = proposed_group
+            candidate["control"] = control
+            prerequisite_question = _question_for_group(candidate, prerequisite)
+            if prerequisite_question is None:
+                raise StateInvariantError(
+                    "registered group prerequisite has no canonical question: "
+                    f"{proposed_group}->{prerequisite}"
+                )
+            effective_pending = prerequisite_question
+            effective_next_group = prerequisite
     if effective_next_group:
         _record_group_transition(candidate, effective_next_group)
     _append_response_fragments(candidate, *result.response_fragments)
-    effective_pending = recovery_pending if recovery_pending is not None else result.pending_question
     if effective_pending is not None:
         pending = asdict(effective_pending) if is_dataclass(effective_pending) else dict(effective_pending)
         if pending != previous_pending:
@@ -4743,6 +4771,13 @@ def _apply_handler_result(
     pending_is_semantic_draft = bool(
         (candidate.get("pending_question") or {}).get("semantic_draft_binding")
     )
+    previous_pending_owner = str(previous_pending.get("group") or "").strip()
+    if (
+        previous_pending_owner
+        and previous_pending_owner != pending_owner
+        and group_readiness(candidate, previous_pending_owner).ready
+    ):
+        mark_group_reconfigured(candidate, previous_pending_owner)
     if pending_owner and not pending_is_semantic_draft:
         candidate["active_group"] = pending_owner
         mark_group_reconfiguring(candidate, pending_owner)

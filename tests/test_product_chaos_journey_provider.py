@@ -56,6 +56,10 @@ from tests.agent_live.product_chaos_obligations import (
 from tests.agent_live.product_obligation_evidence import (
     admit_product_obligation_evidence,
 )
+from tests.agent_live.runtime_checkpoint import (
+    reviewed_scenario,
+    seed_runtime_checkpoint,
+)
 
 
 REVISION = {"commit": "abc123", "worktree_hash": "frozen-tree"}
@@ -166,12 +170,22 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             )),
             encoding="utf-8",
         )
-        (runtime / "checkpoints.sqlite").write_bytes(b"sqlite-checkpoint-data")
+        session_id = "g4-session"
+        session_purpose = "dynamic-dual-ai-chaos"
+        scenario = reviewed_scenario(schedule.start_scenario)
+        seed_receipt = seed_runtime_checkpoint(
+            scenario.seed_state,
+            checkpoint_path=runtime / "checkpoints.sqlite",
+            session_id=session_id,
+            session_purpose=session_purpose,
+            scenario_id=scenario.scenario_id,
+            scenario_state_fingerprint=scenario.state_fingerprint,
+        )
         baseline = {
             "schema_version": 2,
             "event_type": "startup_snapshot",
-            "thread_id": "g4-session",
-            "session_purpose": "dynamic-dual-ai-chaos",
+            "thread_id": session_id,
+            "session_purpose": session_purpose,
             "before_fingerprint": "0" * 64,
             "after_fingerprint": "a" * 64,
             "turn_index": 0,
@@ -463,7 +477,7 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
         turn = turns[-1]
         qualifying = classification == "passed"
         journey_payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "artifact_type": "dynamic_dual_ai_journey_evidence",
             "runner_type": "dynamic_dual_ai_journey",
             "schedule_id": schedule.schedule_id,
@@ -473,7 +487,9 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             "verifier_registry": journey_outcome_verifier_registry_payload(
                 FORMAL_JOURNEY_VERIFIER_REGISTRY
             ),
-            "session_id": "g4-session",
+            "session_id": session_id,
+            "session_purpose": session_purpose,
+            "seed_receipt": seed_receipt.artifact,
             "execution_id": execution_id,
             "provider": provider,
             "model": model,
@@ -837,12 +853,12 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             self.obligations,
             revision=REVISION,
         )
-        self.assertEqual(report["required_denominator"], 732)
+        self.assertEqual(report["required_denominator"], 538)
         self.assertEqual(
             report["by_model"],
             {
-                "anychain-agent-product-chaos": 177,
-                "anychain-agent-product-chaos-state-control": 555,
+                "anychain-agent-product-chaos": 156,
+                "anychain-agent-product-chaos-state-control": 382,
             },
         )
 

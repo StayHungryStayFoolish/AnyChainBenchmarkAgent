@@ -983,6 +983,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "custom_scope",
             "endpoint_process",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "chain_identity": {"canonical": "bsc", "status": "confirmed"},
                 "custom_rpc": {
                     "status": "needs_scope",
@@ -1000,6 +1002,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "custom_single_method",
             "endpoint_process",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "chain_identity": {"canonical": "bsc", "status": "confirmed"},
                 "custom_rpc": {
                     "status": "needs_single_method",
@@ -1073,6 +1077,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "new_chain_scope",
             "endpoint_process",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "chain_identity": {
                     "canonical": "new-chain",
                     "status": "existing_family_needs_workload_scope",
@@ -1092,6 +1098,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "new_chain_single_method",
             "endpoint_process",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "chain_identity": {
                     "canonical": "new-chain",
                     "status": "existing_family_needs_single_method",
@@ -1207,6 +1215,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
 def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     """Construct reviewed runtime variants not reached by the default seeds."""
 
+    from agent.harness.action_registry import state_has_capability
     from agent.harness.domains.chain_identity import _chain_ambiguity_question
     from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
     from agent.harness.domains.environment import config_proposal_review_question
@@ -1227,6 +1236,17 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         manual_action_overrides: Mapping[str, str] | None = None,
     ) -> None:
         if question:
+            missing_capabilities = tuple(
+                capability
+                for capability in question.get("requires_capabilities") or ()
+                if not state_has_capability(state, str(capability))
+            )
+            if missing_capabilities:
+                raise AssertionError(
+                    f"scenario {scenario_id!r} seeds question "
+                    f"{question.get('id')!r} without required capabilities: "
+                    f"{missing_capabilities!r}"
+                )
             seed = deepcopy(state)
             seed["active_group"] = str(question.get("group") or seed.get("active_group") or "opening")
             seed["pending_question"] = deepcopy(dict(question))
@@ -1465,6 +1485,9 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         runtime_extra = {key: value for key, value in extra.items() if key != "draft"}
         state = new_state(f"catalog-{scenario_id}", language=language, session_purpose="coverage")
         state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
+        if scenario_id == "custom_needs_weights":
+            state["target_mode"] = "fake-node"
+            state["workflow_mode"] = "rpc_benchmark"
         state["custom_rpc"] = {
             "status": status,
             "catalog": {
@@ -1541,6 +1564,9 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     for scenario_id, status, extra in new_chain_statuses:
         runtime_extra = {key: value for key, value in extra.items() if key != "draft"}
         state = new_state(f"catalog-{scenario_id}", language=language, session_purpose="coverage")
+        if scenario_id == "new_chain_existing_family_needs_weights":
+            state["target_mode"] = "fake-node"
+            state["workflow_mode"] = "rpc_benchmark"
         state["chain_identity"] = {
             "canonical": "new-chain",
             "status": status,

@@ -1113,9 +1113,43 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             seed_state=seed_state,
             question=question,
         )
+        from tests.agent_live.harness_contract_scenarios import (
+            canonical_question_contract,
+            canonical_scenario_state,
+        )
+        from tests.agent_live.runtime_checkpoint import (
+            reviewed_pending_contract,
+            reviewed_scenario as authoritative_scenario,
+        )
+
+        authoritative = authoritative_scenario(runner.schedule.start_scenario)
+        authoritative_question = reviewed_pending_contract(authoritative)
+        receipt = {
+            "scenario_id": authoritative.scenario_id,
+            "scenario_state_fingerprint": authoritative.state_fingerprint,
+            "seed_state_hash": content_hash(
+                canonical_scenario_state(authoritative.seed_state or {})
+            ),
+            "projected_state_hash": "d" * 64,
+            "checkpoint_sha256": "e" * 64,
+            "checkpoint_path": "/tmp/dynamic-journey-test.sqlite",
+            "session_id": runner.config.session_id,
+            "session_purpose": runner.config.session_purpose,
+            "pending_question_id": str(authoritative_question.get("id") or ""),
+            "pending_contract_hash": content_hash(
+                canonical_question_contract(authoritative_question)
+            ),
+        }
+        receipt_artifact = {
+            **receipt,
+            "receipt_hash": content_hash(receipt),
+        }
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario", return_value=scenario
-        ), patch("tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"):
+        ), patch(
+            "tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint",
+            return_value=SimpleNamespace(artifact=receipt_artifact),
+        ):
             return runner.run()
 
     def _verified_edge(self):

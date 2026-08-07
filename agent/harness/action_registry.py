@@ -588,7 +588,6 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=25,
         target_group="chain_identity",
         preserve_pending=True,
-        requires_capabilities=("target_mode",),
         provides_capabilities=("chain_identity",),
         crosses_pending_barrier=True,
         effect="workflow_navigation",

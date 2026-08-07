@@ -28,7 +28,7 @@ from tests.agent_live.product_chaos_factors import (
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
 
 
-PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 3
+PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 4
 PRODUCT_CHAOS_SEED = 20260724
 PRODUCT_CHAOS_STATUS = "not_run"
 
@@ -319,6 +319,9 @@ def _build_obligation(
             "persona": _persona_for(factor_values),
             "mission": _mission_for(factor_values),
             "max_turns": _max_turns_for(factor_values),
+            "witness_feasibility": _witness_feasibility_contract(
+                factor_values
+            ),
             "prewritten_future_turns_forbidden": True,
             "read_complete_agent_response_before_each_turn": True,
             "attestation": {
@@ -462,19 +465,94 @@ def _persona_for(factors: Mapping[str, str]) -> str:
 
 def _mission_for(factors: Mapping[str, str]) -> str:
     ordered = ", ".join(f"{name}={value}" for name, value in factors.items())
+    witness_instructions: list[str] = []
+    if factors.get("input_shape") == "contradictory":
+        witness_instructions.append(
+            "For contradictory input, provide two simultaneously incompatible "
+            "unresolved values and then answer the Agent's clarification; a "
+            "self-correction that already leaves one final value does not qualify"
+        )
+    if factors.get("evidence_shape") == "split":
+        witness_instructions.append(
+            "Provide the RPC request contract and the observed endpoint response "
+            "on separate turns"
+        )
+    if factors.get("recovery") in {"correct", "retry"}:
+        witness_instructions.append(
+            "Trigger one typed recoverable validation or execution failure, then "
+            "use the Agent's registered correction or retry flow until its "
+            "failure_recovery state is resolved"
+        )
+    witness_text = (
+        " Required witness semantics: " + "; ".join(witness_instructions) + "."
+        if witness_instructions
+        else ""
+    )
     return (
         "Exercise this exact generated product-chaos factor row through natural, "
         "response-driven interaction. Preserve confirmed compatible state, expose "
         "clarifications instead of guessing, and reach the bound verifier outcome. "
-        f"Required factors: {ordered}."
+        f"Required factors: {ordered}.{witness_text}"
     )
 
 
 def _max_turns_for(factors: Mapping[str, str]) -> int:
-    depth = {"0": 0, "1": 2, "2+": 4}.get(str(factors.get("interruption_depth") or ""))
-    if depth is None:
+    return _minimum_witness_turns(factors) + 2
+
+
+def _minimum_witness_turns(factors: Mapping[str, str]) -> int:
+    chain_case = str(factors.get("chain_case") or "")
+    chain_path = {
+        "known": 4,
+        "case1": 11,
+        "case2": 13,
+        "case3": 7,
+    }.get(chain_case)
+    if chain_path is None:
+        return _mapping_gap(factors, "chain_case")
+    interruption = {
+        "0": 0,
+        "1": 2,
+        "2+": 4,
+    }.get(str(factors.get("interruption_depth") or ""))
+    if interruption is None:
         return _mapping_gap(factors, "interruption_depth")
-    return 12 + depth + (2 if factors.get("input_shape") == "contradictory" else 0)
+    recovery = {
+        "none": 0,
+        "back": 1,
+        "jump": 1,
+        "correct": 3,
+        "retry": 3,
+        "reset": 2,
+    }.get(str(factors.get("recovery") or "none"))
+    if recovery is None:
+        return _mapping_gap(factors, "recovery")
+    contradictory = 2 if factors.get("input_shape") == "contradictory" else 0
+    return chain_path + interruption + recovery + contradictory
+
+
+def _witness_feasibility_contract(
+    factors: Mapping[str, str],
+) -> dict[str, Any]:
+    witnesses = [
+        f"{name}:{factors[name]}"
+        for name in (
+            "chain_case",
+            "workflow_mode",
+            "subject_group",
+            "workload",
+            "evidence_shape",
+            "input_shape",
+            "recovery",
+        )
+        if name in factors
+    ]
+    return {
+        "contract_version": 1,
+        "minimum_turns": _minimum_witness_turns(factors),
+        "required_witnesses": witnesses,
+        "pre_execution_rejection": True,
+    }
 
 
 def _validate_start_contract(row: Mapping[str, Any]) -> None:
@@ -551,6 +629,17 @@ def _validate_simulator_contract(row: Mapping[str, Any]) -> None:
     max_turns = simulator.get("max_turns")
     if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns <= 0:
         raise ValueError(f"product Chaos max_turns is invalid: {obligation_id}")
+    factors = dict(row.get("factors") or {})
+    feasibility = simulator.get("witness_feasibility")
+    expected_feasibility = _witness_feasibility_contract(factors)
+    if feasibility != expected_feasibility:
+        raise ValueError(
+            f"product Chaos witness feasibility drifted: {obligation_id}"
+        )
+    if max_turns != _max_turns_for(factors):
+        raise ValueError(
+            f"product Chaos max_turns cannot witness its factors: {obligation_id}"
+        )
 
 
 def _validate_verifier_contract(row: Mapping[str, Any]) -> None:

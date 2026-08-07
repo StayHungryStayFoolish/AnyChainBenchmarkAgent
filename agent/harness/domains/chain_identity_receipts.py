@@ -12,6 +12,7 @@ from ..state import AgentGraphState
 
 
 CHAIN_IDENTITY_RECEIPT_SCHEMA_VERSION = 2
+CHAIN_HANDOFF_EVIDENCE_RECEIPT_SCHEMA_VERSION = 1
 _CHAIN_EXISTS_VALUES = {"true", "false", "unknown"}
 _RESOLVER_SOURCES = {"llm", "planner_proposal"}
 _REFERENCE_KINDS = {"named_identity", "generic_reference", "uncertain"}
@@ -119,6 +120,87 @@ def emit_chain_identity_resolution_receipt(
     receipt = {**body, "receipt_id": _hash(body)}
     _append(state, receipt)
     return receipt
+
+
+def emit_chain_handoff_evidence_receipt(
+    state: AgentGraphState,
+    *,
+    chain: str,
+    evidence: str,
+    evidence_index: int,
+    question_id: str,
+) -> dict[str, Any]:
+    """Bind one Case 3 documentation item to its intake contract."""
+
+    body = {
+        "receipt_type": "chain_handoff_evidence",
+        "schema_version": CHAIN_HANDOFF_EVIDENCE_RECEIPT_SCHEMA_VERSION,
+        "owner": "chain_rpc",
+        "turn_index": int(state.get("turn_index") or 0),
+        "case": "case3",
+        "source_kind": "case3_document_evidence",
+        "chain_hash": _hash(str(chain or "")),
+        "evidence_hash": _hash(str(evidence or "")),
+        "evidence_index": int(evidence_index),
+        "question_id": str(question_id or ""),
+    }
+    receipt = {**body, "receipt_id": _hash(body)}
+    _append(state, receipt)
+    return receipt
+
+
+def validate_chain_handoff_evidence_receipt(
+    receipt: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Validate secret-free Case 3 documentation provenance."""
+
+    expected = {
+        "receipt_type",
+        "schema_version",
+        "owner",
+        "turn_index",
+        "case",
+        "source_kind",
+        "chain_hash",
+        "evidence_hash",
+        "evidence_index",
+        "question_id",
+        "receipt_id",
+    }
+    if set(receipt) != expected:
+        return False, "chain-handoff evidence receipt shape is invalid"
+    if (
+        receipt.get("receipt_type") != "chain_handoff_evidence"
+        or receipt.get("schema_version")
+        != CHAIN_HANDOFF_EVIDENCE_RECEIPT_SCHEMA_VERSION
+        or receipt.get("owner") != "chain_rpc"
+        or not isinstance(receipt.get("turn_index"), int)
+        or isinstance(receipt.get("turn_index"), bool)
+        or receipt.get("case") != "case3"
+        or receipt.get("source_kind") != "case3_document_evidence"
+        or not isinstance(receipt.get("evidence_index"), int)
+        or isinstance(receipt.get("evidence_index"), bool)
+        or int(receipt.get("evidence_index") or 0) <= 0
+        or receipt.get("question_id")
+        not in {"case3_protocol_evidence", "case3_evidence_input"}
+    ):
+        return False, "chain-handoff evidence receipt semantics are invalid"
+    for field in ("chain_hash", "evidence_hash", "receipt_id"):
+        value = str(receipt.get(field) or "")
+        if (
+            len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            return False, f"chain-handoff evidence {field} is invalid"
+    unsigned = {
+        str(key): value
+        for key, value in receipt.items()
+        if str(key) != "receipt_id"
+    }
+    if receipt.get("receipt_id") != _hash(unsigned):
+        return False, "chain-handoff evidence receipt identity is stale"
+    return True, ""
 
 
 def validate_chain_identity_receipt(

@@ -3270,11 +3270,8 @@ def _validate_real_cli_provenance(
     execution_case: Mapping[str, Any],
     seed_receipt: Mapping[str, Any],
 ) -> None:
-    from tests.agent_live.harness_contract_scenarios import (
-        canonical_question_contract,
-        canonical_scenario_state,
-    )
     from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
+    from tests.agent_live.runtime_checkpoint import validate_seed_receipt
 
     resolved = reviewed_execution_case(edge)
     if resolved is None:
@@ -3286,32 +3283,14 @@ def _validate_real_cli_provenance(
         raise ValueError("execution case is not bound to the ledger edge")
     if authoritative_case.descriptor_hash != str(edge.get("execution_case_hash") or ""):
         raise ValueError("ledger execution-case hash is stale")
-    receipt = dict(seed_receipt)
-    receipt_hash = str(receipt.pop("receipt_hash", ""))
-    if content_hash(receipt) != receipt_hash:
-        raise ValueError("seed receipt self-hash mismatch")
-    required = {
-        "scenario_id": scenario.scenario_id,
-        "scenario_state_fingerprint": scenario.state_fingerprint,
-        "seed_state_hash": content_hash(canonical_scenario_state(scenario.seed_state or {})),
-        "session_id": turn.session_id,
-        "session_purpose": str(observation.runtime_events[0].session_purpose),
-        "pending_question_id": str(scenario.question.get("id") or ""),
-        "pending_contract_hash": content_hash(canonical_question_contract(scenario.question)),
-    }
-    mismatches = {
-        key: {"expected": value, "actual": receipt.get(key)}
-        for key, value in required.items()
-        if receipt.get(key) != value
-    }
-    if mismatches:
-        raise ValueError(f"seed receipt does not match reviewed scenario: {mismatches}")
-    for key in ("projected_state_hash", "checkpoint_sha256"):
-        value = str(receipt.get(key) or "")
-        if not _is_sha256(value):
-            raise ValueError(f"seed receipt has invalid {key}")
-    if str(receipt.get("checkpoint_path") or "").strip() == "":
-        raise ValueError("seed receipt has no checkpoint path")
+    validate_seed_receipt(
+        seed_receipt,
+        expected_scenario_id=scenario.scenario_id,
+        expected_session_id=turn.session_id,
+        expected_session_purpose=str(
+            observation.runtime_events[0].session_purpose
+        ),
+    )
     if not authoritative_case.admits_recorded_input(turn.user_message):
         raise ValueError("PTY input does not match the reviewed execution case")
 

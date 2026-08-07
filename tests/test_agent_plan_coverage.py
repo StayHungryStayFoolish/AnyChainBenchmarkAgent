@@ -756,7 +756,7 @@ class PlanCoverageTest(unittest.TestCase):
 
 
     @unittest.skipUnless(sys.version_info >= (3, 10), "Harness runtime requires Python 3.10+")
-    def test_target_mode_intake_precedes_tentative_chain_intake(self) -> None:
+    def test_independent_chain_and_target_mode_intakes_keep_plan_order(self) -> None:
         from agent.harness.coordinator import _order_action_queue
         from agent.harness.state import new_state
 
@@ -778,7 +778,7 @@ class PlanCoverageTest(unittest.TestCase):
 
         self.assertEqual(
             [action["type"] for action in ordered],
-            ["request_target_mode_selection", "request_chain_selection"],
+            ["request_chain_selection", "request_target_mode_selection"],
         )
 
 

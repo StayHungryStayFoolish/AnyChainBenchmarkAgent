@@ -8,7 +8,10 @@ import math
 from typing import Any, Mapping
 
 from .domains.analysis_receipts import validate_analysis_receipt
-from .domains.chain_identity_receipts import validate_chain_identity_receipt
+from .domains.chain_identity_receipts import (
+    validate_chain_handoff_evidence_receipt,
+    validate_chain_identity_receipt,
+)
 from .domains.orientation_receipts import validate_orientation_receipt
 from .domains.rpc_receipts import validate_rpc_receipt
 
@@ -18,6 +21,7 @@ _HANDLER_OWNER_BY_RECEIPT = {
     "analysis_invocation": "analysis",
     "analysis_report": "analysis",
     "chain_identity_resolution": "chain_rpc",
+    "chain_handoff_evidence": "chain_rpc",
     "orientation_response": "orientation",
     "rpc_endpoint_role": "chain_rpc",
     "rpc_catalog_transition": "chain_rpc",
@@ -1097,6 +1101,8 @@ def validate_domain_control_receipt(
         return validate_analysis_receipt(receipt)
     if receipt_type == "chain_identity_resolution":
         return validate_chain_identity_receipt(receipt)
+    if receipt_type == "chain_handoff_evidence":
+        return validate_chain_handoff_evidence_receipt(receipt)
     if receipt_type == "orientation_response":
         return validate_orientation_receipt(receipt)
     return validate_rpc_receipt(receipt)

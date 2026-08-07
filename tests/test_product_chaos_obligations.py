@@ -27,6 +27,11 @@ from tests.agent_live.product_chaos_obligations import (
     validate_product_chaos_obligations,
 )
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
+from tests.agent_live.harness_contract_scenarios import (
+    canonical_question_contract,
+    canonical_scenario_state,
+)
+from tests.agent_live.runtime_checkpoint import reviewed_pending_contract
 
 
 REVISION = {"commit": "a" * 40, "worktree_hash": "b" * 64}
@@ -41,6 +46,28 @@ def _hash(value):
 def _receipt(body, *, rpc=False):
     digest = evidence_hash(body) if rpc else content_hash(body)
     return {**body, "receipt_id": digest}
+
+
+def _seed_receipt(scenario_id):
+    scenario = reviewed_scenario(scenario_id)
+    question = reviewed_pending_contract(scenario)
+    receipt = {
+        "scenario_id": scenario.scenario_id,
+        "scenario_state_fingerprint": scenario.state_fingerprint,
+        "seed_state_hash": content_hash(
+            canonical_scenario_state(scenario.seed_state or {})
+        ),
+        "projected_state_hash": "d" * 64,
+        "checkpoint_sha256": "e" * 64,
+        "checkpoint_path": f"/tmp/{scenario_id}.sqlite",
+        "session_id": "factor-test",
+        "session_purpose": "product-chaos",
+        "pending_question_id": str(question.get("id") or ""),
+        "pending_contract_hash": content_hash(
+            canonical_question_contract(question)
+        ),
+    }
+    return {**receipt, "receipt_hash": content_hash(receipt)}
 
 
 def _event(
@@ -92,6 +119,7 @@ def _factor_context(
     initial_fingerprint="initial",
     messages=(),
     events=(),
+    seed_receipt=None,
 ):
     risks = tuple(
         f"{factor_name}:{value}"
@@ -128,6 +156,7 @@ def _factor_context(
         latest_turn=None,
         completed_events=tuple(events),
         completed_decisions=decisions,
+        seed_receipt=seed_receipt or _seed_receipt(scenario_id),
     )
 
 
@@ -174,6 +203,27 @@ def _planner_receipt(turn_index):
         "planned_action_types": ["consult"],
         "semantic_units": [{"unit_id": "unit-1", "disposition": "mapped"}],
         "planner_metrics": {"unit_count": 1},
+    })
+
+
+def _chain_resolution_receipt(turn_index, *, family="jsonrpc"):
+    return _receipt({
+        "receipt_type": "chain_identity_resolution",
+        "schema_version": 2,
+        "owner": "chain_rpc",
+        "turn_index": turn_index,
+        "candidate_hash": "1" * 64,
+        "resolver_source": "llm",
+        "reference_kind": "named_identity",
+        "chain_exists": "true",
+        "canonical_name_hash": "2" * 64,
+        "possible_known_chain_hash": "3" * 64,
+        "adapter_family": family,
+        "confidence": "high",
+        "google_search_invoked": False,
+        "google_search_available": False,
+        "search_evidence_hash": "4" * 64,
+        "confirmation_required": True,
     })
 
 
@@ -248,15 +298,37 @@ def _rpc_schema_receipt(turn_index, fields):
     return _receipt(body, rpc=True)
 
 
-def _rpc_workload_receipt(turn_index, mode, *, custom):
+def _chain_handoff_evidence_receipt(turn_index):
+    return _receipt({
+        "receipt_type": "chain_handoff_evidence",
+        "schema_version": 1,
+        "owner": "chain_rpc",
+        "turn_index": turn_index,
+        "case": "case3",
+        "source_kind": "case3_document_evidence",
+        "chain_hash": _hash("weird-p2p"),
+        "evidence_hash": _hash("official documentation evidence"),
+        "evidence_index": 1,
+        "question_id": "case3_protocol_evidence",
+    })
+
+
+def _rpc_workload_receipt(turn_index, mode, *, custom, case=""):
+    receipt_case = case or ("custom_rpc" if custom else "known")
     body = {
         "receipt_type": "rpc_workload_commit",
         "receipt_version": 2,
         "turn_index": turn_index,
         "owner": "rpc_workload",
-        "case": "custom_rpc" if custom else "known",
+        "case": receipt_case,
         "rpc_mode": mode,
-        "choice": "custom_rpc" if custom else "template_default",
+        "choice": (
+            "new_chain_verified_methods"
+            if receipt_case == "new_chain"
+            else "custom_rpc"
+            if custom
+            else "template_default"
+        ),
         "methods": ["eth_test"],
         "method_hashes": [evidence_hash("eth_test")],
         "mixed_weight_entries": (
@@ -288,7 +360,7 @@ def _response_receipt(turn_index, language):
 
 
 class ProductChaosObligationCatalogTest(unittest.TestCase):
-    def test_subject_group_and_workflow_path_must_coexist_in_one_event(
+    def test_subject_group_and_workflow_path_require_connected_commits(
         self,
     ) -> None:
         definition = FORMAL_JOURNEY_VERIFIER_REGISTRY.definitions[
@@ -304,14 +376,14 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
             actions=("change_group",),
             receipts=(_domain_commit(
                 1,
-                ("active_group",),
+                ("active_group", "workflow_mode", "target_mode"),
                 owner="coordinator",
                 navigation="change_group",
                 origin="opening",
                 target="chain_auxiliary_endpoints",
                 group_state_transitions=(transition,),
             ),),
-            material=("active_group",),
+            material=("active_group", "workflow_mode", "target_mode"),
             values={
                 "workflow_mode": "rpc_benchmark",
                 "target_mode": "real-node",
@@ -342,6 +414,56 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
             }
         ))
         self.assertTrue(coherent.satisfied, coherent.details)
+
+        mode_event = _event(
+            1,
+            actions=("choose_target_mode",),
+            receipts=(_domain_commit(
+                1,
+                ("workflow_mode", "target_mode"),
+                owner="chain_rpc",
+            ),),
+            material=("workflow_mode", "target_mode"),
+            values={
+                "workflow_mode": "rpc_benchmark",
+                "target_mode": "real-node",
+            },
+            active_group="target_mode",
+        )
+        later_subject_event = _event(
+            2,
+            actions=("change_group",),
+            receipts=(_domain_commit(
+                2,
+                "active_group",
+                owner="coordinator",
+                navigation="change_group",
+                origin="target_mode",
+                target="chain_auxiliary_endpoints",
+                group_state_transitions=(transition,),
+            ),),
+            material=("active_group",),
+            values={
+                "workflow_mode": "rpc_benchmark",
+                "target_mode": "real-node",
+            },
+            active_group="chain_auxiliary_endpoints",
+        )
+        split_positive = _factor_context(
+            "subject_group",
+            subject_group="chain_auxiliary_endpoints",
+            events=(mode_event, later_subject_event),
+        )
+        split_positive = definition.verifier(JourneyVerifierContext(
+            **{
+                **split_positive.__dict__,
+                "schedule": schedule,
+                "evaluating_postcondition_id": (
+                    "subject_group_path_coherent"
+                ),
+            }
+        ))
+        self.assertTrue(split_positive.satisfied, split_positive.details)
 
         sync_group_event = _event(
             1,
@@ -510,6 +632,19 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown product Chaos verifiers"):
             validate_product_chaos_obligations(unknown, revision=REVISION)
 
+    def test_validation_rejects_unwitnessable_turn_budget_before_execution(self) -> None:
+        rows = copy.deepcopy(list(self.rows))
+        simulator = rows[0]["simulator_contract"]
+        simulator["max_turns"] = int(
+            simulator["witness_feasibility"]["minimum_turns"]
+        ) - 1
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "max_turns cannot witness its factors",
+        ):
+            validate_product_chaos_obligations(rows, revision=REVISION)
+
     def test_validation_fails_closed_on_stale_revision(self) -> None:
         with self.assertRaisesRegex(ValueError, "stale product Chaos revision"):
             validate_product_chaos_obligations(
@@ -576,6 +711,24 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
                             self.assertFalse(
                                 _observe(context, factor_name, neighbor).satisfied
                             )
+
+        valid = _factor_context(
+            "session_state",
+            scenario_id="opening",
+            messages=("continue",),
+            events=(_event(1),),
+        )
+        tampered_receipt = {
+            **valid.seed_receipt,
+            "scenario_state_fingerprint": "f" * 64,
+        }
+        tampered = JourneyVerifierContext(**{
+            **valid.__dict__,
+            "seed_receipt": tampered_receipt,
+        })
+        self.assertFalse(
+            _observe(tampered, "session_state", "fresh").satisfied
+        )
 
         group_statuses = {
             "partial": "in_progress",
@@ -741,16 +894,10 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
             "value_hash": "1" * 64,
         }
         response_field = {
-            "field_path": "response_sample",
-            "source_kind": "model_extraction_from_user_evidence",
+            "field_path": "observed_response.sample",
+            "source_kind": "endpoint_probe",
             "source_revisions": [1],
             "value_hash": "2" * 64,
-        }
-        docs_field = {
-            "field_path": "method",
-            "source_kind": "official_document",
-            "source_revisions": [1],
-            "value_hash": "3" * 64,
         }
         contexts = {
             "none": _factor_context(
@@ -779,8 +926,8 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
                 messages=("official documentation evidence",),
                 events=(_event(
                     1,
-                    receipts=(_rpc_schema_receipt(1, [docs_field]),),
-                    material=("custom_rpc.catalog",),
+                    receipts=(_chain_handoff_evidence_receipt(1),),
+                    material=("secondary_handoff.evidence",),
                 ),),
             ),
         }
@@ -896,18 +1043,37 @@ class ProductChaosObligationCatalogTest(unittest.TestCase):
 
     def test_runtime_factor_values_require_exact_owner_receipts(self) -> None:
         for case in FACTOR_OBSERVATION_VALUES["chain_case"]:
+            product_case = "known" if case == "case1" else case
+            status = "needs_review_handoff" if case == "case3" else "confirmed"
+            receipts = []
+            if case in {"case2", "case3"}:
+                receipts.append(_chain_resolution_receipt(1))
+            receipts.append(_domain_commit(
+                1, "chain_identity", owner="chain_rpc"
+            ))
+            if case == "known":
+                receipts.append(_rpc_workload_receipt(1, "single", custom=False))
+            elif case == "case1":
+                receipts.append(_rpc_workload_receipt(1, "single", custom=True))
+            elif case == "case2":
+                receipts.append(_rpc_workload_receipt(
+                    1, "single", custom=True, case="new_chain"
+                ))
             context = _factor_context(
                 "chain_case",
                 messages=(case,),
                 events=(_event(
                     1,
-                    receipts=(_domain_commit(
-                        1, "chain_identity", owner="chain_identity"
-                    ),),
+                    receipts=tuple(receipts),
                     material=("chain_identity",),
                     values={
-                        "chain_identity.case": case,
-                        "chain_identity.status": "confirmed",
+                        "chain_identity.case": product_case,
+                        "chain_identity.status": status,
+                        **(
+                            {"secondary_handoff.status": "ready"}
+                            if case == "case3"
+                            else {}
+                        ),
                     },
                 ),),
             )

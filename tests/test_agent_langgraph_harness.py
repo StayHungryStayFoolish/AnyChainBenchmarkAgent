@@ -11899,6 +11899,9 @@ response:
 
         state = new_state("finish-new-chain-methods", language="zh")
         state["active_group"] = "endpoint_process"
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["use_fake_node"] = True
         state["chain_identity"] = {
             "raw": "local-evm",
             "canonical": "local-evm",
@@ -15050,6 +15053,9 @@ response:
 
     def test_case3_handoff_collects_followup_evidence_without_fallback(self) -> None:
         from tests.agent_live.graph_turn import invoke_action
+        from agent.harness.control_receipts import (
+            validate_persisted_domain_control_receipt,
+        )
         from agent.harness.domains.chain_rpc_questions import _case3_evidence_question
         from agent.harness.state import new_state
 
@@ -15086,6 +15092,19 @@ response:
         self.assertEqual(result["chain_identity"]["status"], "case3_collecting_evidence")
         self.assertEqual(result["secondary_handoff"]["evidence"], ["protocol: weird-p2p"])
         self.assertEqual(result.get("pending_question", {}).get("id"), "case3_evidence_next")
+        receipts = [
+            receipt
+            for receipt in (result.get("turn_context") or {}).get("control_receipts") or []
+            if receipt.get("receipt_type") == "chain_handoff_evidence"
+        ]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["source_kind"], "case3_document_evidence")
+        self.assertNotIn(user_text, str(receipts[0]))
+        valid, reason = validate_persisted_domain_control_receipt(
+            receipts[0],
+            turn_index=int(result.get("turn_index") or 0),
+        )
+        self.assertTrue(valid, reason)
         self.assertIn("已记录", "\n".join(result.get("visible_response") or []))
         self.assertNotIn("你想测试哪条链", "\n".join(result.get("visible_response") or []))
 
@@ -18248,6 +18267,76 @@ response:
         self.assertIn(_render_question(replacement, "en"), response)
         self.assertNotIn(_render_question(previous, "en"), response)
         self.assertIn("Endpoint validation passed.", response)
+
+    def test_domain_pending_question_defers_to_registered_group_prerequisite(self) -> None:
+        from agent.harness.contracts import HandlerResult
+        from agent.harness.coordinator import _apply_handler_result
+        from agent.harness.domains.chain_rpc import (
+            apply_chain_rpc_answer,
+            question_for_chain_rpc,
+        )
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.state import new_state
+
+        state = new_state("out-of-order-chain-rpc", language="en")
+        state["chain_identity"] = {
+            "canonical": "AuroraEdge Testnet",
+            "status": "confirmed",
+            "case": "case2",
+            "adapter_family": "jsonrpc",
+            "identity_confirmed": True,
+            "schema_confirmed": True,
+        }
+        state["custom_rpc"] = {
+            "status": "needs_scope",
+            **_validated_catalog([
+                {"method": "eth_blockNumber", "params": []},
+            ], chain="AuroraEdge Testnet"),
+        }
+        state["pending_question"] = manual_question(
+            "chain_identity",
+            "case2_identity_resolution",
+            question_text("question.chain_rpc.chain.prompt", target_mode="not-selected"),
+            owner="chain_rpc",
+            field="chain",
+        )
+        scope_question = question_for_chain_rpc(state, "endpoint_process")
+        self.assertEqual(scope_question["id"], "custom_rpc_scope")
+        self.assertEqual(
+            scope_question["requires_capabilities"],
+            ["target_mode", "chain_identity"],
+        )
+
+        deferred = _apply_handler_result(
+            state,
+            HandlerResult(
+                pending_question=scope_question,
+                next_group="endpoint_process",
+                completion="in_progress",
+            ),
+            owner="chain_rpc",
+        )
+
+        self.assertEqual(deferred["pending_question"]["id"], "target_mode_select")
+        self.assertEqual(deferred["active_group"], "target_mode")
+        self.assertEqual(deferred["control"]["deferred_group"], "endpoint_process")
+        self.assertEqual(deferred["custom_rpc"], state["custom_rpc"])
+        self.assertEqual(deferred["group_states"]["chain_identity"]["status"], "completed")
+
+        selected = apply_chain_rpc_answer(
+            deferred,
+            deferred["pending_question"],
+            "fake-node",
+            "fake-node",
+        )
+        resumed = _apply_handler_result(deferred, selected, owner="chain_rpc")
+
+        self.assertEqual(resumed["target_mode"], "fake-node")
+        self.assertEqual(resumed["workflow_mode"], "rpc_benchmark")
+        self.assertEqual(resumed["pending_question"]["id"], "custom_rpc_scope")
+        self.assertEqual(resumed["active_group"], "endpoint_process")
+        self.assertNotIn("deferred_group", resumed.get("control") or {})
+        self.assertEqual(resumed["custom_rpc"], state["custom_rpc"])
 
     def test_model_chain_summary_cannot_claim_google_search_provenance(self) -> None:
         from agent.harness.domains.chain_identity import _verified_search_summary

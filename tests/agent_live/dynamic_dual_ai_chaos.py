@@ -440,6 +440,7 @@ class JourneyVerifierContext:
     completed_events: tuple[RuntimeTurnEvent, ...] = ()
     setup_events: tuple[RuntimeTurnEvent, ...] = ()
     completed_decisions: tuple[JourneyDecisionProvenance, ...] = ()
+    seed_receipt: Mapping[str, Any] = field(default_factory=dict)
     evaluating_postcondition_id: str = ""
     verifier_input_contract: Mapping[str, Any] = field(default_factory=dict)
 
@@ -454,7 +455,7 @@ class JourneyPostconditionResult:
 
 
 JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION = 1
-JOURNEY_EVIDENCE_SCHEMA_VERSION = 3
+JOURNEY_EVIDENCE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -507,6 +508,7 @@ def build_journey_verifier_context(
     transcript: Sequence[tuple[str, str]],
     observed_edge_keys: Sequence[str],
     latest_turn: PtyCliTurnRecord | None,
+    seed_receipt: Mapping[str, Any] | None = None,
 ) -> JourneyVerifierContext:
     """Build verifier input from controller-observed immutable facts."""
 
@@ -520,6 +522,7 @@ def build_journey_verifier_context(
         latest_turn=latest_turn,
         completed_events=tuple(events),
         completed_decisions=tuple(decisions),
+        seed_receipt=dict(seed_receipt or {}),
         verifier_input_contract=dict(schedule.verifier_input_contract),
     )
 
@@ -3364,7 +3367,7 @@ class DynamicDualAiJourneyRunner:
         from tests.agent_live.runtime_checkpoint import reviewed_scenario, seed_runtime_checkpoint
 
         start_scenario = reviewed_scenario(self.schedule.start_scenario)
-        seed_runtime_checkpoint(
+        seed_receipt = seed_runtime_checkpoint(
             start_scenario.seed_state,
             checkpoint_path=runtime_root / "checkpoints.sqlite",
             session_id=self.config.session_id,
@@ -3372,6 +3375,7 @@ class DynamicDualAiJourneyRunner:
             scenario_id=start_scenario.scenario_id,
             scenario_state_fingerprint=start_scenario.state_fingerprint,
         )
+        seed_receipt_artifact = seed_receipt.artifact
 
         transcript: list[tuple[str, str]] = []
         transcript_lines: list[str] = []
@@ -3526,6 +3530,7 @@ class DynamicDualAiJourneyRunner:
                 transcript=transcript,
                 observed_edge_keys=observed_edge_keys,
                 latest_turn=None,
+                seed_receipt=seed_receipt_artifact,
             )
             initial_forbidden = self._verify_forbidden_outcomes(initial_context)
             initial_terminal = self._verify_outcome(
@@ -3727,6 +3732,7 @@ class DynamicDualAiJourneyRunner:
                     transcript=transcript,
                     observed_edge_keys=observed_edge_keys,
                     latest_turn=turn,
+                    seed_receipt=seed_receipt_artifact,
                 )
                 forbidden = self._verify_forbidden_outcomes(verifier_context)
                 terminal = self._verify_outcome(
@@ -3846,6 +3852,8 @@ class DynamicDualAiJourneyRunner:
                     self.postcondition_verifier_registry
                 ),
                 "session_id": self.config.session_id,
+                "session_purpose": self.config.session_purpose,
+                "seed_receipt": seed_receipt_artifact,
                 "execution_id": self.config.execution_id,
                 "provider": observed_provider or self.config.provider,
                 "model": observed_model or self.config.model,
@@ -3994,6 +4002,7 @@ class DynamicDualAiJourneyRunner:
         transcript: Sequence[tuple[str, str]],
         observed_edge_keys: Sequence[str],
         latest_turn: PtyCliTurnRecord | None,
+        seed_receipt: Mapping[str, Any],
     ) -> JourneyVerifierContext:
         return build_journey_verifier_context(
             schedule=self.schedule,
@@ -4005,6 +4014,7 @@ class DynamicDualAiJourneyRunner:
             transcript=transcript,
             observed_edge_keys=observed_edge_keys,
             latest_turn=latest_turn,
+            seed_receipt=seed_receipt,
         )
 
     def _validated_decision_attestations(
@@ -4374,6 +4384,18 @@ def validate_journey_evidence_artifact(
         raise ValueError("Journey evidence schedule id does not match")
     if payload.get("schedule_hash") != content_hash(journey_schedule_payload(schedule)):
         raise ValueError("Journey evidence schedule hash does not match")
+    session_id = str(payload.get("session_id") or "")
+    session_purpose = str(payload.get("session_purpose") or "")
+    if not session_id or not session_purpose:
+        raise ValueError("Journey evidence lacks seed session identity")
+    from tests.agent_live.runtime_checkpoint import validate_seed_receipt
+
+    validate_seed_receipt(
+        payload.get("seed_receipt") or {},
+        expected_scenario_id=schedule.start_scenario,
+        expected_session_id=session_id,
+        expected_session_purpose=session_purpose,
+    )
     expected_registry = journey_outcome_verifier_registry_payload(verifier_registry)
     if payload.get("verifier_registry") != expected_registry:
         raise ValueError("Journey evidence verifier registry does not match")

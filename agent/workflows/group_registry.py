@@ -97,7 +97,6 @@ GROUPS: tuple[GroupSpec, ...] = (
             "case3_protocol_evidence",
             "case3_evidence_next",
         ),
-        depends_on=("target_mode",),
         invalidates=(
             "endpoint_process", "chain_auxiliary_endpoints", "workload_rpc",
             "target_samples_fixtures", "preflight_smoke_execution", "job_monitoring",

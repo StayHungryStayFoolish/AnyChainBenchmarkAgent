@@ -16,6 +16,7 @@ from agent.harness.control_receipts import (
 from agent.harness.plan_coverage import segment_user_turn
 from agent.workflows.group_registry import GROUP_ORDER
 from agent.workflows.group_registry import (
+    GROUP_SPEC_BY_NAME,
     NEW_CHAIN_ENDPOINT_STATUSES,
     RPC_EXTENSION_ENDPOINT_STATUSES,
 )
@@ -700,6 +701,30 @@ def _claimed_factor(context: JourneyVerifierContext, name: str, value: str) -> b
     )
 
 
+def _validated_seed_binding(
+    context: JourneyVerifierContext,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], str]:
+    scenario_id = str(getattr(context.schedule, "start_scenario", "") or "")
+    try:
+        from tests.agent_live.runtime_checkpoint import (
+            reviewed_scenario,
+            validate_seed_receipt,
+        )
+
+        receipt = validate_seed_receipt(
+            context.seed_receipt,
+            expected_scenario_id=scenario_id,
+            expected_session_id=str(context.initial_event.thread_id or ""),
+            expected_session_purpose=str(
+                context.initial_event.session_purpose or ""
+            ),
+        )
+        scenario = reviewed_scenario(scenario_id)
+        return receipt, dict(scenario.seed_state or {}), ""
+    except (TypeError, ValueError) as exc:
+        return {}, {}, str(exc)
+
+
 def _seed_factor_observed(
     context: JourneyVerifierContext,
     name: str,
@@ -707,9 +732,13 @@ def _seed_factor_observed(
 ) -> tuple[bool, Mapping[str, Any]]:
     scenario_id = str(getattr(context.schedule, "start_scenario", "") or "")
     proof = _seed_classification(scenario_id, name)
-    fingerprint_bound = (
-        str(context.initial_event.after_fingerprint)
-        == str(proof["scenario_state_fingerprint"])
+    validated_receipt, _seed_state, receipt_error = _validated_seed_binding(
+        context
+    )
+    fingerprint_bound = bool(
+        validated_receipt
+        and validated_receipt.get("scenario_state_fingerprint")
+        == proof["scenario_state_fingerprint"]
     )
     classified = proof["classified_value"] == value
     missing = []
@@ -720,7 +749,10 @@ def _seed_factor_observed(
     return fingerprint_bound and classified, {
         "evidence_class": "seed_fact",
         "typed_seed_proof": proof,
-        "actual_initial_event_fingerprint": context.initial_event.after_fingerprint,
+        "seed_receipt_hash": str(
+            validated_receipt.get("receipt_hash") or ""
+        ),
+        "seed_receipt_error": receipt_error,
         "missing_product_receipts": missing,
     }
 
@@ -819,6 +851,7 @@ def _evidence_shape_observed(
         "rpc_schema_provenance",
         "rpc_catalog_transition",
         "analysis_evidence_block",
+        "chain_handoff_evidence",
     )
     evidence_delta = _changed_path(
         context,
@@ -839,12 +872,15 @@ def _evidence_shape_observed(
     ]
     response_fields = [
         field for field in fields
-        if str(field.get("field_path") or "").startswith("response")
+        if str(field.get("field_path") or "").startswith(
+            "observed_response."
+        )
     ]
     docs_fields = [
         field for field in fields
         if field.get("source_kind") == "official_document"
     ]
+    handoff_docs = _validated_receipts(context, "chain_handoff_evidence")
     request_turns = {
         int(event.turn_index)
         for event, receipt in provenance
@@ -859,7 +895,9 @@ def _evidence_shape_observed(
         for event, receipt in provenance
         if any(
             isinstance(field, Mapping)
-            and str(field.get("field_path") or "").startswith("response")
+            and str(field.get("field_path") or "").startswith(
+                "observed_response."
+            )
             for field in receipt.get("fields") or ()
         )
     }
@@ -886,12 +924,12 @@ def _evidence_shape_observed(
             and bool(response_fields)
             and request_precedes_response
         ),
-        "docs": bool(docs_fields) and not request_fields and not response_fields,
+        "docs": bool(docs_fields or handoff_docs) and not request_fields and not response_fields,
     }[value]
     missing = []
     if not observed:
-        if value == "docs" and not docs_fields:
-            missing.append("rpc_schema_provenance.source_kind=official_document")
+        if value == "docs" and not (docs_fields or handoff_docs):
+            missing.append("chain_handoff_evidence:case3_document_evidence")
         elif value == "split":
             missing.append("ordered_multi_turn_rpc_schema_provenance")
         else:
@@ -901,6 +939,7 @@ def _evidence_shape_observed(
         "request_field_count": len(request_fields),
         "response_field_count": len(response_fields),
         "docs_field_count": len(docs_fields),
+        "chain_handoff_document_receipt_count": len(handoff_docs),
         "source_revisions": sorted(revisions),
         "receipt_turns": sorted(receipt_turns),
         "request_turns": sorted(request_turns),
@@ -1148,44 +1187,109 @@ def _factor_structural_observation(
     if name == "input_shape":
         return _input_shape_observed(context, value)
     if name == "chain_case":
+        accepted_cases = {
+            "known": frozenset({"known"}),
+            "case1": frozenset({"known"}),
+            "case2": frozenset({"case2", "case2_runtime_override"}),
+            "case3": frozenset({"case3"}),
+        }[value]
         owner_receipts = _validated_receipts(
             context, "chain_identity_resolution", "domain_commit"
         )
-        exact_state = _has_state_value(context, "chain_identity.case", value)
-        confirmed_state = _has_state_value(
-            context,
+        _seed_receipt, seed_state, _seed_error = _validated_seed_binding(
+            context
+        )
+        seed_identity = dict(seed_state.get("chain_identity") or {})
+        exact_state = _event_has_state_value(
+            context.current_event,
+            "chain_identity.case",
+            *accepted_cases,
+        )
+        accepted_statuses = (
+            frozenset({"needs_review_handoff"})
+            if value == "case3"
+            else frozenset({"confirmed"})
+        )
+        terminal_state = _event_has_state_value(
+            context.current_event,
             "chain_identity.status",
-            "confirmed",
+            *accepted_statuses,
         )
-        owner_bound = any(
-            (
-                receipt.get("receipt_type") == "chain_identity_resolution"
-                and _event_has_state_value(event, "chain_identity.case", value)
-                and _event_has_state_value(
-                    event, "chain_identity.status", "confirmed"
-                )
-            )
-            or (
-                receipt.get("receipt_type") == "domain_commit"
-                and receipt.get("owner") == "chain_identity"
-                and _receipt_writes(receipt, "chain_identity")
-                and _event_has_state_value(event, "chain_identity.case", value)
-                and _event_has_state_value(
-                    event, "chain_identity.status", "confirmed"
-                )
-            )
+        seed_owner_bound = bool(
+            seed_identity.get("case") in accepted_cases
+            and seed_identity.get("status") in accepted_statuses
+        )
+        resolution_turns = [
+            int(event.turn_index)
             for event, receipt in owner_receipts
+            if receipt.get("receipt_type") == "chain_identity_resolution"
+            and _event_has_state_value(
+                event, "chain_identity.case", *accepted_cases
+            )
+        ]
+        confirmation_turns = [
+            int(event.turn_index)
+            for event, receipt in owner_receipts
+            if receipt.get("receipt_type") == "domain_commit"
+            and receipt.get("owner") == "chain_rpc"
+            and _receipt_writes(receipt, "chain_identity")
+            and _event_has_state_value(
+                event, "chain_identity.case", *accepted_cases
+            )
+            and _event_has_state_value(
+                event, "chain_identity.status", *accepted_statuses
+            )
+        ]
+        workload_receipts = [
+            receipt
+            for _, receipt in _validated_receipts(
+                context, "rpc_workload_commit"
+            )
+        ]
+        case_specific = {
+            "known": any(
+                receipt.get("choice") == "template_default"
+                for receipt in workload_receipts
+            ),
+            "case1": any(
+                receipt.get("case") == "custom_rpc"
+                and receipt.get("choice") == "custom_rpc"
+                for receipt in workload_receipts
+            ),
+            "case2": any(
+                receipt.get("case") == "new_chain"
+                and receipt.get("choice") == "new_chain_verified_methods"
+                for receipt in workload_receipts
+            ),
+            "case3": _event_has_state_value(
+                context.current_event,
+                "secondary_handoff.status",
+                "ready",
+            ),
+        }[value]
+        owner_bound = bool(
+            (confirmation_turns or seed_owner_bound)
+            and (
+                value in {"known", "case1"}
+                or resolution_turns
+                or seed_owner_bound
+            )
         )
-        observed = exact_state and confirmed_state and owner_bound
+        observed = exact_state and terminal_state and owner_bound and case_specific
         return observed, {
             "evidence_class": "runtime_fact",
             "exact_case": value,
-            "required_status": "confirmed",
+            "accepted_product_cases": sorted(accepted_cases),
+            "required_statuses": sorted(accepted_statuses),
+            "case_specific_receipt_observed": case_specific,
             "owner_receipt_count": len(owner_receipts),
+            "resolution_turns": resolution_turns,
+            "confirmation_turns": confirmation_turns,
+            "reviewed_seed_owner_bound": seed_owner_bound,
             "missing_product_receipts": (
                 []
                 if observed
-                else [f"chain_identity_owner_receipt:{value}:confirmed"]
+                else [f"chain_identity_owner_receipt:{value}:terminal"]
             ),
         }
     if name == "workload":
@@ -1220,8 +1324,26 @@ def _factor_structural_observation(
                 if receipt.get("rpc_mode") == mode
                 and receipt.get("job_local_override") is custom
                 and receipt.get("replace_defaults") is custom
-                and receipt.get("choice")
-                == ("custom_rpc" if custom else "template_default")
+                and (
+                    (
+                        not custom
+                        and receipt.get("choice") == "template_default"
+                    )
+                    or (
+                        custom
+                        and (
+                            (
+                                receipt.get("case") == "custom_rpc"
+                                and receipt.get("choice") == "custom_rpc"
+                            )
+                            or (
+                                receipt.get("case") == "new_chain"
+                                and receipt.get("choice")
+                                == "new_chain_verified_methods"
+                            )
+                        )
+                    )
+                )
                 and bool(receipt.get("methods"))
             ]
             observed = len(commits) == 1
@@ -1285,9 +1407,36 @@ def subject_group_path_coherent(
         "real": ("rpc_benchmark", "real-node"),
         "sync": ("sync_observe", "sync-observe"),
     }.get(factors.get("workflow_mode"))
+    subject_spec = GROUP_SPEC_BY_NAME.get(subject_group)
+    path_applicable = bool(
+        expected_mode
+        and subject_spec is not None
+        and (
+            not subject_spec.workflow_modes
+            or expected_mode[0] in subject_spec.workflow_modes
+        )
+        and (
+            not subject_spec.target_modes
+            or expected_mode[1] in subject_spec.target_modes
+        )
+    )
 
-    matching_turns: list[int] = []
+    subject_turns: list[int] = []
+    mode_turns: list[int] = []
+    invalidation_turns: list[int] = []
     if expected_mode and subject_group:
+        mode_turns = [
+            int(event.turn_index)
+            for event, receipt in _domain_commits(context)
+            if _receipt_writes(receipt, "workflow_mode")
+            and _receipt_writes(receipt, "target_mode")
+            and _event_has_state_value(
+                event, "workflow_mode", expected_mode[0]
+            )
+            and _event_has_state_value(
+                event, "target_mode", expected_mode[1]
+            )
+        ]
         for event, receipt in _domain_commits(context):
             transitions = [
                 transition
@@ -1296,19 +1445,6 @@ def subject_group_path_coherent(
                 and str(transition.get("group") or "") == subject_group
             ]
             if not transitions:
-                continue
-            if not (
-                _event_has_state_value(
-                    event,
-                    "workflow_mode",
-                    expected_mode[0],
-                )
-                and _event_has_state_value(
-                    event,
-                    "target_mode",
-                    expected_mode[1],
-                )
-            ):
                 continue
             if subject_group == "endpoint_process" and factors.get(
                 "workflow_mode"
@@ -1330,20 +1466,52 @@ def subject_group_path_coherent(
                         continue
                 else:
                     continue
-            matching_turns.append(int(event.turn_index))
+            subject_turns.append(int(event.turn_index))
+        if subject_turns and mode_turns:
+            connected_after = max(min(subject_turns), min(mode_turns))
+            invalidation_turns = [
+                int(event.turn_index)
+                for event, receipt in _validated_receipts(
+                    context, "domain_commit"
+                )
+                if int(event.turn_index) > connected_after
+                and subject_group in set(
+                    receipt.get("invalidated_groups") or ()
+                )
+            ]
+    current_mode_matches = bool(
+        expected_mode
+        and _event_has_state_value(
+            context.current_event, "workflow_mode", expected_mode[0]
+        )
+        and _event_has_state_value(
+            context.current_event, "target_mode", expected_mode[1]
+        )
+    )
+    observed = bool(
+        subject_turns
+        and mode_turns
+        and path_applicable
+        and current_mode_matches
+        and not invalidation_turns
+    )
 
     return _result(
         "subject_group_path_coherent",
-        bool(matching_turns),
+        observed,
         context,
         subject_group=subject_group,
         workflow_mode_factor=factors.get("workflow_mode", ""),
         chain_case_factor=factors.get("chain_case", ""),
-        matching_turn_indexes=matching_turns,
+        subject_turn_indexes=subject_turns,
+        workflow_mode_turn_indexes=mode_turns,
+        later_subject_invalidation_turn_indexes=invalidation_turns,
+        current_mode_matches=current_mode_matches,
+        subject_group_applicable=path_applicable,
         missing_product_receipts=(
             []
-            if matching_turns
-            else ["domain_commit:subject_group+workflow_path"]
+            if observed
+            else ["connected_domain_commits:subject_group+workflow_path"]
         ),
     )
 

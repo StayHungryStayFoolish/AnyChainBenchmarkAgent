@@ -61,6 +61,7 @@ from .plan_coverage import (
 )
 from .questions import (
     exact_option_prefix_answer,
+    manual_action_for_value,
     pending_option_value_exists,
     pending_value_identity,
     researched_identity_value_is_valid,
@@ -6142,6 +6143,8 @@ def _merge_owner_documents(
 
 def _project_unresolved_mutation_conflicts(
     candidate: Mapping[str, Any],
+    *,
+    conflict_actions: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Keep ambiguous same-dimension mutations out of the durable queue.
 
@@ -6159,9 +6162,12 @@ def _project_unresolved_mutation_conflicts(
         return output
     if not all(isinstance(action, Mapping) for action in actions):
         return output
-    conflicts = mutation_conflict_action_groups(tuple(
-        dict(action) for action in actions
-    ))
+    projected_actions = tuple(
+        dict(action) for action in (conflict_actions or actions)
+    )
+    if len(projected_actions) != len(actions):
+        return output
+    conflicts = mutation_conflict_action_groups(projected_actions)
     conflict_indexes = {
         index
         for _dimension, indexes in conflicts
@@ -6222,6 +6228,31 @@ def _project_unresolved_mutation_conflicts(
     return output
 
 
+def _pending_owner_mutation_projection(
+    actions: Sequence[Mapping[str, Any]],
+    state: AgentGraphState,
+) -> tuple[dict[str, Any], ...]:
+    """Project pending answers to their declared owner for conflict checks."""
+
+    pending = dict(state.get("pending_question") or {})
+    projected: list[dict[str, Any]] = []
+    for raw in actions:
+        action = dict(raw)
+        if str(action.get("type") or "") == "answer_pending":
+            answer = action.get("selected_value", action.get("answer"))
+            owner_action = manual_action_for_value(pending, answer)
+            owner_spec = ACTION_BY_TYPE.get(
+                str(owner_action.get("type") or "")
+            )
+            if owner_action and owner_spec is not None and owner_spec.mutation_dimension:
+                for metadata_key in ("_plan_scope", "_submitted_turn_index"):
+                    if metadata_key in action:
+                        owner_action[metadata_key] = action[metadata_key]
+                action = owner_action
+        projected.append(action)
+    return tuple(projected)
+
+
 def _prepare_candidate_with_normalized_conflict_projection(
     candidate: Mapping[str, Any],
     state: AgentGraphState,
@@ -6260,13 +6291,18 @@ def _prepare_candidate_with_normalized_conflict_projection(
         isinstance(action, Mapping) for action in actions
     ):
         return normalized, candidate_text, validation
-    if not mutation_conflict_action_groups(tuple(
-        dict(action) for action in actions
-    )):
+    conflict_actions = _pending_owner_mutation_projection(
+        tuple(dict(action) for action in actions),
+        state,
+    )
+    if not mutation_conflict_action_groups(conflict_actions):
         return normalized, candidate_text, validation
 
     projected = _strip_candidate_admission_metadata(
-        _project_unresolved_mutation_conflicts(normalized)
+        _project_unresolved_mutation_conflicts(
+            normalized,
+            conflict_actions=conflict_actions,
+        )
     )
     projected_support_ids = frozenset(
         str(unit_id)

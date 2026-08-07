@@ -182,10 +182,41 @@ def build_product_factor_model() -> FactorModel:
                 chain_case=chain_case,
                 workload=workload,
             )
+    for workload in ("custom_single", "custom_mixed"):
+        forbid(
+            f"known-no-{workload}",
+            chain_case="known",
+            workload=workload,
+        )
     for workload in (
         "default_single", "default_mixed", "custom_single", "custom_mixed"
     ):
         forbid(f"case3-no-{workload}", chain_case="case3", workload=workload)
+
+    # Evidence shape describes the receipts required by each chain lifecycle,
+    # not arbitrary text pasted elsewhere in the same conversation. Template
+    # workloads need no custom schema evidence; Case 1/2 require independently
+    # sourced request and observed-response provenance; Case 3 requires official
+    # protocol documentation for its development handoff.
+    for evidence_shape in ("request", "response", "split", "docs"):
+        forbid(
+            f"known-no-{evidence_shape}-evidence",
+            chain_case="known",
+            evidence_shape=evidence_shape,
+        )
+    for chain_case in ("case1", "case2"):
+        for evidence_shape in ("none", "request", "response", "docs"):
+            forbid(
+                f"{chain_case}-requires-split-not-{evidence_shape}",
+                chain_case=chain_case,
+                evidence_shape=evidence_shape,
+            )
+    for evidence_shape in ("none", "request", "response", "split"):
+        forbid(
+            f"case3-requires-docs-not-{evidence_shape}",
+            chain_case="case3",
+            evidence_shape=evidence_shape,
+        )
 
     # Back requires a real interruption frame. A quarantined checkpoint is
     # presented through the resume selector, so it has a choice contract and

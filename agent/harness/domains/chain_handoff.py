@@ -9,6 +9,7 @@ from ..secret_refs import materialize_state_secret_references
 from ..state import AgentGraphState
 from ..transitions import mark_group_reconfigured, record_group_invalidations
 from .chain_rpc_questions import _case3_evidence_question
+from .chain_identity_receipts import emit_chain_handoff_evidence_receipt
 from .response_fragments import ResponseCollector, emit
 from .chain_rpc_support import _next_group
 from .rpc_catalog import (
@@ -265,6 +266,15 @@ def _record_case3_evidence(
     items = handoff.setdefault("evidence", [])
     if evidence:
         items.append(evidence)
+        emit_chain_handoff_evidence_receipt(
+            state,
+            chain=normalize_scalar(identity.get("canonical") or identity.get("raw")),
+            evidence=evidence,
+            evidence_index=len(items),
+            question_id=normalize_scalar(
+                (state.get("pending_question") or {}).get("id")
+            ),
+        )
     identity.update({"status": "case3_collecting_evidence", "case": "case3"})
     handoff.update({"status": "collecting_evidence", "kind": "case3_protocol_adapter_implementation", "chain": normalize_scalar(identity.get("canonical") or identity.get("raw"))})
     state['active_group'] = "chain_identity"

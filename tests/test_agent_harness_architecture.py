@@ -4051,7 +4051,8 @@ class HarnessArchitectureTest(unittest.TestCase):
     def test_group_specs_own_dependencies_and_invalidation_metadata(self) -> None:
         from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
 
-        self.assertIn("target_mode", GROUP_SPEC_BY_NAME["chain_identity"].depends_on)
+        self.assertNotIn("target_mode", GROUP_SPEC_BY_NAME["chain_identity"].depends_on)
+        self.assertIn("target_mode", GROUP_SPEC_BY_NAME["endpoint_process"].depends_on)
         self.assertIn("workload_rpc", GROUP_SPEC_BY_NAME["chain_identity"].invalidates)
         self.assertIn("preflight_smoke_execution", GROUP_SPEC_BY_NAME["qps_profile"].invalidates)
 

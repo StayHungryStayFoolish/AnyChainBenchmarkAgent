@@ -145,8 +145,15 @@ class ProductChaosFactorCoverageTest(unittest.TestCase):
             for row in rows
         ))
         self.assertTrue(any(
-            row["workload"] == "default_single"
-            and row["evidence_shape"] == "response"
+            row["chain_case"] == "known"
+            and row["workload"] == "default_single"
+            and row["evidence_shape"] == "none"
+            for row in rows
+        ))
+        self.assertTrue(any(
+            row["chain_case"] == "case2"
+            and row["workload"] == "custom_single"
+            and row["evidence_shape"] == "split"
             for row in rows
         ))
 

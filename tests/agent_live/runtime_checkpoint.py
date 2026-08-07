@@ -86,6 +86,70 @@ class SeedReceipt:
     def receipt_hash(self) -> str:
         return content_hash(self.payload)
 
+    @property
+    def artifact(self) -> dict[str, str]:
+        return {**self.payload, "receipt_hash": self.receipt_hash}
+
+
+def validate_seed_receipt(
+    value: Mapping[str, Any],
+    *,
+    expected_scenario_id: str,
+    expected_session_id: str,
+    expected_session_purpose: str,
+) -> dict[str, str]:
+    """Validate one checkpoint seed against its reviewed scenario and session."""
+
+    receipt = dict(value)
+    expected_fields = {
+        *SeedReceipt.__dataclass_fields__,
+        "receipt_hash",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("seed receipt fields are invalid")
+    receipt_hash = str(receipt.pop("receipt_hash") or "")
+    if content_hash(receipt) != receipt_hash:
+        raise ValueError("seed receipt self-hash mismatch")
+    scenario = reviewed_scenario(expected_scenario_id)
+    question = reviewed_pending_contract(scenario)
+    expected = {
+        "scenario_id": scenario.scenario_id,
+        "scenario_state_fingerprint": scenario.state_fingerprint,
+        "seed_state_hash": content_hash(
+            canonical_scenario_state(scenario.seed_state or {})
+        ),
+        "session_id": str(expected_session_id),
+        "session_purpose": str(expected_session_purpose),
+        "pending_question_id": str(question.get("id") or ""),
+        "pending_contract_hash": content_hash(
+            canonical_question_contract(question)
+        ),
+    }
+    mismatches = {
+        key: {"expected": expected_value, "actual": receipt.get(key)}
+        for key, expected_value in expected.items()
+        if receipt.get(key) != expected_value
+    }
+    if mismatches:
+        raise ValueError(
+            f"seed receipt does not match reviewed scenario: {mismatches}"
+        )
+    for key in (
+        "scenario_state_fingerprint",
+        "seed_state_hash",
+        "projected_state_hash",
+        "checkpoint_sha256",
+        "pending_contract_hash",
+    ):
+        candidate = str(receipt.get(key) or "")
+        if len(candidate) != 64 or any(
+            character not in "0123456789abcdef" for character in candidate
+        ):
+            raise ValueError(f"seed receipt has invalid {key}")
+    if not str(receipt.get("checkpoint_path") or "").strip():
+        raise ValueError("seed receipt has no checkpoint path")
+    return {**{key: str(item) for key, item in receipt.items()}, "receipt_hash": receipt_hash}
+
 
 def seed_runtime_checkpoint(
     seed_state: Mapping[str, Any],

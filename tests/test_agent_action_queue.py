@@ -177,7 +177,7 @@ class ActionQueueOrderingTests(unittest.TestCase):
             [11, 10],
         )
 
-    def test_neighboring_missing_capability_keeps_cross_turn_provider_dependency(self) -> None:
+    def test_independent_chain_and_mode_intakes_keep_cross_turn_order(self) -> None:
         state = new_state("cross-turn-capability")
         actions = [
             {
@@ -197,7 +197,7 @@ class ActionQueueOrderingTests(unittest.TestCase):
 
         self.assertEqual(
             _types(ordered),
-            ["request_target_mode_selection", "request_chain_selection"],
+            ["request_chain_selection", "request_target_mode_selection"],
         )
 
     def test_conflicting_same_turn_typed_mutations_fail_atomically(self) -> None:
