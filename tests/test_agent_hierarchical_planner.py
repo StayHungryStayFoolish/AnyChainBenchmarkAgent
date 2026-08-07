@@ -8100,6 +8100,31 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 3)
 
+    def test_pending_entailment_contract_accepts_concrete_corrected_value(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _pending_entailment_prompt
+
+        prompt = _pending_entailment_prompt()
+
+        self.assertIn(
+            "Correction or replacement framing does not disqualify a source "
+            "that itself explicitly assigns one concrete, directly usable value",
+            prompt,
+        )
+        self.assertIn(
+            "replace the value without supplying that concrete value",
+            prompt,
+        )
+        self.assertNotIn(
+            "a navigation request, a correction, a deferral",
+            prompt,
+        )
+        self.assertNotIn(
+            "a request to change, choose, revisit, or replace the value,",
+            prompt,
+        )
+
     def test_pending_entailment_quorum_precedes_generic_stage_a_review(self) -> None:
         from agent.harness.hierarchical_planner import _review_stage_a_candidate
 
