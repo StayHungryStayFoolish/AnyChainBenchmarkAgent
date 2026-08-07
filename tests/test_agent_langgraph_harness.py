@@ -12717,6 +12717,40 @@ response:
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_continue")
         self.assertEqual(_catalog_methods(result)[0]["observed_response"]["shape_hash"], "shape-1")
 
+    def test_probe_confirmation_does_not_expose_endpoint_capability(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.domains.rpc_catalog import confirm_request, correct_draft
+        from agent.harness.questions import render_question
+        from agent.harness.secret_refs import secret_references_in_value
+        from agent.harness.state import new_state
+
+        state = new_state("probe-secret-boundary", language="en")
+        state.update({
+            "active_group": "endpoint_process",
+            "chain_identity": {
+                "canonical": "case-two-chain",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+            },
+            "custom_rpc": {"status": "schema_needs_confirmation"},
+        })
+        self.assertTrue(correct_draft(state, {
+            "method": "eth_blockNumber",
+            "params": [],
+            "params_json": [],
+            "response_summary": "unknown",
+            "validation_endpoint": "semantic-secret:opaque-endpoint-capability",
+        }).accepted)
+        self.assertTrue(confirm_request(state, True).accepted)
+
+        question = question_for_chain_rpc(state, "endpoint_process")
+
+        self.assertEqual(question["id"], "custom_rpc_probe_confirm")
+        self.assertFalse(secret_references_in_value(question))
+        rendered = render_question(question, "en")
+        self.assertIn("saved validation endpoint", rendered)
+        self.assertNotIn("semantic-secret:", rendered)
+
     def test_rejected_observed_response_preserves_request_evidence(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
 

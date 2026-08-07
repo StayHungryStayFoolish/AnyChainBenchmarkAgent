@@ -737,7 +737,6 @@ def _parameter_confirmation_question(state: AgentGraphState, case: str, index: i
 def _probe_confirmation_question(state: AgentGraphState, case: str, *, retry: bool = False) -> dict[str, Any]:
     draft = draft_view(state)
     method = normalize_scalar(draft.get("method")) or "<unknown>"
-    endpoint = normalize_scalar(draft.get("validation_endpoint"))
     question_id = "new_chain_probe_confirm" if case == "new_chain" else "custom_rpc_probe_confirm"
     response_confirmed = bool(draft.get("response_confirmed"))
     prompt = question_text(
@@ -746,7 +745,6 @@ def _probe_confirmation_question(state: AgentGraphState, case: str, *, retry: bo
         contract_status="request-and-response-confirmed"
         if response_confirmed
         else "request-confirmed-response-pending",
-        endpoint=endpoint or "<missing>",
         method=method,
     )
     return _choice(

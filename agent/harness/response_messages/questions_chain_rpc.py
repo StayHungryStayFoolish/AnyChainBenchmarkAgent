@@ -177,12 +177,11 @@ MESSAGES = {
         "kinds": {"question_prompt"},
     },
     "question.chain_rpc.probe_confirmation.prompt": {
-        "en": "Probe method `{method}` against validation endpoint `{endpoint}` now? Prior probe: {prior_probe_status}; contract status: {contract_status}. `Y` authorizes only this probe; `N` returns to evidence correction.",
-        "zh": "是否现在对验证 endpoint `{endpoint}` 执行 method `{method}` probe？上次 probe：{prior_probe_status}；contract 状态：{contract_status}。`Y` 只授权本次 probe；`N` 返回证据修正。",
+        "en": "Probe method `{method}` against the saved validation endpoint now? Prior probe: {prior_probe_status}; contract status: {contract_status}. `Y` authorizes only this probe; `N` returns to evidence correction.",
+        "zh": "是否现在对已保存的验证 endpoint 执行 method `{method}` probe？上次 probe：{prior_probe_status}；contract 状态：{contract_status}。`Y` 只授权本次 probe；`N` 返回证据修正。",
         "arguments": {
             "prior_probe_status": "string",
             "contract_status": "string",
-            "endpoint": "string",
             "method": "string",
         },
         "kinds": {"question_prompt"},
