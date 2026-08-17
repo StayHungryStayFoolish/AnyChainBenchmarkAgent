@@ -1369,13 +1369,13 @@ class CoverageEvidenceTest(unittest.TestCase):
             self.assertFalse(valid)
             self.assertIn("attestation hash mismatch", reason)
 
-            secret_error = "benchmark exited 1: Bearer abcdefghijklmnopqrstuvwxyz123456"
+            safe_job_error = "benchmark exited 1"
             original_job = job_file.read_bytes()
             job_file.write_text(json.dumps({
                 "job_id": "job-1",
                 "status": "failed",
                 "exit_code": 1,
-                "error": secret_error,
+                "error": safe_job_error,
                 "created_at": "2026-07-24T00:00:01Z",
             }), encoding="utf-8")
             failure_hashed = [
@@ -1400,7 +1400,7 @@ class CoverageEvidenceTest(unittest.TestCase):
                         **artifact["result"]["observed_job"],
                         "status": "failed",
                         "exit_code": 1,
-                        "error": secret_error,
+                        "error": safe_job_error,
                     },
                 },
                 job_id="job-1",
@@ -1408,7 +1408,7 @@ class CoverageEvidenceTest(unittest.TestCase):
                 log_artifacts=(log,),
                 outcome="observed-fail",
                 exit_status=1,
-                error=secret_error,
+                error=safe_job_error,
                 started_at="2026-07-24T00:00:00Z",
                 finished_at="2026-07-24T00:00:02Z",
             )
