@@ -243,7 +243,7 @@ PR 要求：
 - `tools/chain_adapters/base.py`
 - `tools/fake-node/handlers/<family>.go`
 - `tools/fake-node/configs/<family>.yaml`
-- 如果 handler registry 需要新增入口，修改 `tools/fake-node/main.go`
+- 如果 handler registry 需要新增入口，修改 `tools/fake-node/fake_node.go`
 - `config/chains/<chain>.json`
 - `docs/en/how-to-add-chain.md`
 - `docs/zh/how-to-add-chain.md`
@@ -353,7 +353,7 @@ python3 tools/fake-node/runtime_probe.py --chain <chain>
 规则：
 
 - `mixed_weighted` 是 mixed 模式按权重生成请求的来源。
-- 权重建议总和为 100，便于审计。
+- 所有启用权重必须是正整数，并且总和必须严格等于 100。
 - sync-health RPC method 不应该计入 workload method。
 - per-method 报告图表只描述压测 workload traffic。
 

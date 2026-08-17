@@ -393,6 +393,61 @@ class InvocationContextAuthorityTest(unittest.TestCase):
 
 
 class SyncObserveOwnershipAuthorityTest(unittest.TestCase):
+    def test_reviewed_metrics_endpoint_is_delegated_to_sync_owner(self) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.environment import (
+            apply_inferred_config_review,
+            apply_reviewed_owned_config_values,
+        )
+        from agent.harness.invariants import validate_delta_owner
+        from agent.harness.state import new_state
+
+        endpoint = "http://node:6060/debug/metrics/prometheus"
+        state = new_state("reviewed-sync-endpoint", language="en")
+        state["inferred_config"] = {
+            "pending_review": {
+                "config_values": {"NODE_PROMETHEUS_METRICS_URL": endpoint},
+                "source_format": "natural_language",
+            }
+        }
+        reviewed = apply_inferred_config_review(state, True)
+
+        self.assertFalse(
+            any(
+                write.path == ("confirmed_config", "NODE_PROMETHEUS_METRICS_URL")
+                for write in reviewed.delta.writes
+            )
+        )
+        self.assertEqual(
+            reviewed.followup_actions,
+            ({
+                "type": "apply_reviewed_sync_observe_config",
+                "config_values": {"NODE_PROMETHEUS_METRICS_URL": endpoint},
+            },),
+        )
+        validate_delta_owner(reviewed.delta, "environment")
+
+        committed = apply_reviewed_owned_config_values(
+            state,
+            ActionProposal(
+                action_id="reviewed-sync-commit",
+                action_type="apply_reviewed_sync_observe_config",
+                arguments={
+                    "config_values": {"NODE_PROMETHEUS_METRICS_URL": endpoint}
+                },
+            ),
+            owner="sync_observe",
+        )
+
+        validate_delta_owner(committed.delta, "sync_observe")
+        self.assertTrue(
+            any(
+                write.path == ("confirmed_config", "NODE_PROMETHEUS_METRICS_URL")
+                and write.value == endpoint
+                for write in committed.delta.writes
+            )
+        )
+
     def test_environment_proposes_sync_options_without_writing_sync_state(self) -> None:
         from agent.harness.domains.environment import apply_direct_config_assignments
         from agent.harness.state import new_state

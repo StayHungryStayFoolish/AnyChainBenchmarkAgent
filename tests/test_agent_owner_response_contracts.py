@@ -61,6 +61,31 @@ class OwnerResponseContractTests(unittest.TestCase):
         self.assertIn("AnyChain Benchmark Agent", render_fragment(fragment, "en").text)
         self.assertIn("AnyChain Benchmark Agent", render_fragment(fragment, "zh").text)
 
+    def test_sync_observe_behavior_consultation_is_read_only_and_bilingual(self) -> None:
+        from agent.harness.domains.orientation import consultation_fragment
+
+        state = new_state("sync-observe-behavior", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["pending_question"] = {
+            "id": "sync_observe_stop_condition",
+            "group": "sync_observe",
+        }
+        fragment = consultation_fragment(
+            state,
+            {
+                "type": "answer_opening_question",
+                "topic": "sync_observe_behavior",
+            },
+        )
+
+        self.assertEqual(
+            fragment.message_id,
+            "harness.orientation.consultation.sync_observe_behavior",
+        )
+        self.assertIn("until the user stops", render_fragment(fragment, "en").text)
+        self.assertIn("手动停止", render_fragment(fragment, "zh").text)
+
     def test_recommendation_completion_does_not_prescribe_stale_next_state(
         self,
     ) -> None:
@@ -110,8 +135,74 @@ class OwnerResponseContractTests(unittest.TestCase):
             render_failure(failure, "en").text,
         )
 
+    def test_environment_proposals_are_idempotent_against_confirmed_values(
+        self,
+    ) -> None:
+        from agent.harness.domains.environment import apply_environment_action
+
+        state = new_state("owner-environment-idempotency", language="en")
+        state["confirmed_config"] = {
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+        }
+
+        equal = apply_environment_action(
+            state,
+            ActionProposal(
+                "equal",
+                "propose_config_values",
+                {"config_values": {"LEDGER_DEVICE": "vda"}},
+                "high",
+            ),
+        )
+        self.assertIsNone(equal.pending_question)
+        self.assertTrue(equal.delta.is_empty())
+
+        conflict = apply_environment_action(
+            state,
+            ActionProposal(
+                "conflict",
+                "propose_config_values",
+                {"config_values": {"LEDGER_DEVICE": "vdb"}},
+                "high",
+            ),
+        )
+        self.assertEqual(conflict.pending_question["id"], "inferred_config_review")
+
+        mixed = apply_environment_action(
+            state,
+            ActionProposal(
+                "mixed",
+                "propose_config_values",
+                {
+                    "config_values": {
+                        "LEDGER_DEVICE": "vda",
+                        "DATA_VOL_TYPE": "nvme",
+                        "DATA_VOL_MAX_IOPS": "20000",
+                    }
+                },
+                "high",
+            ),
+        )
+        pending_review = {
+            write.path[-1]: write.value
+            for write in mixed.delta.writes
+            if write.path[:3]
+            == ("inferred_config", "pending_review", "config_values")
+        }
+        self.assertEqual(
+            pending_review,
+            {
+                "DATA_VOL_TYPE": "nvme",
+                "DATA_VOL_MAX_IOPS": "20000",
+            },
+        )
+
     def test_performance_responses_and_failures_use_registered_messages(self) -> None:
-        from agent.harness.domains.performance import apply_performance_action
+        from agent.harness.domains.performance import (
+            apply_performance_action,
+            apply_performance_answer,
+        )
 
         state = new_state("owner-response-performance", language="en")
         selected = apply_performance_action(
@@ -126,6 +217,35 @@ class OwnerResponseContractTests(unittest.TestCase):
         self.assertIn(
             "9108",
             render_fragment(selected.response_fragments[0], "en").text,
+        )
+        qps_state = new_state("owner-response-qps", language="en")
+        qps_state["qps_profile"] = {
+            "mode": "quick",
+            "confirmed": False,
+            "default_decision_made": True,
+        }
+        qps_action = apply_performance_action(
+            qps_state,
+            ActionProposal(
+                "qps-override",
+                "set_qps_override",
+                {"qps_overrides": {"INITIAL_QPS": 50}},
+                "high",
+            ),
+        )
+        self.assertEqual(
+            render_fragment(qps_action.response_fragments[0], "en").text,
+            "Applied QPS profile overrides: INITIAL_QPS=50",
+        )
+        qps_state["qps_profile"]["adjust_field"] = "MAX_QPS"
+        qps_answer = apply_performance_answer(
+            qps_state,
+            {"group": "qps_profile", "field": "qps_adjust_value"},
+            "1200",
+        )
+        self.assertEqual(
+            render_fragment(qps_answer.response_fragments[0], "zh").text,
+            "已应用 QPS profile 覆盖值：MAX_QPS=1200",
         )
         failure = apply_performance_action(
             state,

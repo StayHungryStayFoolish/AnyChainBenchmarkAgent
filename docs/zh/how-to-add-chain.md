@@ -102,7 +102,9 @@ config/chains/<chain>.json
 }
 ```
 
-建议权重总和写成 100，便于审计。框架会按比例生成 vegeta targets。
+所有启用权重必须是正整数，并且总和严格等于 100。chain template 和 runtime
+workload validator 会在执行前拒绝其他总和；框架只根据验证通过的权重按比例生成
+Vegeta targets。
 
 ### Mixed Workload 真实度
 
@@ -136,9 +138,10 @@ address、transaction、block、contract/view 类型 method。
 7. 在 `tools/fake-node/configs/` 对应 family YAML 中增加 fixture 映射。
 8. 录制该 method 自己的 fixture，并运行 coverage/runtime probes。
 
-`weight` 必须是正整数。target generator 会把缺失、非法或为 0 的权重视为 `1`，
-确保已配置的 method 在 mixed-mode smoke 和 benchmark 中仍会被覆盖。如果要禁用某个
-method，需要从 `mixed_weighted` 中移除，不要把 `weight` 设置为 `0`。
+`weight` 必须是正整数，所有启用权重的总和必须严格等于 100。target generator
+仍会把旧数据中缺失、非法或为 0 的值防御性地归一为 `1`，但这不是验收路径：
+template/workload validator 必须在执行前拒绝该配置。如果要禁用某个 method，需要从
+`mixed_weighted` 中移除，不要把 `weight` 设置为 `0`。
 
 不要因为某个 method 出现在官方文档中就直接加入 mixed。只有当框架能构造合法
 请求、录制真实响应、通过 fake-node 回放，并进入 proxy/HTML 归因链路时，才应

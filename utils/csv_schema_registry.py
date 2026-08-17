@@ -133,6 +133,17 @@ _EXECUTION_FIELDS: List[FieldDef] = [
     FieldDef("execution_gas_per_sec",   "gauge",   "execution", False, "execution_gas_per_sec"),
     FieldDef("execution_metric_source", "unknown", "execution", False, "execution_metric_source"),
     FieldDef("execution_metric_status", "unknown", "execution", False, "execution_metric_status"),
+    FieldDef("client_metric_profile", "unknown", "execution", False, "client_metric_profile"),
+    FieldDef("client_block_insert_ms_p50", "latency", "execution", False, "client_block_insert_ms_p50"),
+    FieldDef("client_import_mgas_per_sec_p50", "throughput", "execution", False, "client_import_mgas_per_sec_p50"),
+    FieldDef("client_import_observation_count", "gauge", "execution", False, "client_import_observation_count"),
+    FieldDef("client_block_tx_count", "gauge", "execution", False, "client_block_tx_count"),
+    FieldDef("client_block_gas_used", "gauge", "execution", False, "client_block_gas_used"),
+    FieldDef("client_head_block", "gauge", "execution", False, "client_head_block"),
+    FieldDef("client_justified_block", "gauge", "execution", False, "client_justified_block"),
+    FieldDef("client_finalized_block", "gauge", "execution", False, "client_finalized_block"),
+    FieldDef("client_inserted_blocks_count", "gauge", "execution", False, "client_inserted_blocks_count"),
+    FieldDef("client_metric_quality", "unknown", "execution", False, "client_metric_quality"),
 ]
 
 _NODE_CPU_FIELDS: List[FieldDef] = [
@@ -149,6 +160,8 @@ _NODE_CPU_FIELDS: List[FieldDef] = [
     FieldDef("node_top_cores_cpu_pct",            "unknown", "node_cpu", False, "node_top_cores_cpu_pct"),
     FieldDef("node_cpu_concentration_top1_pct",   "gauge",   "node_cpu", False, "node_cpu_concentration_top1_pct"),
     FieldDef("node_cpu_concentration_top5_pct",   "gauge",   "node_cpu", False, "node_cpu_concentration_top5_pct"),
+    FieldDef("node_process_rss_mib",              "gauge",   "node_cpu", False, "node_process_rss_mib"),
+    FieldDef("node_process_memory_pct",           "gauge",   "node_cpu", False, "node_process_memory_pct"),
     FieldDef("node_cpu_status",                   "unknown", "node_cpu", False, "node_cpu_status"),
 ]
 

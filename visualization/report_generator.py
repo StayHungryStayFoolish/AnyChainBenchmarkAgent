@@ -29,6 +29,7 @@ sys.path.insert(0, project_root)
 from visualization.chart_style_config import UnifiedChartStyle
 from visualization.device_manager import DeviceManager
 from visualization.performance_visualizer import format_time_axis
+from visualization.bsc_sync_metrics import calculate_bsc_sync_kpis
 from utils.ena_field_accessor import ENAFieldAccessor
 from utils.csv_schema_registry import CSVSchemaRegistry
 
@@ -506,6 +507,8 @@ class ReportGenerator:
                 </div>
                 """
 
+            bsc_section = self._generate_bsc_native_section(df)
+
             return f"""
             <div class="section sync-execution-section">
                 <h2>{self.t['node_sync_execution_analysis']}</h2>
@@ -531,11 +534,145 @@ class ReportGenerator:
                         <tr><td>Network RX avg / TX avg</td><td>{net_rx_avg} Mbps / {net_tx_avg} Mbps</td></tr>
                     </tbody>
                 </table>
+                {bsc_section}
                 {chart_html}
             </div>
             """
         except Exception as exc:
             return f"<div class='error'>Sync execution section generation failed: {html.escape(str(exc))}</div>"
+
+    @staticmethod
+    def _format_bsc_kpi(value, digits=2, suffix=""):
+        if value is None:
+            return "N/A"
+        try:
+            return f"{float(value):,.{digits}f}{suffix}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _generate_bsc_native_chart(self, df):
+        if df is None or df.empty or "client_metric_profile" not in df.columns:
+            return None
+        try:
+            chart_df = df[
+                df["client_metric_profile"].astype(str).str.strip().str.lower() == "bsc_v1_7"
+            ].copy()
+            if chart_df.empty or "timestamp" not in chart_df.columns:
+                return None
+            chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"], errors="coerce")
+            chart_df = chart_df.dropna(subset=["timestamp"])
+            if chart_df.empty:
+                return None
+
+            def numeric(column):
+                if column not in chart_df.columns:
+                    return pd.Series(np.nan, index=chart_df.index, dtype="float64")
+                return pd.to_numeric(chart_df[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+            fig, axes = plt.subplots(4, 1, figsize=(16, 13), sharex=True)
+            fig.suptitle("BNB Smart Chain Native Import Metrics", fontsize=16, fontweight="bold")
+
+            mgas = numeric("client_import_mgas_per_sec_p50")
+            insert_ms = numeric("client_block_insert_ms_p50")
+            axes[0].plot(chart_df["timestamp"], mgas, color="#15803d", linewidth=2, label="MGas/s P50")
+            insert_axis = axes[0].twinx()
+            insert_axis.plot(chart_df["timestamp"], insert_ms, color="#7c3aed", linewidth=1.8, label="Block insert P50")
+            axes[0].set_ylabel("MGas/s")
+            insert_axis.set_ylabel("ms")
+            lines, labels = axes[0].get_legend_handles_labels()
+            extra_lines, extra_labels = insert_axis.get_legend_handles_labels()
+            axes[0].legend(lines + extra_lines, labels + extra_labels, loc="upper left")
+            axes[0].grid(True, alpha=0.3)
+
+            tx_count = numeric("client_block_tx_count")
+            gas_mgas = numeric("client_block_gas_used") / 1_000_000.0
+            axes[1].plot(chart_df["timestamp"], tx_count, color="#2563eb", linewidth=2, label="TX/block")
+            gas_axis = axes[1].twinx()
+            gas_axis.plot(chart_df["timestamp"], gas_mgas, color="#dc2626", linewidth=1.8, label="MGas/block")
+            axes[1].set_ylabel("TX/block")
+            gas_axis.set_ylabel("MGas/block")
+            lines, labels = axes[1].get_legend_handles_labels()
+            extra_lines, extra_labels = gas_axis.get_legend_handles_labels()
+            axes[1].legend(lines + extra_lines, labels + extra_labels, loc="upper left")
+            axes[1].grid(True, alpha=0.3)
+
+            head = numeric("client_head_block")
+            justified_lag = (head - numeric("client_justified_block")).clip(lower=0)
+            finalized_lag = (head - numeric("client_finalized_block")).clip(lower=0)
+            axes[2].plot(chart_df["timestamp"], justified_lag, color="#0891b2", linewidth=2, label="Justified lag")
+            axes[2].plot(chart_df["timestamp"], finalized_lag, color="#ea580c", linewidth=2, label="Finalized lag")
+            axes[2].set_ylabel("Blocks")
+            axes[2].legend(loc="upper left")
+            axes[2].grid(True, alpha=0.3)
+
+            process_cpu = numeric("node_process_cpu_pct")
+            memory_pct = numeric("node_process_memory_pct")
+            axes[3].plot(chart_df["timestamp"], process_cpu, color="#b91c1c", linewidth=2, label="Node process CPU")
+            memory_axis = axes[3].twinx()
+            memory_axis.plot(chart_df["timestamp"], memory_pct, color="#475569", linewidth=1.8, label="Node process memory")
+            axes[3].set_ylabel("CPU percent")
+            memory_axis.set_ylabel("Memory percent")
+            lines, labels = axes[3].get_legend_handles_labels()
+            extra_lines, extra_labels = memory_axis.get_legend_handles_labels()
+            axes[3].legend(lines + extra_lines, labels + extra_labels, loc="upper left")
+            axes[3].grid(True, alpha=0.3)
+            format_time_axis(axes[3], chart_df["timestamp"])
+
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            chart_file = os.path.join(self.output_dir, "bsc_sync_kpis.png")
+            plt.savefig(chart_file, dpi=300, bbox_inches="tight", facecolor="white", edgecolor="none")
+            plt.close(fig)
+            return os.path.basename(chart_file)
+        except Exception as exc:
+            print(f"⚠️ BSC native metric chart generation failed: {exc}")
+            return None
+
+    def _generate_bsc_native_section(self, df):
+        kpis = calculate_bsc_sync_kpis(df)
+        if not kpis.get("available"):
+            return ""
+
+        transaction_label = self.t[
+            "bsc_transactions" if kpis.get("transactions_estimated") else "bsc_transactions_exact"
+        ]
+        chart_src = self._generate_bsc_native_chart(df)
+        chart_html = ""
+        if chart_src:
+            chart_html = f"""
+            <div class="chart-container">
+                <img src="{html.escape(chart_src)}" alt="{html.escape(self.t['bsc_native_import_metrics'])}" class="chart-image">
+            </div>
+            """
+
+        rows = (
+            (self.t["bsc_block_insert_p50"], self._format_bsc_kpi(kpis.get("block_insert_ms_p50"), 2, " ms")),
+            (self.t["bsc_import_mgas_p50"], self._format_bsc_kpi(kpis.get("import_mgas_per_sec_p50"), 2, " MGas/s")),
+            (self.t["bsc_justified_lag"], " / ".join(self._format_bsc_kpi(kpis.get(f"justified_lag_p{p}"), 0) for p in (50, 90, 99))),
+            (self.t["bsc_finalized_lag"], " / ".join(self._format_bsc_kpi(kpis.get(f"finalized_lag_p{p}"), 0) for p in (50, 90, 99))),
+            (transaction_label, self._format_bsc_kpi(kpis.get("transactions"), 0)),
+            (self.t["bsc_block_gas_used"], self._format_bsc_kpi(kpis.get("avg_block_gas_used_mgas"), 2, " MGas/block")),
+            (self.t["bsc_block_gas_per_sec"], self._format_bsc_kpi(kpis.get("block_gas_used_per_sec_mgas"), 2, " MGas/s")),
+            (self.t["bsc_avg_gas_per_tx"], self._format_bsc_kpi(kpis.get("avg_gas_per_tx"), 0, " gas/tx")),
+            (self.t["bsc_avg_tx_per_block"], self._format_bsc_kpi(kpis.get("avg_tx_per_block"), 2)),
+            (self.t["bsc_tps"], self._format_bsc_kpi(kpis.get("tps"), 2, " tx/s")),
+            (self.t["bsc_process_cpu"], self._format_bsc_kpi(kpis.get("process_cpu_avg_pct"), 2, "%")),
+            (self.t["bsc_process_memory"], self._format_bsc_kpi(kpis.get("process_memory_rss_avg_gib"), 2, " GiB")),
+            (self.t["bsc_system_memory"], self._format_bsc_kpi(kpis.get("memory_used_avg_gib"), 2, " GiB")),
+            (self.t["bsc_coverage"], self._format_bsc_kpi(kpis.get("sample_coverage_pct"), 2, "%")),
+            (self.t["bsc_quality"], html.escape(str(kpis.get("quality") or "unavailable"))),
+        )
+        rows_html = "".join(
+            f"<tr><td>{html.escape(str(label))}</td><td>{value}</td></tr>" for label, value in rows
+        )
+        return f"""
+        <h3>{html.escape(self.t['bsc_native_import_metrics'])}</h3>
+        <p>{html.escape(self.t['bsc_native_import_note'])}</p>
+        <table class="report-table summary-table">
+            <thead><tr><th>{html.escape(self.t['metric'])}</th><th>{html.escape(self.t['value'])}</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+        {chart_html}
+        """
 
     def _is_sync_execution_report(self, df):
         """Return whether sync-observe execution metrics should be shown."""

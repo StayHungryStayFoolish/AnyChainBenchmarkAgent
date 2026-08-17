@@ -1,16 +1,52 @@
 # AnyChain Agent AI Work Gate
 
-This document is the project-specific gate for AI coding work on AnyChain
-Agent. It complements the repository-level `AI_CODING_GUIDE.md` behavior contract.
+本文档是 AnyChain Agent 的项目级 AI coding Gate，用于补充仓库根目录
+`AI_CODING_GUIDE.md` 中的通用行为约束。
 
-Before changing Agent code, an AI coding agent must read:
+修改 Agent 代码前，AI coding agent 必须阅读：
 
 1. `AI_CODING_GUIDE.md`.
-2. This gate document.
-3. `agent/README.md`.
-4. The exact files it plans to edit.
+2. 本 Gate 文档。
+3. `docs/zh/adk-agent-architecture.md`。
+4. `agent/README.md`。
+5. 当前已经 review 的 Agent task/design 文档。
+6. 计划修改的具体文件。
 
-If these rules conflict with an implementation shortcut, the rules win.
+实现捷径与这些规则冲突时，以这些规则为准。
+
+## 修改代码前的文档 Gate
+
+在任务没有被准确记录之前，不得修改 Agent workflow 代码。
+
+任何影响 Agent 行为、Harness prompt、LLM routing、workflow branch、terminal
+交互、workflow state、benchmark execution、validator、runner lifecycle、
+fake-node smoke、endpoint validation 或 onboarding 的变更，都必须：
+
+1. 阅读 `AI_CODING_GUIDE.md`、本文件、Agent 架构文档和当前 task/design 文档。
+2. 确认 task 文档写明根因、范围、需要精读和禁止修改的文件、预期用户行为、
+   验证命令、验收证据以及清理要求。
+3. 如果 task 文档缺失、过时、模糊或与代码矛盾，先更新并 review 文档，之后
+   才能修改代码。
+4. 每项代码变更都必须能够追溯到已记录的任务和架构约束。
+
+禁止以下捷径：
+
+- 只修复一段 terminal transcript，而不更新 group workflow 或 task 文档；
+- 用局部 if/else、regex、模糊匹配、phrase cleanup 或 fallback 掩盖 workflow 缺陷；
+- 未证明现有架构无法承载需求，就创建新的 helper 文件；
+- 设计要求删除或迁移旧逻辑时，仅通过改名或隔离继续保留；
+- 未运行文档规定的 Gate 就声称某个阶段完成。
+
+live CLI 或测试发现新问题时，必须先在 task 文档中分类并确认根因，再开始编码。
+修复应落在 LangGraph Harness workflow、typed state、确定性工具、validator 或
+terminal I/O 边界，不能只针对失败 prompt 的原句。若确实采用局部方案，task 文档
+必须说明取舍、移除条件并增加 Harness coverage，否则不得提交该方案。
+
+单条 transcript 通过不能证明修复成立。修复必须同时保持相邻分支中的 group
+workflow、typed `pending_question`、validator 顺序、用户修正路径和执行 Gate。
+配置对话问题至少要区分：pending question 缺失或过时、一个 prompt 暴露多个问题、
+确定性 next-question transition 缺失、smoke 值泄漏到正式 benchmark，以及 terminal
+层试图补偿 workflow transition 缺失。
 
 ## Non-Negotiable Product Boundary
 
@@ -36,6 +72,33 @@ Understand -> Plan -> Ask -> Configure -> Validate -> Execute -> Observe -> Anal
 负责 planning、group selection、question selection、fallback ordering 和 iteration。
 仓库工具负责确定性检查、配置物化、benchmark execution、证据采集和基于 artifact 的分析。
 
+对外术语也是控制权边界的一部分。terminal message、doctor action、提供给模型的
+framework context、tool schema 和生成的 onboarding plan 都不得把核心 runtime 称为
+ADK Agent/terminal/runtime。`ADK` 只能描述可选 Gemini `google_search`、保留的兼容
+路径名称或明确的历史代码。所有生成路径都必须根据当前仓库验证；chain template
+起始文件是 `config/chain_template.json.bak`。
+
+## Group Workflow 与 Y/N 契约
+
+完整 workflow map 和 Harness 设计必须存在于当前已 review 的 task/design 文档中，
+不得只依赖本 Gate 的简表修改 workflow。
+
+每个 yes/no 答案必须绑定唯一 active pending question。只有接受与拒绝路径都已注册，
+Agent 才能提出 Y/N 问题：
+
+- 没有 pending question 时，裸 `Y`、`N`、`yes` 或 `no` 不是有效业务决策；
+- dependency installation 的 `Y` 只返回需要在当前 shell 执行的准确命令，`N` 拒绝；
+  交互终端不得在对话会话内执行安装脚本；
+- target mode 问题只接受已注册的 fake-node、real-node、sync-observe 或对应选项；
+- disk choice 的编号选择已展示设备，manual value 覆盖推断值；
+- quick assumed fake-node smoke 的 `Y` 必须提交对应 detached smoke，不得重复确认；
+- 用户反悔、回退或修改旧答案时，必须更新或回滚 state、执行 invalidation，并重新
+  运行 validator 后再继续。
+
+detached job 提交后，Agent 应返回 `job_id`、run directory、`benchmark.log` 以及
+`status`、`logs`、`follow` 的使用方式。除非 workflow state 中存在对应的已注册
+pending action，否则不得临时询问“是否查看日志”等无状态 Y/N 问题。
+
 ## Forbidden Patterns
 
 Do not add or reintroduce:
@@ -56,6 +119,37 @@ Do not add or reintroduce:
 Stable terminal commands such as `help`, `doctor`, `jobs`, `status`, `logs`,
 `follow`, and `exit` are allowed. Business requests must go through the
 LangGraph Harness workflow.
+
+## 旧代码污染 Gate
+
+修复 Agent workflow 前，必须审查 `agent/` 中是否仍有旧 custom-Agent 逻辑。
+代码不能因为当前仍被 import 就自动获得保留资格。
+
+允许保留的职责只有：
+
+- LangGraph Harness runtime、group workflow、checkpoint 和 typed event；
+- `agent/llm/search_grounding.py` 中可选的 Gemini `google_search` grounding；
+- 确定性的 planner、validator、runner、analyzer、discovery、onboarding 和 knowledge provider；
+- terminal I/O、稳定 shell command、Ctrl+C/log-follow、dependency consent 和进度显示；
+- 明确位于产品 runtime 之外的开发工具与测试。
+
+必须删除或迁移：
+
+- 旧的非 Harness benchmark wizard；
+- fallback brain、mock agent 或 phrase-repair loop；
+- terminal keyword/fuzzy/regex 业务路由；
+- 重复 workflow state machine；
+- 冒充真实 smoke 的 lifecycle-only mock；
+- 只因旧 import 存在而保留的 dead file。
+
+旧逻辑中有价值的确定性能力，应迁移到正确的 planner、validator、runner、analyzer、
+onboarding 或 knowledge 组件；旧 conversational wrapper 不得继续存在。只要 legacy
+代码仍能绕过 Harness intent routing、typed pending question、validator、preflight、
+smoke 或用户授权 Gate，Agent 就不能声明达到产品验收标准。
+
+`agent/adk_app/` 整个 package 是已经退休的第二套 ADK-native conversation loop，
+不得恢复。`agent/harness/` 是唯一产品 workflow runtime；terminal 只负责 I/O，
+Google ADK 只属于可选 search grounding 边界。
 
 ## Required Agent Behavior
 
@@ -153,50 +247,36 @@ time. The Agent must route the turn to the right group, preserve valid state,
 invalidate affected state, and then return to the next blocking group in the
 default order.
 
-The default order should match user mental model and manual configuration
-order:
+`agent/workflows/group_registry.py::GROUPS` 是唯一 group metadata authority。
+当前默认顺序为：
 
-1. Provider and deployment group: cloud provider, region, zone, machine type,
-   VM vs Kubernetes/container, and platform such as GCE, EC2, GKE, EKS, or
-   self-hosted Kubernetes.
-2. Hardware group: CPU and memory discovery, network inventory, disk inventory,
-   and resource metadata.
-3. Ledger disk group: `LEDGER_DEVICE`, `DATA_VOL_TYPE`, `DATA_VOL_SIZE`,
-   `DATA_VOL_MAX_IOPS`, and `DATA_VOL_MAX_THROUGHPUT`.
-4. Accounts disk group: ask whether a separate accounts/state disk exists; if
-   yes, collect `ACCOUNTS_DEVICE`, `ACCOUNTS_VOL_TYPE`, `ACCOUNTS_VOL_SIZE`,
-   `ACCOUNTS_VOL_MAX_IOPS`, and `ACCOUNTS_VOL_MAX_THROUGHPUT`.
-5. Network group: `NETWORK_INTERFACE`, selected from detected interfaces when
-   there is more than one candidate, and `NETWORK_MAX_BANDWIDTH_GBPS`.
-6. Chain and endpoint group: `BLOCKCHAIN_NODE`, target mode, `LOCAL_RPC_URL`,
-   `MAINNET_RPC_URL` or template sync-health behavior, and
-   `BLOCKCHAIN_PROCESS_NAMES` for real-node monitoring.
-7. Chain auxiliary endpoint group: chain-template-driven optional overrides
-   such as `CHAIN_REST_URL`, `CHAIN_INDEXER_URL`, `CHAIN_SIDECAR_URL`,
-   `CHAIN_EVM_RPC_URL`, `CHAIN_JSON_RPC_URL`, `CHAIN_MIRROR_URL`, and
-   `RPC_API_KEY`.
-8. Workload group: `RPC_MODE`, default workload selection, custom RPC methods,
-   mixed weights, runtime chain template override, endpoint validation,
-   fixtures, and workload validation.
-9. Target sample and fixture group: only the `TARGET_*` values required by the
-   selected chain template, methods, adapter family, and custom RPC schema.
-10. QPS profile group: quick, standard, or intensive profile; explain defaults
-    first; ask whether to keep defaults; if not, collect initial QPS, max QPS,
-    QPS step, duration, and relevant cooldown/warmup fields.
-11. Sync-observe group：仅当用户希望在不发送 RPC benchmark load 的情况下观察节点
-    同步/资源行为时进入。确认 sync-health/reference 行为、节点进程身份、可选
-    `NODE_PROMETHEUS_METRICS_URL` 和停止条件。该 workflow 激活时跳过 workload
-    和 QPS groups。
-12. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
-    then ports, auto-stop behavior, scrape endpoint guidance, and port checks.
-13. Advanced tuning group: optional account discovery settings, monitoring
-    intervals, disk monitor rate, internal bottleneck thresholds, success-rate
-    threshold, latency threshold, and other `internal_config.sh` values. The
-    Agent must explain these before asking whether the user wants to change
-    them.
-14. Preflight, smoke, and execution approval group: validate config, run
-    preflight, run complete closed-loop smoke, show evidence, and ask for
-    approval before the real benchmark job.
+| 顺序 | Group | Owner | 适用范围 |
+|---:|---|---|---|
+| 1 | `opening` | `orientation` | session 入口与恢复 |
+| 2 | `target_mode` | `chain_rpc` | 所有 workflow |
+| 3 | `chain_identity` | `chain_rpc` | 所有 workflow |
+| 4 | `provider_deployment` | `environment` | 所有 workflow |
+| 5 | `ledger_disk` | `environment` | 所有 workflow |
+| 6 | `accounts_disk` | `environment` | 所有 workflow |
+| 7 | `network` | `environment` | 所有 workflow |
+| 8 | `endpoint_process` | `chain_rpc` | real-node 与 sync-observe；Case 1/2 需要 live endpoint 验证时也适用于 fake-node |
+| 9 | `chain_auxiliary_endpoints` | `chain_rpc` | real-node 与 sync-observe |
+| 10 | `workload_rpc` | `chain_rpc` | 仅 RPC benchmark |
+| 11 | `target_samples_fixtures` | `chain_rpc` | 仅 RPC benchmark |
+| 12 | `qps_profile` | `performance` | 仅 RPC benchmark |
+| 13 | `sync_observe` | `sync_observe` | 仅 sync-observe |
+| 14 | `observability` | `performance` | 所有 workflow |
+| 15 | `advanced_tuning` | `performance` | 所有 workflow |
+| 16 | `preflight_smoke_execution` | `execution` | 当前 workflow 的执行 Gate |
+| 17 | `job_monitoring` | `execution` | 显式 job 操作；不参与 fallback |
+| 18 | `failure_recovery` | `recovery` | 显式失败恢复；不参与 fallback |
+| 19 | `error_evidence_analysis` | `analysis` | 显式 evidence 分析；不参与 fallback |
+| 20 | `report_artifact_analysis` | `analysis` | 显式报告分析；不参与 fallback |
+
+框架固定为 20 个 group、8 个 domain owner。graph coordinator 负责 typed control
+dispatch，但不属于第 9 个 domain owner，也不拥有 `GroupSpec`。fallback 会跳过
+workflow/target-mode filter 不匹配的 group，并且不会在没有显式 action 时进入最后
+四个非 fallback 的运维与分析 group。
 
 Each group must define:
 
@@ -537,11 +617,41 @@ LangGraph live CLI matrix in Docker/Linux。产品 acceptance 和 coverage evide
 Docker 中运行适用的 fake-node、local real-node、custom-RPC 或 sync-observe 路径；
 fake-node 不能替代其他 workflow path。
 
+对于广泛影响 Agent workflow、group state、routing 或 Harness 的变更，单独运行
+LangGraph live CLI matrix 仍然不够。还必须运行真实双 AI Chaos：真实
+`./bin/anychain-agent` CLI 使用已配置的 live model，Codex 扮演用户，并且每轮读取
+Agent 的最新实际回复后才决定下一条输入。预先写好的 prompt 序列不属于双 AI
+Chaos。完整 transcript 必须包含真实用户式的中断、回退、跨 group 跳转、语言切换、
+复制粘贴配置或 evidence、自定义 RPC、未知链、session resume，以及最终 review、
+preflight 和 smoke。未 review 完整 transcript 时不得声称产品验收完成。
+
 生成的 schedule、cataloged edge、covering row/tuple 和成功返回的 PTY 文本都只是
 test intent 或 transport evidence，不是 observed execution。pass 必须绑定当前 revision
 的实际 state transition 与独立验证的 postcondition；execution edge 还必须包含 hash
 绑定的 job artifact。报告必须分开列出 generated/cataloged、observed-pass、
 observed-fail、not-run、externally-blocked 和 uncovered denominator。
+
+Codex 用户模拟器必须使用明确 persona，不能只走中性的 happy path。至少包括：
+
+- 第一次使用且困惑的评估者；
+- 急躁的运维工程师；
+- 大量复制粘贴内容的技术用户；
+- 不断改变需求、回退和跨 group 跳转的用户；
+- 中英文混合用户；
+- 日志、错误与报告分析用户；
+- 自定义 RPC 集成用户；
+- Case 2 新链评估用户；
+- Case 3 unsupported-family handoff 用户；
+- 恢复历史 session 的用户。
+
+第一次使用且困惑的评估者是基线 Gate，并且必须从非空 checkpoint 开始，例如尚未
+完成的 `sync-observe / bsc` session。它应询问“你是谁”“你从哪里来”“你能做什么”
+“应该从哪里开始”“fake-node、real-node、sync-observe 有什么区别”等基础问题，
+随后切换到 fake-node。Harness 必须显式处理旧 session 和 stale chain/mode，不能
+静默复用旧链。该 transcript 还要继续覆盖资源确认、workload、QPS、observability、
+preflight/smoke；对执行确认的正向回答必须真正执行或返回具体 blocker。之后关于
+“执行过测试么”“当前状态是什么”“下一步是什么”的问题必须依据 checkpoint、job、
+preflight 和 smoke state 回答，不能退化为通用 workflow 文案。
 
 If a boundary cannot be tested locally, report it as untested. Do not describe
 untested behavior as complete.

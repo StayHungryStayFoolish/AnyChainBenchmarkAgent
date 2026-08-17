@@ -86,8 +86,8 @@ def prepare_benchmark_run(
 ) -> dict[str, Any]:
     """Run discovery, drafting, plan generation, preflight, and runbook rendering.
 
-    Returns the same structured-result shape the ADK `prepare_benchmark_run`
-    tool exposes to the LLM; the ADK wrapper is a thin pass-through to this
+    Returns the structured result exposed through the deterministic Agent tool
+    surface. The Harness owns confirmation and dispatch before calling this
     function.
     """
     discovery = _discover_environment()
@@ -189,9 +189,8 @@ def run_fake_node_smoke_benchmark(
 ) -> dict[str, Any]:
     """Materialize the fake-node smoke plan and submit it as a detached job.
 
-    Returns the same structured-result shape the ADK
-    `run_fake_node_smoke_benchmark` tool exposes to the LLM; the ADK wrapper
-    only adds the `approved` confirmation gate before calling this.
+    Returns the structured result exposed through the deterministic Agent tool
+    surface. The Harness applies the approval gate before calling this.
     """
     plan_path = Path(plan_file)
     if not plan_path.is_file():
@@ -308,9 +307,8 @@ def submit_benchmark_job(
 ) -> dict[str, Any]:
     """Submit a real benchmark job.
 
-    Returns the same structured-result shape the ADK `submit_benchmark_job`
-    tool exposes to the LLM; the ADK wrapper only adds the `approved`
-    confirmation gate before calling this.
+    Returns the structured result exposed through the deterministic Agent tool
+    surface. The Harness applies the approval gate before calling this.
     """
     plan_path = Path(plan_file)
     if not plan_path.is_file():

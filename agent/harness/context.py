@@ -8,6 +8,8 @@ from .action_registry import (
     ACTION_ARGUMENT_SCHEMAS,
     ACTION_SPECS,
     CONSULTATION_TOPIC_PURPOSES,
+    CONSULTATION_TOPIC_ROUTE_GROUPS,
+    CONSULTATION_TOPIC_SUBJECT_POLICIES,
     CONSULTATION_TOPICS,
     ActionLifetime,
     ActionSpec,
@@ -41,6 +43,13 @@ def action_schema(
         if item["type"] == "answer_opening_question":
             item["allowed_topics"] = list(CONSULTATION_TOPICS)
             item["topic_purposes"] = dict(CONSULTATION_TOPIC_PURPOSES)
+            item["topic_subject_policies"] = dict(
+                CONSULTATION_TOPIC_SUBJECT_POLICIES
+            )
+            item["topic_route_groups"] = {
+                topic: sorted(route_groups)
+                for topic, route_groups in CONSULTATION_TOPIC_ROUTE_GROUPS.items()
+            }
         if item["type"] == "change_group":
             item["allowed_groups"] = list(USER_NAVIGABLE_GROUPS)
         if item["target_field_argument"]:

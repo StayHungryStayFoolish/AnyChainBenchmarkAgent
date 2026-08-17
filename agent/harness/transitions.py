@@ -40,6 +40,7 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
 
     custom_rpc = _catalog_for_chain(state, new_chain=new_chain)
     state["rpc_mode"] = ""
+    state["secondary_handoff"] = {}
     for key in ("workload", "endpoint_evidence", "fixture_evidence"):
         state[key] = {}
     state["custom_rpc"] = custom_rpc
@@ -68,6 +69,7 @@ def invalidate_for_adapter_family_change(state: AgentGraphState) -> None:
     """Remove facts whose interpretation depends on the adapter protocol."""
 
     state["rpc_mode"] = ""
+    state["secondary_handoff"] = {}
     for key in ("workload", "endpoint_evidence", "fixture_evidence", "custom_rpc"):
         state[key] = {}
     confirmed = state.setdefault("confirmed_config", {})

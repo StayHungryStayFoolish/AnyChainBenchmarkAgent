@@ -1,8 +1,11 @@
 # English Documentation
 
+- [AI Assistant Operator Guide](../../AGENTS.md)
 - [Framework Flow and Data Lifecycle](framework-flow.md)
 - [AnyChain Agent Architecture](adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](anychain-agent-ai-work-gate.md)
+- [Agent CLI Verification Guide](agent-cli-verification-guide.md)
+- [External AI Handoff and Product Verification](agent-handoff-product-verification.md)
 - [Module Guide](module-guide.md)
 - [Full Framework Reference](framework-reference.md)
 - [How to Add a Chain or RPC Method](how-to-add-chain.md)

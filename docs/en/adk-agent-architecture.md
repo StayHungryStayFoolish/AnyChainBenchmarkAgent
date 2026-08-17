@@ -31,6 +31,50 @@ not statements that ADK owns the runtime. The preferred venv option is
 `--agent-venv`. Missing Google ADK disables only web research; it must not block
 CLI startup, provider authentication, planning, validation, or execution.
 
+## Published Terminology And Path Contract
+
+User-visible output, model-facing framework context, doctor actions, and tool
+schemas must call the core product `AnyChain Agent`, `Agent runtime`, or
+`LangGraph Harness`. They must not call the core product an `ADK Agent`, `ADK
+terminal`, or `ADK runtime`. The term `ADK` is allowed only when referring to:
+
+- the optional Gemini `google_search` implementation or its availability;
+- retained compatibility names such as `.venv-adk`, `requirements-adk.txt`,
+  `--adk-venv`, and `adk-status`;
+- explicitly historical or retired implementation notes and regression tests.
+
+The following current code surfaces require terminology/path convergence before
+product acceptance:
+
+- `agent/terminal/language.py`: label startup information as optional Gemini
+  search availability, and describe empty model output without saying ADK owns
+  the response;
+- `agent/diagnostics/adk_status.py`: when the optional package is absent, state
+  that the core runtime is unaffected and recommend installation only when
+  Gemini `google_search` is required;
+- `agent/diagnostics/doctor.py`: recommend the AnyChain Agent terminal and
+  LangGraph runtime, not an ADK Agent or ADK terminal;
+- `agent/knowledge/framework_context.py`: describe the LangGraph Harness as the
+  core runtime presented to the configured model;
+- `agent/tools/schema.py`: describe `include_agent_runtime` as the core Agent
+  runtime and `adk_venv` as a retained compatibility path, not as a Google ADK
+  reinstall;
+- user-facing onboarding output from `agent/knowledge/gap_analyzer.py`: point
+  to the existing `config/chain_template.json.bak`, never the nonexistent
+  `config/chains/chain_template.json.bak`.
+
+Retired ADK-wrapper ownership wording in `agent/runners/benchmark_pipeline.py`,
+`agent/validators/`, and the header of `scripts/install_deps.sh` is internal
+documentation debt and must also be rewritten to describe the deterministic
+Harness/tool boundary. Genuine optional-search implementation comments in
+`agent/llm/search_grounding.py`, compatibility-name handling, and explicitly
+historical regression tests remain valid and must not be blindly renamed.
+
+Internal function/message keys may retain an old name only when changing the
+identifier would add migration risk and the published text is accurate. This
+exception never permits stale ownership claims in terminal output, prompts,
+tool descriptions, doctor reports, or generated onboarding plans.
+
 ## Architecture Overview
 
 ```mermaid
@@ -139,15 +183,41 @@ sizes to every durable envelope. Read-only plans continue to use one review.
 When exact DemandAtoms remain unresolved, `review_plan` may create a durable
 but non-executable `SemanticPlanDraft`. Its locally validated candidates are
 evidence, not admitted actions: they cannot enter benchmark configuration,
-group readiness, or `action_queue`. The coordinator asks one revision-bound
-atom question at a time. After the final resolution it restores the original
-pending contract and active group, recompiles the complete original source
-with the resolution evidence, and reruns coverage, whole-plan review, and
-deterministic admission. Every newly admitted envelope carries the same
-finalization receipt. Session, schema, registry, pending-contract, or workflow
-precondition drift invalidates the draft; reset/cancel never commits its
-candidates. External execution requires a later fresh authorization turn and
-cannot be finalized from a draft.
+group readiness, or `action_queue`. Independently complete consultation units
+may enter a separate registry-bounded detour only when every action is
+`turn_local/read_only`. That projected plan receives a fresh immutable
+whole-plan review and normal deterministic admission; the rejected parent plan
+is never an execution receipt. Draft contract v4 records the exact read-only
+unit identities delivered in the same Product Head transaction. Finalization
+projects those settled units to context so the response cannot be repeated.
+Mutation, navigation, pending-answer, durable-queue, and execution actions are
+never partially applied. The coordinator asks one revision-bound atom question
+at a time. After the final resolution it restores the original pending contract
+and active group, recompiles the complete original source with the resolution
+evidence, and reruns coverage, whole-plan review, and deterministic admission.
+Every newly admitted envelope carries the same finalization receipt. Session,
+schema, registry, pending-contract, or workflow precondition drift invalidates
+the draft; reset/cancel never commits its candidates. External execution
+requires a later fresh authorization turn and cannot be finalized from a draft.
+
+A resolved draft may also finish with no action, but only through a separate
+Harness-minted no-op finalization transaction. Its receipt binds a ready draft
+with no frozen candidates, background disposition evidence for every atom, a
+zero-action immutable plan, context admission verdicts for every source unit,
+and the complete review identity. This clears the draft without inventing an
+`unknown` or synthetic no-op action. An ordinary empty model response has no
+such receipt and continues to fail closed.
+
+An active evidence question does not reclassify arbitrary input as structured
+evidence. Input shape remains a transport-syntax fact: parser-recognized JSON,
+YAML, curl, and related blocks may remain atomic, while plain-language
+consultation, navigation, and configuration changes remain prose for semantic
+routing. A source-grounded chain replacement supersedes a chain-specific Case
+2/3 handoff. The chain transition authority clears `secondary_handoff` and its
+evidence, invalidates downstream chain-dependent state, and then returns to the
+normal fallback order. Correcting an adapter family performs the same handoff
+cleanup before entering the replacement family workflow; no transcript-specific
+cancellation path is involved.
 
 The persisted semantic-partition receipt names its `planning_lane` as either
 `bounded_semantic_value` or `hierarchical`. The producer, runtime-event
@@ -433,7 +503,7 @@ edit it manually. If a user changes an earlier answer, the Harness must update
 or invalidate the affected group state and regenerate downstream runtime
 artifacts through deterministic tools.
 
-Checkpoint state uses schema version 23. Current-version turns never invoke a
+Checkpoint state uses schema version 24. Current-version turns never invoke a
 legacy action compiler. Version 12 checkpoints cross the explicit migration
 boundary; version 13 checkpoints additionally migrate deferred-queue retention
 into the typed pending-question contract; version 14 initializes typed response
@@ -456,7 +526,9 @@ fields, and atomic finalization receipts; incomplete version 20 finalization
 transactions are quarantined as a whole. Version 22 adds a durable-state
 secret-binding registry. Version 23 signs sensitivity into the group/question
 contract, uses salted memory-hard secret verifiers, and transacts registry
-mutations with the Product Head commit.
+mutations with the Product Head commit. Version 24 adds the admission-bound
+semantic-draft no-op finalization receipt and its replay invariants; it does not
+relax empty-plan admission outside that exact transaction.
 Every accepted domain delta reconciles durable secret ownership inside that
 same atomic commit boundary before candidate validation. Sensitive-value
 replacement therefore retires the superseded binding without exposing a
@@ -537,6 +609,12 @@ The workflow confirms:
   metrics;
 - stop condition: until stopped, fixed duration, or until synced.
 
+For canonical chain `bsc`, the BSC v1.7.x metrics profile extends the same
+sync-observe artifact path with native import MGas/s, block-insert P50,
+justified/finalized lag percentiles, transaction/gas aggregates, TPS, and sample
+quality. It does not add a workflow group or a Vegeta path, and it is not
+inherited by unrelated EVM clients.
+
 It must not ask for RPC mode, custom RPC workload, mixed weights, Vegeta, or
 QPS profile unless the user explicitly switches to an RPC benchmark.
 
@@ -579,10 +657,10 @@ scenarios and deterministic assertions.
 `tests/agent_live/run_product_acceptance.py` is the Phase 8
 evidence-admission controller, not the user simulator or real-execution
 provider. It generates revision-bound obligation catalogs and admits evidence
-produced by subordinate providers. Phase 8 is implemented, but G3-G6 remain
-open until retained real-CLI regressions, response-driven dual-AI Chaos, all
-required real executions, and the final product review have independently
-produced qualifying evidence.
+produced by subordinate providers. This architecture document does not freeze
+the current G3-G6 result; run the controller for the target revision. Each gate
+remains open until its retained real-CLI regressions, response-driven dual-AI
+Chaos, required real executions, and product-review evidence are admitted.
 
 The fixed CLI matrix is not sufficient for product acceptance. Follow
 `tests/agent_live/README.md`: DeepSeek runs the real Docker/Linux CLI and Codex

@@ -1092,6 +1092,163 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "preserve-product-head",
         )
 
+    def test_pre_admission_uncertainty_uses_read_only_detour_transaction(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import review_semantic_plan
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.semantic_drafts import semantic_hash
+        from agent.harness.state import new_state
+
+        consultation = {
+            "unit_id": "consultation",
+            "clause_id": "clause-1",
+            "source_text": "Explain real-node requirements",
+            "operation": "consultation",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+            "reason": "read-only requirements consultation",
+        }
+        unresolved = {
+            "unit_id": "undecided-goal",
+            "clause_id": "clause-2",
+            "source_text": "Save one of those goals",
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "the goal is not uniquely identified",
+        }
+        document = {
+            "status": "review_plan",
+            "started_monotonic": time.monotonic(),
+            "clauses": [
+                {
+                    "clause_id": "clause-1",
+                    "text": consultation["source_text"],
+                    "input_shape": "prose",
+                },
+                {
+                    "clause_id": "clause-2",
+                    "text": unresolved["source_text"],
+                    "input_shape": "prose",
+                },
+            ],
+            "source_partition": [consultation, unresolved],
+            "routed_partition": [consultation],
+            "owner_documents": {
+                "orientation": {
+                    "actions": [{
+                        "type": "answer_opening_question",
+                        "topic": "requirements",
+                        "source_evidence": consultation["source_text"],
+                    }],
+                    "bindings": [{
+                        "unit_id": "consultation",
+                        "action_indexes": [0],
+                        "disposition": "action",
+                        "reason": "compiled",
+                    }],
+                },
+            },
+            "owner_count": 1,
+            "unit_count": 2,
+        }
+        state = new_state("coverage-detour", language="en")
+        state["turn_index"] = 1
+        state["turn_context"] = {
+            "product_head": {
+                "product_authority_id": "authority:coverage-detour",
+                "revision": 1,
+                "checkpoint_thread_id": "checkpoint-thread:coverage-detour",
+                "checkpoint_id": "checkpoint:coverage-detour",
+                "state_fingerprint": semantic_hash({"head": "coverage-detour"}),
+            },
+        }
+        merged_units = [
+            {
+                **consultation,
+                "disposition": "action",
+                "action_indexes": [0],
+            },
+            {
+                **unresolved,
+                "disposition": "unresolved",
+                "action_indexes": [],
+            },
+        ]
+        validation = PlanCoverageResult(
+            valid=False,
+            errors=(),
+            unresolved_clauses=(unresolved["source_text"],),
+            unresolved_units=(merged_units[1],),
+        )
+        durable_units = [
+            {
+                **merged_units[0],
+                "disposition": "context",
+                "action_indexes": [],
+            },
+            merged_units[1],
+        ]
+        admitted = {
+            "actions": document["owner_documents"]["orientation"]["actions"],
+            "semantic_units": [
+                merged_units[0],
+                {
+                    **merged_units[1],
+                    "disposition": "context",
+                    "action_indexes": [],
+                },
+            ],
+        }
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_prepare_candidate_with_normalized_conflict_projection",
+                return_value=(
+                    {
+                        "actions": document["owner_documents"]["orientation"][
+                            "actions"
+                        ],
+                        "semantic_units": merged_units,
+                    },
+                    "{}",
+                    validation,
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_and_admit_semantic_draft_read_only_detour",
+                return_value=(
+                    durable_units,
+                    [],
+                    ("consultation",),
+                    admitted,
+                    1,
+                    (321,),
+                ),
+            ),
+        ):
+            result = review_semantic_plan(state, document)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["answer_opening_question"],
+        )
+        self.assertEqual(
+            result["semantic_draft"]["settled_read_only_unit_ids"],
+            ("consultation",),
+        )
+        self.assertEqual(
+            [atom["unit_id"] for atom in result["semantic_draft"]["unresolved_atoms"]],
+            ["undecided-goal"],
+        )
+        self.assertEqual(result["planner_metrics"]["admission_calls"], 1)
+        self.assertEqual(result["planner_metrics"]["prompt_bytes"], 321)
+        self.assertEqual(result["planner_metrics"]["largest_request_bytes"], 321)
+
     def test_owner_compile_failure_is_preserved_as_typed_unresolved_work(
         self,
     ) -> None:
@@ -1687,6 +1844,32 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             (),
         )
         self.assertTrue(_cross_domain_pending_errors(incorrectly_routed, state))
+
+    def test_current_chain_reference_can_frame_an_independent_mode_change(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+
+        state = {
+            "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+            "target_mode": "real-node",
+            "pending_question": {
+                "group": "provider_deployment",
+                "value_domain": "environment_value",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "Switch this BSC run to sync-observe.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "target_mode",
+            }],
+        }]
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+
+        state["chain_identity"] = {"canonical": "solana", "status": "confirmed"}
+        self.assertTrue(_cross_domain_pending_errors(partition, state))
 
     def test_registered_value_consultation_remains_read_only(self) -> None:
         from agent.harness.hierarchical_planner import (
@@ -3042,6 +3225,26 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             60_000,
         )
 
+    def test_stage_a_payload_projects_runtime_field_intake_owner(self) -> None:
+        from agent.harness.hierarchical_planner import _stage_a_payload
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = (
+            "The node Prometheus metrics endpoint is "
+            "http://127.0.0.1:19091/debug/metrics/prometheus."
+        )
+        payload = _stage_a_payload({}, text, segment_user_turn(text))
+        intake = next(
+            row
+            for row in payload["registered_runtime_field_intakes"]
+            if row["field"] == "NODE_PROMETHEUS_METRICS_URL"
+        )
+
+        self.assertEqual(intake["owner"], "environment")
+        self.assertEqual(intake["groups"], ["sync_observe"])
+        self.assertEqual(intake["action_type"], "propose_config_values")
+        self.assertEqual(intake["logical_key"], "node_prometheus_metrics_url")
+
     def test_stage_a_projects_closed_consultation_topic_purposes(self) -> None:
         from agent.harness.action_registry import CONSULTATION_TOPIC_PURPOSES
         from agent.harness.hierarchical_planner import _stage_a_payload
@@ -3610,6 +3813,91 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(result["stage_a_calls"], 1)
         self.assertEqual(result["admission_calls"], 1)
         self.assertEqual(compiler.call_count, 2)
+
+    def test_rejected_stage_a_challenger_cannot_veto_reviewed_primary(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        text = "Explain real-node requirements and save one undecided goal."
+        primary = [
+            {
+                "unit_id": "consultation",
+                "clause_id": "clause-1",
+                "source_text": "Explain real-node requirements",
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "opening",
+                }],
+                "reason": "complete read-only consultation",
+            },
+            {
+                "unit_id": "undecided-goal",
+                "clause_id": "clause-1",
+                "source_text": "save one undecided goal",
+                "operation": "unresolved",
+                "owner_routes": [],
+                "reason": "the goal is not uniquely identified",
+            },
+        ]
+        challenger = [
+            {
+                "unit_id": "broken-consultation",
+                "clause_id": "clause-1",
+                "source_text": "Explain real-node",
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "opening",
+                }],
+                "reason": "the shared predicate was cut off",
+            },
+            dict(primary[1]),
+        ]
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                side_effect=[
+                    (primary, (), (101,)),
+                    (challenger, (), (102,)),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_candidate",
+                side_effect=[
+                    ((), (201,), frozenset(), True, ()),
+                    (
+                        ("Stage A admission found unresolved unit: broken-consultation",),
+                        (202,),
+                        frozenset(),
+                        True,
+                        (),
+                    ),
+                ],
+            ),
+        ):
+            document = begin_semantic_partition(
+                new_state("reviewed-primary", language="en"),
+                text,
+            )
+
+        self.assertEqual(document["status"], "compile_owner", document)
+        self.assertEqual(document["source_partition"], primary)
+        self.assertEqual(document["owner_requests"], [{
+            "owner": "orientation",
+            "unit_ids": ["consultation"],
+            "groups": ["opening"],
+        }])
+        self.assertEqual(
+            document["stage_a_challenger_rejection"]["retained_proposal"],
+            "primary",
+        )
 
     def test_unresolved_partition_converges_to_independent_routed_proposal(
         self,
@@ -5653,8 +5941,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner."
-                "_review_stage_a_pending_entailment",
-                return_value=((), (101, 102, 103)),
+                "_review_stage_a_pending_entailment_detailed",
+                return_value=(
+                    (),
+                    (101, 102, 103),
+                    frozenset({"focused-unit-1"}),
+                    frozenset(),
+                ),
             ),
             patch(
                 "agent.harness.hierarchical_planner."
@@ -5804,6 +6097,130 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(len(clauses), 1)
         self.assertEqual(clauses[0].input_shape, "structured")
         self.assertEqual(clauses[0].text, source)
+
+    def test_evidence_question_does_not_reclassify_plain_navigation_as_structured(self) -> None:
+        from agent.harness.hierarchical_planner import _turn_clauses
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-navigation", language="en")
+        state["pending_question"] = {
+            "id": "case3_protocol_evidence",
+            "group": "chain_identity",
+            "kind": "evidence",
+            "manual_input_allowed": True,
+            "structured_input_owner": True,
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+        }
+        source = "Actually, leave this handoff and switch to another chain."
+
+        clauses = _turn_clauses(state, source)
+
+        self.assertTrue(clauses)
+        self.assertTrue(all(clause.input_shape == "prose" for clause in clauses))
+        self.assertEqual(" ".join(clause.text for clause in clauses), source)
+
+    def test_semantic_draft_jury_binding_preserves_clarification_siblings(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _turn_clauses
+        from agent.harness.state import new_state
+
+        state = new_state("semantic-draft-siblings", language="zh")
+        state["pending_question"] = {
+            "id": "semantic-draft-question",
+            "group": "opening",
+            "manual_input_allowed": True,
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+            "semantic_draft_binding": {
+                "draft_id": "draft-id",
+                "revision": 1,
+                "atom_id": "atom-id",
+                "sensitive_input": False,
+            },
+        }
+
+        clauses = _turn_clauses(
+            state,
+            "不要保存目标，取消未决项；准备说明已经足够，不要重复。",
+        )
+
+        self.assertEqual(len(clauses), 2)
+        self.assertTrue(all(clause.input_shape == "prose" for clause in clauses))
+        self.assertEqual(clauses[0].text, "不要保存目标，取消未决项；")
+        self.assertEqual(clauses[1].text, "准备说明已经足够，不要重复。")
+
+    def test_semantic_draft_disposition_accepts_only_punctuation_envelope(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _bind_active_semantic_draft_disposition,
+            _semantic_draft_resolution_contract_errors,
+        )
+
+        evidence = "不要保存目标，取消未决项"
+        payload = {
+            "contract_proven_semantic_draft_resolution": {
+                "evidence_quote": evidence,
+                "resolution_disposition": "background",
+            }
+        }
+        base_unit = {
+            "unit_id": "u1",
+            "clause_id": "clause-1",
+            "source_text": f"{evidence}；",
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "jury-bound clarification",
+        }
+
+        bound, errors = _bind_active_semantic_draft_disposition(
+            [base_unit], payload
+        )
+
+        self.assertFalse(errors)
+        self.assertEqual(
+            bound[0]["_semantic_draft_resolution_disposition"],
+            "background",
+        )
+        self.assertFalse(
+            _semantic_draft_resolution_contract_errors(
+                [base_unit],
+                {
+                    **payload,
+                    "pending_question": {"group": "opening"},
+                },
+            )
+        )
+
+        lexical_sibling = {
+            **base_unit,
+            "source_text": f"{evidence}，并修改 QPS",
+        }
+        _bound, errors = _bind_active_semantic_draft_disposition(
+            [lexical_sibling], payload
+        )
+        self.assertEqual(
+            errors,
+            (
+                "semantic draft clarification disposition has no unique "
+                "source unit",
+            ),
+        )
+        self.assertTrue(
+            _semantic_draft_resolution_contract_errors(
+                [lexical_sibling],
+                {
+                    **payload,
+                    "pending_question": {"group": "opening"},
+                },
+            )
+        )
 
     @patch(
         "agent.harness.hierarchical_planner.request_semantic_compilation",
@@ -7593,6 +8010,132 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertTrue(any("owner/group mismatch" in error for error in errors))
 
+    def test_stage_a_accepts_registered_cross_owner_config_intake(self) -> None:
+        from agent.harness.hierarchical_planner import _validate_partition_document
+        from agent.harness.plan_coverage import segment_user_turn
+
+        source = (
+            "The metrics endpoint is "
+            "http://127.0.0.1:19091/debug/metrics/prometheus."
+        )
+        clauses = segment_user_turn(source)
+        document = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": clauses[0].text,
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "environment",
+                    "group": "sync_observe",
+                }],
+                "reason": "registered runtime-field proposal",
+            }],
+        }
+
+        units, errors = _validate_partition_document(
+            json.dumps(document),
+            clauses,
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(
+            units[0]["owner_routes"],
+            [{"owner": "environment", "group": "sync_observe"}],
+        )
+
+    def test_stage_a_rejects_consultation_without_subject_group(self) -> None:
+        from agent.harness.hierarchical_planner import _validate_partition_document
+        from agent.harness.plan_coverage import segment_user_turn
+
+        source = "Can sync-observe continue without a metrics endpoint?"
+        clauses = segment_user_turn(source)
+        document = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": clauses[0].text,
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "",
+                }],
+                "reason": "workflow capability question without its subject",
+            }],
+        }
+
+        _units, errors = _validate_partition_document(
+            json.dumps(document),
+            clauses,
+        )
+
+        self.assertTrue(any(
+            "consultation route has no subject group" in error
+            for error in errors
+        ))
+
+    def test_stage_a_payload_projects_consultation_topic_route_groups(self) -> None:
+        from agent.harness.hierarchical_planner import _stage_a_payload
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        source = "Can BSC sync-observe continue without a metrics endpoint?"
+        payload = _stage_a_payload(
+            new_state("topic-route-projection", language="en"),
+            source,
+            segment_user_turn(source),
+        )
+        orientation = payload["universal_owner_action_purposes"][
+            "consultation"
+        ]["orientation"]
+        consultation = next(
+            row
+            for row in orientation
+            if row["action_type"] == "answer_opening_question"
+        )
+
+        self.assertEqual(
+            consultation["topic_route_groups"]["sync_observe_metrics"],
+            ["sync_observe"],
+        )
+
+    def test_stage_b_exposes_config_proposal_to_cross_owner_group(self) -> None:
+        from agent.harness.hierarchical_planner import _stage_b_payload
+        from agent.harness.state import new_state
+
+        source = (
+            "The metrics endpoint is "
+            "http://127.0.0.1:19091/debug/metrics/prometheus."
+        )
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "environment",
+                "group": "sync_observe",
+            }],
+            "reason": "registered runtime-field proposal",
+        }
+
+        payload = _stage_b_payload(
+            new_state("cross-owner-config", language="en"),
+            "environment",
+            frozenset({"sync_observe"}),
+            (unit,),
+            ("unit-1",),
+        )
+
+        self.assertIn(
+            "propose_config_values",
+            {row["type"] for row in payload["owner_action_schema"]},
+        )
+        self.assertEqual(
+            {row["name"] for row in payload["owner_group_schema"]},
+            {"sync_observe"},
+        )
+
     def test_stage_a_rejects_cross_clause_reordering(self) -> None:
         from agent.harness.hierarchical_planner import _validate_partition_document
         from agent.harness.plan_coverage import segment_user_turn
@@ -8319,6 +8862,229 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(redundant, frozenset())
         self.assertTrue(contract_valid)
         self.assertEqual(rejected, ())
+
+    def test_rejected_closed_option_can_support_a_complete_mode_change(self) -> None:
+        from agent.harness.hierarchical_planner import _review_stage_a_candidate
+
+        payload = {
+            "pending_question": {
+                "id": "qps_profile_confirm",
+                "group": "qps_profile",
+                "manual_input_allowed": False,
+                "value_domain": "closed_options",
+            },
+        }
+        partition = [
+            {
+                "unit_id": "declined-current-mode",
+                "clause_id": "clause-1",
+                "source_text": "Do not continue quick.",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "qps_profile",
+                }],
+            },
+            {
+                "unit_id": "mode-change",
+                "clause_id": "clause-2",
+                "source_text": "Switch to sync-observe.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+            },
+        ]
+
+        def coverage_review(_provider, reviewed_payload, _partition, **_kwargs):
+            self.assertEqual(
+                reviewed_payload[
+                    "contract_rejected_pending_entailment_unit_ids"
+                ],
+                ["declined-current-mode"],
+            )
+            return (), (400,), frozenset({"declined-current-mode"}), True
+
+        with patch(
+            "agent.harness.hierarchical_planner."
+            "_review_stage_a_pending_entailment_detailed",
+            return_value=(
+                (
+                    "Stage A pending-answer entailment quorum rejected unit: "
+                    "declined-current-mode",
+                ),
+                (100, 200, 300),
+                frozenset(),
+                frozenset({"declined-current-mode"}),
+            ),
+        ), patch(
+            "agent.harness.hierarchical_planner._review_stage_a_partition",
+            side_effect=coverage_review,
+        ):
+            errors, sizes, redundant, contract_valid, rejected = (
+                _review_stage_a_candidate(object(), payload, partition)
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, (100, 200, 300, 400))
+        self.assertEqual(redundant, frozenset({"declined-current-mode"}))
+        self.assertTrue(contract_valid)
+        self.assertEqual(rejected, ())
+
+    def test_unabsorbed_rejected_pending_claim_is_forwarded_to_challenger(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _review_stage_a_candidate
+
+        payload = {
+            "pending_question": {
+                "id": "qps_profile_confirm",
+                "group": "qps_profile",
+                "value_domain": "closed_options",
+            },
+        }
+        partition = [
+            {
+                "unit_id": "declined-current-mode",
+                "clause_id": "clause-1",
+                "source_text": "Do not continue quick.",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "qps_profile",
+                }],
+            },
+            {
+                "unit_id": "mode-change",
+                "clause_id": "clause-2",
+                "source_text": "Switch to sync-observe.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "target_mode",
+                }],
+            },
+        ]
+
+        with patch(
+            "agent.harness.hierarchical_planner."
+            "_review_stage_a_pending_entailment_detailed",
+            return_value=(
+                ("pending entailment rejected",),
+                (100, 200, 300),
+                frozenset(),
+                frozenset({"declined-current-mode"}),
+            ),
+        ), patch(
+            "agent.harness.hierarchical_planner._review_stage_a_partition",
+            return_value=(
+                ("Stage A admission found unresolved unit: declined-current-mode",),
+                (400,),
+                frozenset(),
+                True,
+            ),
+        ):
+            errors, _sizes, _redundant, contract_valid, rejected = (
+                _review_stage_a_candidate(object(), payload, partition)
+            )
+
+        self.assertTrue(errors)
+        self.assertTrue(contract_valid)
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["unit_id"], "declined-current-mode")
+        self.assertEqual(rejected[0]["operation"], "pending_answer")
+        self.assertEqual(rejected[0]["group"], "qps_profile")
+        self.assertIn("pending-entailment jury rejected", rejected[0]["reason"])
+
+    def test_admission_contract_accepts_rejected_option_as_transition_support(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_stage_a_admission_document,
+        )
+
+        payload = {
+            "clauses": [
+                {
+                    "clause_id": "clause-1",
+                    "text": "Do not continue quick.",
+                    "input_shape": "prose",
+                },
+                {
+                    "clause_id": "clause-2",
+                    "text": "Switch to sync-observe.",
+                    "input_shape": "prose",
+                },
+            ],
+            "groups": [
+                {"owner": "coordinator", "name": "qps_profile"},
+                {"owner": "chain_rpc", "name": "target_mode"},
+            ],
+            "pending_question": {
+                "id": "qps_profile_confirm",
+                "group": "qps_profile",
+                "value_domain": "closed_options",
+            },
+            "contract_rejected_pending_entailment_unit_ids": [
+                "declined-current-mode"
+            ],
+        }
+        partition = [
+            {
+                "unit_id": "declined-current-mode",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+            },
+            {
+                "unit_id": "mode-change",
+                "clause_id": "clause-2",
+                "operation": "domain_request",
+            },
+        ]
+        response = json.dumps({
+            "unit_verdicts": [
+                {
+                    "unit_id": "declined-current-mode",
+                    "verdict": "redundant",
+                    "supports_unit_id": "mode-change",
+                    "reason": "the refusal frames the requested mode transition",
+                },
+                {
+                    "unit_id": "mode-change",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "the target workflow transition is explicit",
+                },
+            ],
+            "clause_verdicts": [
+                {
+                    "clause_id": "clause-1",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "the refusal is represented as transition support",
+                },
+                {
+                    "clause_id": "clause-2",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "the transition demand is represented",
+                },
+            ],
+            "reason": "all source semantics are represented once",
+        })
+
+        contract_errors, semantic_errors, redundant = (
+            _validate_stage_a_admission_document(
+                response,
+                payload,
+                partition,
+            )
+        )
+
+        self.assertEqual(contract_errors, ())
+        self.assertEqual(semantic_errors, ())
+        self.assertEqual(redundant, frozenset({"declined-current-mode"}))
 
     def test_researched_identity_allows_only_redundant_rejected_predecessor(
         self,
@@ -9506,6 +10272,73 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
         self.assertIn("contract_repair", repair_payload)
 
+    def test_stage_a_admission_repair_names_missing_row_fields(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Explain the current sync metrics.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Explain the current sync metrics.",
+            }],
+            "groups": [{"name": "sync_observe", "owner": "orientation"}],
+            "universal_operations": ["consultation"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Explain the current sync metrics.",
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "sync_observe",
+            }],
+            "reason": "read-only metrics consultation",
+        }]
+        malformed = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the consultation is represented",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+            }],
+            "reason": "the partition is complete",
+        }
+        repaired = {
+            **malformed,
+            "clause_verdicts": [{
+                **malformed["clause_verdicts"][0],
+                "reason": "the complete clause is represented",
+            }],
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=[json.dumps(malformed), json.dumps(repaired)],
+        ) as compiler:
+            errors, sizes, _redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 2)
+        validation_errors = compiler.call_args_list[1].kwargs[
+            "request_payload"
+        ]["contract_repair"]["validation_errors"]
+        self.assertTrue(any(
+            "missing fields: reason" in error
+            for error in validation_errors
+        ))
+
     def test_stage_a_admission_does_not_retry_valid_semantic_rejection(
         self,
     ) -> None:
@@ -10635,6 +11468,174 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         ]
         self.assertIn(
             "conflicting answer and selected_value representations",
+            " ".join(repair["validator_errors"]),
+        )
+
+    def test_stage_b_repairs_unbound_config_explanation_subject_once(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-config-subject-repair", language="en")
+        state["pending_question"] = {
+            "id": "sync_observe_stop_condition",
+            "group": "sync_observe",
+            "kind": "numbered_choice",
+            "prompt": "Choose how observation stops.",
+            "manual_input_allowed": False,
+        }
+        source = "Can this keep observing until I stop it manually?"
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "sync_observe",
+            }],
+            "reason": "explains the active stop option",
+        }]
+        malformed = {
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "config_explanation",
+                "source_evidence": source,
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "answers the stop-option question",
+            }],
+            "reason": "compiled without a stable subject",
+        }
+        repaired = {
+            **malformed,
+            "actions": [{
+                **malformed["actions"][0],
+                "subject": "sync_observe_stop_condition",
+            }],
+            "reason": "bound to the immutable pending-question identifier",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_owner_document_requires_semantic_review",
+                return_value=False,
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(malformed), json.dumps(repaired)],
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "orientation",
+                frozenset({"sync_observe"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], repaired["actions"])
+        self.assertEqual(len(sizes), 2)
+        repair = compiler.call_args_list[1].kwargs["request_payload"][
+            "contract_repair"
+        ]
+        self.assertIn(
+            "exact bound subject",
+            " ".join(repair["validator_errors"]),
+        )
+
+    def test_stage_b_repairs_consultation_topic_outside_routed_group_once(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-consultation-route-repair", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {
+            "canonical": "bsc",
+            "status": "confirmed",
+        }
+        source = "Can sync-observe continue without a metrics endpoint?"
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "sync_observe",
+            }],
+            "reason": "workflow metric capability question",
+        }]
+        binding = [{
+            "unit_id": "unit-1",
+            "action_indexes": [0],
+            "disposition": "action",
+            "reason": "answers the capability question",
+        }]
+        malformed = {
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "environment_readiness",
+                "source_evidence": source,
+            }],
+            "bindings": binding,
+            "reason": "used host readiness for a workflow capability",
+        }
+        repaired = {
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "sync_observe_metrics",
+                "subject": "bsc",
+                "source_evidence": source,
+            }],
+            "bindings": binding,
+            "reason": "uses the routed workflow capability topic",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_owner_document_requires_semantic_review",
+                return_value=False,
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(malformed), json.dumps(repaired)],
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "orientation",
+                frozenset({"sync_observe"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], repaired["actions"])
+        self.assertEqual(len(sizes), 2)
+        repair = compiler.call_args_list[1].kwargs["request_payload"][
+            "contract_repair"
+        ]
+        self.assertIn(
+            "outside unit route groups",
             " ".join(repair["validator_errors"]),
         )
 

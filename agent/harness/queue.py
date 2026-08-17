@@ -208,6 +208,17 @@ def action_target_groups(action: Mapping[str, Any]) -> set[str]:
     spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
     if spec is None:
         return set()
+    if spec.target_groups_strategy == "config_values":
+        from agent.workflows.group_registry import group_for_config_field
+
+        values = action.get("config_values")
+        if not isinstance(values, Mapping):
+            return set()
+        return {
+            group
+            for field in values
+            if (group := group_for_config_field(str(field or "").strip().upper()))
+        }
     groups = {
         str(group).strip()
         for group in (

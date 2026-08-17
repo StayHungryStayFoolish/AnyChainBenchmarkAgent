@@ -275,6 +275,9 @@ def _apply_performance_answer_state(
                 return state, response_fragment, True
             qps.setdefault("overrides", {})[adjust_field] = candidate
             qps.pop("adjust_field", None)
+            response_fragment = _qps_overrides_applied_fragment(
+                {adjust_field: candidate}
+            )
     elif group == "observability":
         mode = str(value)
         state.setdefault("observability", {})["mode"] = mode
@@ -330,6 +333,22 @@ def validate_qps_profile(values: dict[str, Any]) -> str:
     if parsed["MAX_QPS"] < parsed["INITIAL_QPS"]:
         return f"MAX_QPS({parsed['MAX_QPS']}) < INITIAL_QPS({parsed['INITIAL_QPS']})"
     return ""
+
+
+def _qps_overrides_applied_fragment(
+    overrides: dict[str, Any],
+) -> ResponseFragment:
+    details = ", ".join(
+        f"{field}={normalize_scalar(str(overrides[field]))}"
+        for field in QPS_FIELDS
+        if field in overrides
+    )
+    return ResponseFragment(
+        kind="message",
+        message_id="harness.performance.qps_overrides_applied",
+        arguments={"details": details},
+        source=__name__,
+    )
 
 
 def validate_qps_overrides(
@@ -428,6 +447,7 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
         qps.setdefault("overrides", {}).update({key: normalized[key] for key in QPS_FIELDS if key in normalized})
         qps.update({"confirmed": True, "default_decision_made": True})
         next_group = "qps_profile"
+        response_fragment = _qps_overrides_applied_fragment(normalized)
     elif action.action_type == "set_observability":
         mode = normalize_observability_mode(action.arguments.get("observability_mode"))
         if not mode:

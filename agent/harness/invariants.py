@@ -22,6 +22,7 @@ from .semantic_drafts import (
     semantic_draft_question_binding,
     semantic_draft_uses_current_authority,
     validate_semantic_draft_finalization_receipt_body,
+    validate_semantic_draft_noop_finalization_receipt_body,
     validate_semantic_plan_draft,
 )
 
@@ -67,15 +68,6 @@ OWNER_PATH_POLICY: dict[str, frozenset[StatePath]] = {
         | {
             ("inferred_config",),
             ("endpoint_evidence", "proposed_values"),
-            # Structured review is one typed environment action. These exact
-            # fields are shared proposal inputs, not workflow-control grants.
-            ("confirmed_config", "CHAIN_REST_URL"),
-            ("confirmed_config", "CHAIN_INDEXER_URL"),
-            ("confirmed_config", "CHAIN_SIDECAR_URL"),
-            ("confirmed_config", "CHAIN_EVM_RPC_URL"),
-            ("confirmed_config", "CHAIN_JSON_RPC_URL"),
-            ("confirmed_config", "CHAIN_MIRROR_URL"),
-            ("confirmed_config", "RPC_API_KEY"),
         }
     ),
     "chain_rpc": frozenset(
@@ -314,6 +306,71 @@ def _validate_semantic_finalization_action_sets(
             raise StateInvariantError(
                 "semantic draft finalization action set is incomplete"
             )
+
+
+def _validate_semantic_noop_finalizations(state: AgentGraphState) -> None:
+    """Validate terminal zero-action draft receipts independently of actions."""
+
+    session_id = str(
+        (state.get("session") or {}).get("id")
+        or state.get("thread_id")
+        or ""
+    )
+    noop_receipts: dict[tuple[str, int], dict[str, Any]] = {}
+    action_finalizations: set[tuple[str, int]] = set()
+    application_draft_ids: set[str] = set()
+    for item in state.get("audit_events") or ():
+        if not isinstance(item, Mapping):
+            continue
+        event = str(item.get("event") or "")
+        if event == "semantic_draft_finalized":
+            action_finalizations.add((
+                str(item.get("draft_id") or ""),
+                int(item.get("draft_revision") or 0),
+            ))
+            continue
+        if event == "semantic_draft_finalization_action_applied":
+            application_draft_ids.add(str(item.get("draft_id") or ""))
+            continue
+        if event != "semantic_draft_noop_finalized":
+            continue
+        body = {key: value for key, value in item.items() if key != "event"}
+        try:
+            receipt = validate_semantic_draft_noop_finalization_receipt_body(
+                body,
+                session_id=session_id,
+            )
+        except ValueError as exc:
+            raise StateInvariantError(str(exc)) from exc
+        key = (
+            str(receipt.get("draft_id") or ""),
+            int(receipt.get("draft_revision") or 0),
+        )
+        existing = noop_receipts.get(key)
+        if existing is not None and existing != receipt:
+            raise StateInvariantError(
+                "semantic draft no-op finalization receipts are inconsistent"
+            )
+        noop_receipts[key] = receipt
+    if set(noop_receipts) & action_finalizations:
+        raise StateInvariantError(
+            "semantic draft has conflicting action and no-op finalization"
+        )
+    if {
+        draft_id for draft_id, _revision in noop_receipts
+    } & application_draft_ids:
+        raise StateInvariantError(
+            "semantic draft no-op finalization has an action application"
+        )
+    live_draft = dict(state.get("semantic_plan_draft") or {})
+    live_key = (
+        str(live_draft.get("draft_id") or ""),
+        int(live_draft.get("revision") or 0),
+    )
+    if live_key in noop_receipts:
+        raise StateInvariantError(
+            "semantic draft no-op finalization retained the live draft"
+        )
 
 
 def validate_state(state: AgentGraphState) -> None:
@@ -604,6 +661,7 @@ def validate_state(state: AgentGraphState) -> None:
     non_empty_ids = [item for item in action_ids if item]
     if len(non_empty_ids) != len(set(non_empty_ids)):
         raise StateInvariantError("action queue contains duplicate action ids")
+    _validate_semantic_noop_finalizations(state)
     _validate_semantic_finalization_action_sets(state)
 
     selected = state.get("selected_action") or {}

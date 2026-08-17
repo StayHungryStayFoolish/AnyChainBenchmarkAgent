@@ -29,8 +29,8 @@ MESSAGES = {
         "kinds": _PROMPT,
     },
     "question.control.semantic_draft_atom.cancel": {
-        "en": "Cancel the complete pending plan",
-        "zh": "取消整个待确认计划",
+        "en": "Discard all unresolved, unapplied items in this draft",
+        "zh": "丢弃这个草稿中所有尚未解决且未应用的内容",
         "arguments": {},
         "kinds": _LABEL,
     },

@@ -27,7 +27,10 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     warnings = list(environment.get("warnings", []))
 
     if llm_errors:
-        warnings.append("LLM provider is not fully configured; offline dev checks still work, but ADK runtime needs a model configuration.")
+        warnings.append(
+            "LLM provider is not fully configured; offline development checks still work, "
+            "but natural-language AnyChain Agent operation needs a model configuration."
+        )
     warnings.extend(google_auth.get("warnings", []))
     if required_missing:
         warnings.append("Real benchmark execution may fail until required dependencies are available.")
@@ -90,12 +93,15 @@ def _next_actions(
     if required_missing:
         actions.append("Use the project Docker image or isolated dependency installer before real benchmark execution.")
     if llm_errors:
-        actions.append("Configure config/agent_config.sh with a real model provider before starting the ADK Agent.")
+        actions.append("Configure config/agent_config.sh with a real model provider before starting AnyChain Agent.")
     actions.extend(google_auth.get("next_actions", []))
     disks = environment.get("disks", {})
     if disks.get("ambiguous_candidates"):
         actions.append("Confirm ledger/accounts devices before running disk bottleneck tests.")
-    actions.append("Run `run smoke` in the ADK terminal after creating a plan for a local lifecycle check.")
+    actions.append(
+        "Start ./bin/anychain-agent, create a plan, and approve the prompted smoke step "
+        "for a local lifecycle check."
+    )
     return actions
 
 

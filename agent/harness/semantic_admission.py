@@ -54,6 +54,9 @@ from .questions import (
     value_satisfies_pending_contract,
 )
 from .queue import action_supersedes_pending_contract
+from .semantic_drafts import (
+    build_semantic_draft_noop_finalization_receipt,
+)
 from .semantic_compiler import (
     ImmutableSemanticPlan,
     STRICT_JSON_REASONING_MODE,
@@ -679,7 +682,7 @@ def _review_bounded_semantic_candidate(
     admission = request_whole_plan_admission(
         provider,
         plan,
-        semantic_policy=_semantic_fulfillment_prompt(),
+        semantic_policy=_whole_plan_fulfillment_policy(),
         allowed_action_types=(
             sorted(allowed_action_types)
             if allowed_action_types is not None
@@ -1168,10 +1171,24 @@ def _admitted_action_queue(
         if not isinstance(action, Mapping) or not str(action.get("_admission_action_id") or ""):
             raise ValueError("canonical pending choice has no final admission action id")
         contract["admission_action_id"] = str(action.get("_admission_action_id"))
-    return _parse_action_queue(
+    parsed = _parse_action_queue(
         json.dumps(admitted_payload, ensure_ascii=False, sort_keys=True),
         trusted_metadata=True,
+        allow_empty_actions=True,
     )
+    draft = dict(state.get("semantic_plan_draft") or {})
+    if not actions and draft.get("status") == "ready_for_review":
+        parsed["semantic_draft_noop_finalization_receipt"] = (
+            build_semantic_draft_noop_finalization_receipt(
+                draft,
+                plan_hash=plan.plan_hash,
+                unit_verdicts=admission.unit_verdicts,
+                review_hashes=admission.review_hashes,
+                review_ids=admission.review_ids,
+                request_count=admission.request_count,
+            )
+        )
+    return parsed
 
 
 def _invalid_plan_coverage(
@@ -2181,6 +2198,8 @@ def _requires_semantic_fulfillment_review(action: dict[str, Any]) -> bool:
 
 
 def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
+    """Return the standalone legacy fulfillment-review contract and policy."""
+
     if review_kind == "actions":
         output_contract = (
             "Audit only the supplied action-purpose rows. Return one JSON object only: "
@@ -2239,6 +2258,35 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "A wire-method-selection purpose requires an actual callable wire method, not merely a schema field named method or method_id. An endpoint-selection purpose requires an explicitly selected validation endpoint, not an example or documentation URL. A secondary-development evidence purpose likewise requires new protocol, endpoint, request, response, or official-document evidence. A pending-answer purpose must actually answer the supplied pending contract. Reset and execution "
         "approval require explicit authorization. A declared pending option plus adjacent prose that only explains why that same option was selected is one supported pending-answer purpose: the option selection is direct evidence and the reason may be explanatory_context or operation_restatement support. The reason is not an omitted demand unless it independently asks, changes, contradicts, navigates, or selects something else. "
         "For each unit_review, complete is true only when mapped operations collectively preserve every explicit selection, mutation, consultation, evidence request, and navigation demand in source_text; one mapped purpose may be valid while the set is still incomplete. When complete is false, missing_demand_quote must be the shortest non-empty exact substring of source_text that states one omitted independently actionable demand; otherwise it must be empty. A committed named benchmark chain requires a declared purpose that selects that exact chain. A tentative chain candidate may instead be completely preserved by a declared intake purpose that asks the user to resolve candidates, while a chain mentioned only in a support question needs no chain mutation or intake purpose. When a schema-evidence pending question identifies an existing catalog draft, deictic source text such as 'this method has no parameters' or 'it returns a hex value' contributes parameter/response evidence to that current draft and may support an evidence-ingestion purpose; it still cannot support a wire-method-selection purpose unless the source itself names the wire method. Do not repair, route, invent, rename, or classify an operation."
+    )
+
+
+def _whole_plan_fulfillment_policy() -> str:
+    """Return domain policy expressed only in whole-plan admission concepts."""
+
+    return (
+        "Audit high-risk AnyChain action-purpose mappings and compound-unit completeness. "
+        "Use only the action_verdicts and unit_verdicts contract already declared above. "
+        "A context unit is context only when it contains no independent present selection, "
+        "mutation, consultation, evidence request, navigation, correction, or execution demand. "
+        "Explanatory framing, provenance, format or temporal scope, and a non-mutation constraint "
+        "may remain context when they add no independently requested effect. "
+        f"{FRAMED_REQUEST_SEMANTIC_POLICY}"
+        "Judge each immutable action from its declared purpose and exact owned source evidence; "
+        "workflow state and pending state are never user authorization. A read-only consultation "
+        "must answer the exact requested subject and cannot authorize a durable mutation. "
+        "Group navigation preserves a request to visit or resume a registered group, but it does "
+        "not preserve an explicitly supplied field value or a more specific registered entry action. "
+        "A custom-RPC entry action is supported by an explicit request to start that typed workflow; "
+        "endpoint, method, parameters, response schema, validation, and weights remain later typed steps. "
+        "An RPC evidence action requires source-grounded method, request, parameter, response, endpoint, "
+        "or official-document evidence and must not treat an example endpoint as the selected benchmark endpoint. "
+        "A QPS customization action requires an explicit request to alter the profile; merely visiting "
+        "the QPS group is navigation. A committed named chain requires the registered chain-selection "
+        "purpose, while tentative candidates require the registered candidate intake. "
+        "A pending answer must answer only the signed question that existed at turn start; independently "
+        "actionable sibling demands require their own immutable actions. Reset and execution approval "
+        "always require explicit authorization. Do not repair, route, invent, rename, or classify an action."
     )
 
 
@@ -2345,6 +2393,7 @@ def _parse_action_queue(
     text: str,
     *,
     trusted_metadata: bool = False,
+    allow_empty_actions: bool = False,
 ) -> dict[str, Any]:
     payload = _parse_json_object(text)
     actions_raw = payload.get("actions")
@@ -2364,7 +2413,7 @@ def _parse_action_queue(
         action_type = str(action["type"])
         action.setdefault("confidence", "low" if action_type == "unknown" else "medium")
         actions.append(action)
-    if not actions:
+    if not actions and not allow_empty_actions:
         actions = [{"type": "unknown", "reason": "model returned no actions", "confidence": "low"}]
     return {
         "actions": actions,

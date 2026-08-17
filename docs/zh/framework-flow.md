@@ -88,6 +88,14 @@ flowchart TD
 指标时，数值 0 才表示真实观测值；否则不得把 0 解释为真实吞吐。框架支持 Geth 的
 `chain_mgasps` summary。
 
+当 `BLOCKCHAIN_NODE=bsc` 时，BSC v1.7.x profile 会从同一个 endpoint 精确读取
+`chain_mgasps{quantile="0.5"}`、`chain_inserts`、`chain_insert_txsize`、
+`chain_insert_gasused` 以及 imported/justified/finalized head gauges。报告会增加
+区块导入 P50、MGas/s、finality 落后 P50/P90/P99、交易总数、每区块/每秒 Gas、
+每交易 Gas、每区块交易数、TPS、CPU、内存和样本质量。这些 BSC 指标不会自动套用
+到其他 EVM client；当 scrape interval 跳过已导入区块时，累计交易和 Gas 会明确标记
+为估算并展示覆盖率。
+
 Sync-observe 不录制 fake-node fixtures。节点可能先下载 peer snapshot，然后从
 snapshot 高度继续追块；框架通过 endpoint/sync-health 真实性校验观察这个行为，
 而不是录制 RPC request/response fixtures。

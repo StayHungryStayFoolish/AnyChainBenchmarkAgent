@@ -23,9 +23,8 @@ runtime docs.
 ## What This Project Is
 
 AnyChain Benchmark Agent is a LangGraph Harness-based terminal Agent for
-blockchain node benchmark workflows. Google ADK is an optional model/tool
-bridge for Gemini and Google capabilities, not the product workflow owner. The
-Agent helps users:
+blockchain node benchmark workflows. Google ADK is only the optional Gemini
+`google_search` bridge, not the product workflow owner. The Agent helps users:
 
 - configure an LLM provider;
 - inspect local environment and dependencies;
@@ -71,8 +70,13 @@ environment.
 
    ```bash
    source config/agent_config.sh
+   python3 -m agent.cli llm-config
    python3 -m agent.cli adk-status
    ```
+
+   `llm-config` validates the selected provider/auth configuration without a
+   model call. `adk-status` reports only the optional Gemini
+   `google_search` bridge and is not a general provider-readiness check.
 
 6. Start the product terminal:
 
@@ -137,7 +141,7 @@ Gemini API key:
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro-preview"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="api_key"
 GEMINI_API_KEY="<secret>"
 ```
@@ -146,7 +150,7 @@ Gemini on Vertex AI with ADC:
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro-preview"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="google_adc"
 GOOGLE_CLOUD_PROJECT="<project-id>"
 GOOGLE_CLOUD_LOCATION="global"
@@ -206,19 +210,25 @@ research is unavailable unless a provider-specific integration is added later.
   fallback, mock-agent, phrase-repair, duplicate-state, and terminal
   business-routing paths. If useful deterministic behavior exists, migrate that
   behavior into the correct planner, validator, runner, analyzer, onboarding,
-  knowledge, or ADK-tool module. Do not keep legacy product logic by
+  knowledge, or optional search-grounding module. Do not keep legacy product logic by
   "isolating" it.
 
 ## Documents To Read For Deeper Work
 
 - `README.md`: user-facing quick start and full overview.
 - `agent/README.md`: Agent runtime and development contract.
-- `docs/en/adk-agent-architecture.md`: LangGraph Harness architecture, ADK
-  bridge boundary, and Agent Loop.
+- `docs/en/adk-agent-architecture.md`: LangGraph Harness architecture, optional
+  ADK search boundary, and Agent Loop.
 - `docs/en/anychain-agent-ai-work-gate.md`: project-specific AI coding gate.
+- `docs/en/agent-cli-verification-guide.md`: Docker/Linux CLI and dual-AI
+  verification procedure.
+- `docs/en/agent-handoff-product-verification.md`: external-AI handoff and
+  product acceptance contract.
 - `docs/zh/adk-agent-architecture.md` and
   `docs/zh/anychain-agent-ai-work-gate.md`: Chinese-directory mirrors for users
   browsing localized docs.
+- `docs/zh/agent-cli-verification-guide.md` and
+  `docs/zh/agent-handoff-product-verification.md`: Chinese verification mirrors.
 - `docs/zh/how-to-add-chain.md`: adding chain and RPC support.
 - `docs/zh/local-closed-loop-testing.md`: fake-node closed-loop testing.
 - `docs/zh/secondary-development-guide.md`: secondary-development handoff.

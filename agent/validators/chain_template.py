@@ -1,4 +1,4 @@
-"""Chain template validation wrappers for ADK tools."""
+"""Chain template validation wrappers for deterministic Agent tools."""
 
 from __future__ import annotations
 

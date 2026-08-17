@@ -45,7 +45,7 @@ LangGraph Harness 是唯一的对话与 workflow 控制平面：
 -> 通过 graph transition 继续处理已 admission 的工作
 -> canonical fallback
 -> 每轮最多一个 blocking question
--> 校验并 checkpoint schema version 23
+-> 校验并 checkpoint schema version 24
 ```
 
 任意手动输入值、自然语言、multi-intent prose 或需要语义归属的结构化内容都
@@ -94,6 +94,22 @@ Y/N、可信 terminal command、evidence transport framing 和空输入可以走
 graph 另有 `coordinator` control owner，仅处理 typed pending answer 和 graph
 control action。它不拥有 `GroupSpec`，不是第 9 个 domain owner。
 
+### 术语与生成路径验收
+
+产品 review 必须验证真实对外表面，不能只搜索源码注释：
+
+- startup 可以报告可选 Gemini search/Google ADK 可用性，但核心 runtime 必须是
+  LangGraph Harness；
+- 模型空输出和 provider failure 必须指向 configured model 或 AnyChain Agent，不能
+  声称 ADK 拥有响应；
+- structured doctor 的 `warnings` 和 `next_actions` 不得推荐 ADK Agent 或 ADK terminal；
+- 提供给模型的 framework context 与 programmatic tool schema 必须遵守同一控制权边界；
+- unknown-chain gap/onboarding 输出必须指向真实存在的
+  `config/chain_template.json.bak`。
+
+修改实现前先为这些输出增加确定性断言。内部兼容 identifier 可以保留旧名称，但用户或
+模型可见的旧描述、以及不存在的生成路径都必须让该验收边界失败。
+
 关键实现职责：
 
 - `graph.py`：唯一 checkpointer-backed LangGraph runtime；
@@ -117,7 +133,7 @@ control action。它不拥有 `GroupSpec`，不是第 9 个 domain owner。
 
 runtime 只能编译一个带 SQLite checkpointer 的 graph。禁止第二个
 uncheckpointed turn graph，禁止在一个 Python node 中 drain 完整 durable
-queue。checkpoint schema version 23 是当前契约：v12 是隔离 migration
+queue。checkpoint schema version 24 是当前契约：v12 是隔离 migration
 边界，v13 迁移 deferred queue retention，v14/v15 初始化 typed response，
 v16 增加显式 pending owner 与 Chain/RPC case context，v17 增加
 checkpointed semantic planning，v18 移除持久化的 turn-local response
@@ -126,7 +142,10 @@ checkpointed semantic planning，v18 移除持久化的 turn-local response
 v21 增加 atom 级 evidence、secret reference 和原子 finalization，v22 增加
 durable-state secret-binding registry，v23 增加签名 sensitivity、salted
 memory-hard verifier、与 Product Head 同事务的 registry，以及
-reference-only durable plan。v21 的原始凭据/reference 与 v22 的旧
+reference-only durable plan。v24 增加 admission-bound semantic-draft no-op
+finalization receipt；它只能清除所有 atom 都是 background、所有 source unit 都
+作为 context 通过 admission 的 ready draft，不能放宽普通模型空 plan 的 fail-closed
+规则。v21 的原始凭据/reference 与 v22 的旧
 binding/reference 必须 quarantine；当前版本缺失 secret 时使用 question
 contract v6 重录入。旧 state 必须 fail closed、迁移或 quarantine。
 
@@ -252,7 +271,9 @@ Codex 必须先读取本轮真实 Agent response，再决定下一轮输入。�
 
 `tests/agent_live/run_product_acceptance.py` 是唯一 G0-G6 evidence admission
 与状态权威。Phase 8 接收下级 provider 生成的 revision-bound evidence，但
-不自己伪造 conversation 或 job。
+不自己伪造 conversation 或 job。Phase 6 只关闭确定性 Gate G2。该长期契约不固化
+当前 G3-G6 结果；必须针对目标 revision 运行 controller。任一必需 gate 未关闭时，
+该 revision 都是 `not ready`，不能把局部 CLI 或双模型通过描述为最终产品验收完成。
 
 PTY worker 只持久化 candidate JSON。worker 启动前，不可变 batch manifest
 冻结 Ed25519 公钥信任根；私钥只在 batch controller 内存中生成，不写入共享
@@ -316,6 +337,7 @@ transcript、local coverage ledger、cache 或开发 key。
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 tests/run_offline_python_suite.py
 python3 tools/check_agent_boundaries.py --root .
+PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q agent tests
 git diff --check
 python3 tests/agent_live/run_product_acceptance.py --through-phase 8 \
   --g3-authority-trust-root-id "$G3_AUTHORITY_TRUST_ROOT_ID" \

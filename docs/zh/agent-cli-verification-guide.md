@@ -92,12 +92,16 @@ python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
 
-checkpoint schema version 23 是当前契约。migration 必须覆盖 v16 pending
+checkpoint schema version 24 是当前契约。migration 必须覆盖 v16 pending
 owner/Chain-RPC context、v17 semantic planning、v18 response authority，以及
 v19 non-executable semantic draft boundary、v20 Product Head/contract
 authority、v21 atom evidence/secret reference/finalization、v22
 durable-state secret binding，以及 v23 签名 sensitivity、memory-hard
-verifier、registry transaction 与 reference-only durable plan；并安全移除或
+verifier、registry transaction 与 reference-only durable plan。v24 还必须证明
+admission-bound semantic-draft no-op finalization receipt：只有所有 atom 都被
+裁定为 background、所有 source unit 都作为 context 通过 admission 的 ready draft
+才能在不产生 action 的情况下清除；普通模型空 plan 仍须 fail closed。migration
+必须安全移除或
 quarantine 不兼容的 in-flight planning、response scratch、v21
 raw/reference 与 v22 legacy binding/reference。
 
@@ -106,6 +110,16 @@ raw/reference 与 v22 legacy binding/reference。
 `admit` transition，并验证每阶段前后 checkpoint recovery、owner cursor、
 semantic order、失败行为和 resume idempotency。
 
+随后使用已配置的真实模型运行 LangGraph CLI matrix。它驱动用户实际使用的
+`./bin/anychain-agent` 入口，为每个 scenario 隔离 terminal/checkpoint state：
+
+```bash
+python3 tests/agent_live/run_langgraph_cli_matrix.py
+```
+
+只有配置了 Gemini credentials 时才能使用 `provider=gemini`。其他受支持 provider
+可以形成非搜索 live evidence，但不能据此声称 Google Search 已覆盖。
+
 Phase 8 唯一 authority：
 
 ```bash
@@ -113,7 +127,8 @@ python3 tests/agent_live/run_product_acceptance.py --through-phase 8
 ```
 
 该 controller 只生成 obligation catalog、admit 并验证下级 evidence，不会
-替代真实 conversation 或 job。
+替代真实 conversation 或 job。该长期指南不固化当前 G3-G6 结果；必须针对目标
+revision 运行 controller，缺少必需 admitted evidence 的 gate 保持 open。
 
 ## 双 AI Chaos 验证
 
@@ -168,9 +183,10 @@ matching 和 transcript 专用分支。
 
 ### 1. 启动、Auth 与本地发现
 
-输入 `doctor`。验证 provider/model/auth/web research、deployment、CPU、
-memory、network interface 与 disk candidate。metadata 不可用时显示 unknown。
-依赖安装必须先请求确认。Gemini 环境额外运行：
+启动 banner 验证 provider/model/auth/web research；输入 `doctor` 重跑只读摘要，验证
+deployment、CPU、memory、network interface 与 disk candidate。metadata 不可用时
+显示 unknown。缺少依赖时必须先请求同意，然后只显示外部 shell 安装命令，不得在
+对话会话内执行。Gemini 环境额外运行：
 
 ```bash
 python3 -m agent.cli llm-config

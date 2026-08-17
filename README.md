@@ -5,7 +5,7 @@
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](COMMERCIAL.md)
 [![Benchmark Python 3.8+](https://img.shields.io/badge/benchmark_python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![ADK Python 3.10+](https://img.shields.io/badge/adk_python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Agent Python 3.10+](https://img.shields.io/badge/agent_python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 A production-oriented benchmark framework for blockchain node QPS, latency,
@@ -17,17 +17,20 @@ monitoring collectors, fake-node, report generation, and archiving are still the
 source of truth. The intended human-facing entrypoint is `./bin/anychain-agent`.
 The product workflow is owned by the LangGraph Harness: it holds checkpointed
 state, routes typed intents to configuration groups, validates every gate, and
-selects the next blocking question. The Harness's own model calls are plain
-OpenAI-compatible HTTP requests for every provider (OpenAI, DeepSeek, and
-Gemini on Vertex alike); Google ADK is used for exactly one optional
-capability — Gemini `google_search` grounding for unknown-chain/protocol,
+selects the next blocking question. Every model provider implements the same
+Harness contract, while its transport remains provider-specific: OpenAI,
+DeepSeek, and Vertex Gemini use OpenAI-compatible calls; Gemini API-key mode
+uses native `generateContent`; Claude API-key mode uses Anthropic Messages; and
+Vertex Claude uses `rawPredict`. Google ADK is used for exactly one optional
+capability: Gemini `google_search` grounding for unknown-chain/protocol,
 custom-RPC schema, and sync-observe client research (see
-`agent/llm/search_grounding.py`) — and never owns a second benchmark wizard or
+`agent/llm/search_grounding.py`). It never owns a second benchmark wizard or
 conversation loop.
 
 The benchmark engine is the stable execution layer. The Agent uses the
-configured LLM only to interpret ambiguous natural language into typed Harness
-actions; deterministic tools, validators, preflight checks, smoke tests, and
+configured LLM for semantic interpretation and evidence-bounded consultation
+or analysis through typed Harness plans. Model output is never an execution
+authority: deterministic tools, validators, preflight checks, smoke tests, and
 approval gates own execution.
 
 ## Contents
@@ -86,7 +89,10 @@ Preview the generated benchmark report before running the framework:
 - Provides `sync-observe` mode for node catch-up observation without RPC load,
   proxy traffic, Vegeta, or QPS ramp. Reports include block-height progress,
   MGas/s when client metrics expose it, node process CPU/thread hotspots, disk
-  latency/iowait context, and network throughput.
+  latency/iowait context, and network throughput. For BSC v1.7.x, the native
+  profile also reports block-insert P50, justified/finalized lag percentiles,
+  transactions, gas/block, gas/second, gas/transaction, TX/block, TPS, and
+  sample quality from the BSC Prometheus endpoint.
 - Produces HTML reports and archives every run.
 - Provides optional Prometheus/Grafana telemetry through a read-only exporter.
 - Exposes JSON CLI tools, an OpenAI-compatible tool schema, and a stable
@@ -154,6 +160,11 @@ DeepSeek, OpenAI, Claude, and non-search Gemini sessions must start and run
 without that extra. Use `--agent-venv` for the preferred environment option;
 `--adk-venv` remains a compatibility alias.
 
+Startup reports the optional ADK search capability separately. A
+`google-adk is not installed` or `Web research: unavailable` message is
+informational unless the session specifically requires Gemini
+`google_search`; it is not a failure of the core LangGraph Agent runtime.
+
 If you skip this step and start the interactive Agent anyway, the launcher
 checks the required terminal dependency before entering the REPL. When
 `prompt-toolkit` is missing, it asks for confirmation and then runs
@@ -167,12 +178,14 @@ the Agent requires a Python 3.10+ runtime environment for model-backed
 sessions. The product launcher uses its own LangGraph terminal workflow and
 does not ask users to run `adk run` directly.
 
-Do not start by installing benchmark-engine dependencies manually. In the
-normal Agent flow, users install the Agent runtime once, configure the LLM, then
-let the Agent inspect benchmark dependencies and ask for approval before it
-calls `scripts/install_deps.sh --yes` through the confirmation-gated
-`install_dependencies` tool. Direct `scripts/install_deps.sh` usage is kept for
-CI, Docker images, and non-Agent automation.
+Do not install benchmark-engine dependencies before the Agent has inspected the
+host. In the normal interactive flow, users install the Agent runtime once,
+configure the LLM, and let startup diagnostics identify missing benchmark
+dependencies. The terminal asks for consent and, after `Y`, prints the exact
+`scripts/install_deps.sh --yes` command to run in the current shell; it does not
+execute installation scripts inside the conversation. The programmatic
+`install_dependencies` tool remains approval-gated for controlled platform
+integrations, CI, Docker images, and non-interactive automation.
 
 ### 3. Configure The Agent
 
@@ -197,9 +210,10 @@ commands validate the Agent, and what an assistant must not bypass. Real API
 keys, ADC settings, Vertex settings, and other local provider choices should go
 into `config/agent_config.local.sh`, which is gitignored.
 
-For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
-editing files. For user-only setup, `AGENTS.md` plus this README is usually
-enough to get started.
+For code changes, the assistant must also read `AI_CODING_GUIDE.md`,
+`docs/en/adk-agent-architecture.md`, and
+`docs/en/agent-handoff-product-verification.md` before editing files. For
+user-only setup, `AGENTS.md` plus this README is usually enough to get started.
 
 #### Option B: Manual Setup
 
@@ -209,9 +223,9 @@ If you prefer to configure the project yourself, start with:
 config/agent_config.sh
 ```
 
-Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
-credentials, context compaction, and optional enterprise Knowledge Base
-integration. Every variable has an inline comment.
+Use it to configure the Agent itself: LLM provider, model, authentication,
+optional enterprise Knowledge Base integration, and notification settings.
+Every variable has an inline comment.
 
 Write real secrets and local provider choices to:
 
@@ -229,7 +243,7 @@ service-account modes work for Gemini or `claude` through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="api_key"                   # api_key | google_adc | attached_service_account | service_account_impersonation | service_account_file
 GEMINI_API_KEY=""                         # or GOOGLE_API_KEY, required for Gemini API-key mode
 ANTHROPIC_API_KEY=""                      # required for `claude` API-key mode
@@ -240,6 +254,10 @@ GOOGLE_CLOUD_LOCATION="global"           # Vertex AI location/region
 GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # required for service_account_impersonation
 GOOGLE_APPLICATION_CREDENTIALS=""         # required only for service_account_file
 ```
+
+Model IDs and regional availability are provider-controlled. Select a model
+available for the chosen auth path and verify it with
+`python3 -m agent.cli llm-config` before starting a model-backed session.
 
 Choose one authentication path:
 
@@ -266,9 +284,14 @@ and request/response samples.
 
 Google Cloud CLI is needed only for local ADC workflows such as
 `LLM_AUTH_MODE=google_adc`, or when a host must create ADC before
-service-account impersonation. The Agent can detect whether `gcloud` and the
-local ADC file are present through `doctor`; after explicit approval it can
-install Google Cloud CLI with:
+service-account impersonation. The complete structured doctor report detects
+whether `gcloud` and the local ADC file are present:
+
+```bash
+python3 -m agent.cli doctor
+```
+
+Install Google Cloud CLI explicitly when the report says it is required:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes --with-gcloud
@@ -294,8 +317,8 @@ bash <(curl -sSL https://storage.googleapis.com/cloud-samples-data/adc/setup_adc
 ```
 
 That flow authorizes the environment and writes Application Default Credentials,
-usually under `~/.config/gcloud/application_default_credentials.json`. The
-Agent's `doctor` step should verify that ADC is present before using
+usually under `~/.config/gcloud/application_default_credentials.json`. Run
+`python3 -m agent.cli doctor` to verify that ADC is present before using
 `LLM_AUTH_MODE=google_adc`.
 
 On GCE/GKE/Cloud Run with an attached service account, `gcloud` is not required
@@ -310,8 +333,10 @@ config/user_config.sh
 ```
 
 You normally do not need to understand or edit all benchmark variables up
-front. Start the Agent, run `doctor`, describe what you want to test, and let
-the Agent tell you which required values are missing.
+front. The interactive terminal runs read-only diagnostics automatically at
+startup. Describe what you want to test, and let the Agent tell you which
+required values are missing. Use `doctor` in the session when you need to
+rerun the checks or troubleshoot the environment.
 
 When the Agent submits a job, it writes:
 
@@ -357,12 +382,13 @@ grounding capability:
 
 Then talk to it from the `User>` prompt. The Agent replies as `Agent>`, keeps
 the response language aligned with the user's input, stores job/session
-artifacts under `.agent`, and asks for explicit approval before installing
-dependencies, running smoke, or launching a benchmark job.
+artifacts under `.agent`, asks for consent before providing dependency-install
+commands, and requires explicit approval before smoke or benchmark execution.
 
 ```text
 User> doctor
-Agent> ...summarizes dependencies and asks before installing anything...
+Agent> ...reruns the read-only summary and, when dependencies are missing, asks
+       before showing the external installation command...
 
 User> I want to benchmark a Solana node.
 Agent> ...asks whether this is a fake-node closed-loop test or a real node...
@@ -380,11 +406,14 @@ Agent> ...routes to sync-observe, confirms sync-health reference, node process,
        optional metrics endpoint, disk/network metadata, and stop condition...
 ```
 
-Use a readiness check first on a new host. The Agent has a read-only doctor tool
-for cloud/deployment detection, dependencies, LLM/Vertex configuration,
-Knowledge Base configuration, and current framework capability coverage.
-If benchmark dependencies are missing, the Agent should explain the planned
-changes and ask for explicit approval before installing them.
+The Agent automatically runs a read-only startup check for cloud/deployment
+detection, dependencies, and current framework capability coverage, so
+`doctor` does not need to be the first input on a new host. Use `doctor` to
+rerun the check. For the complete structured LLM/Vertex, Knowledge Base, and
+authentication details, use `python3 -m agent.cli doctor`.
+If benchmark dependencies are missing, the interactive Agent explains the
+requirement and asks for consent before showing the external shell command. It
+does not run that installer inside the conversation.
 
 Real benchmark execution still uses confirmation-gated tools and must pass
 preflight and smoke before launch. The model output is never executed directly.
@@ -722,6 +751,8 @@ smoke.
 - [Agent Control Plane](agent/README.md)
 - [Agent Architecture](docs/en/adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](docs/en/anychain-agent-ai-work-gate.md)
+- [Agent CLI Verification Guide](docs/en/agent-cli-verification-guide.md)
+- [External AI Handoff and Product Verification](docs/en/agent-handoff-product-verification.md)
 - [Full Framework Reference](docs/en/framework-reference.md)
 - [Framework Flow and Data Lifecycle](docs/en/framework-flow.md)
 - [Module Guide](docs/en/module-guide.md)

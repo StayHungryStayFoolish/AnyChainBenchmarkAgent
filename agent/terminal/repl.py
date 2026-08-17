@@ -1257,6 +1257,7 @@ class AnyChainTerminal:
             "family_count": capabilities.get("family_count", summary.get("family_count")),
             "unique_rpc_method_count": capabilities.get("unique_rpc_method_count", summary.get("unique_rpc_method_count")),
             "chains": capabilities.get("chains", []),
+            "client_metric_profiles": capabilities.get("client_metric_profiles", []),
         }
         self.io.agent(
             self.state.language,

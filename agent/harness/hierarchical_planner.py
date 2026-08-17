@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,7 @@ from .action_registry import (
     ACTION_ARGUMENT_SCHEMAS,
     ACTION_BY_TYPE,
     ACTION_SPECS,
+    CONSULTATION_TOPIC_ROUTE_GROUPS,
     SEMANTIC_OPERATION_PURPOSES,
     SEMANTIC_OPERATIONS,
     UNIVERSAL_SEMANTIC_OPERATION_OWNERS,
@@ -44,11 +46,14 @@ from .context import (
     owner_workflow_snapshot,
     workflow_snapshot,
 )
-from .domains.environment import extract_structured_input_candidates
+from .domains.environment import (
+    CONFIG_PROPOSAL_FIELDS,
+    extract_structured_input_candidates,
+)
 from .semantic_admission import (
     _admitted_action_queue,
     _review_bounded_semantic_candidate,
-    _semantic_fulfillment_prompt,
+    _whole_plan_fulfillment_policy,
     _strip_candidate_admission_metadata,
     _unresolved_action_queue,
     prepare_hierarchical_candidate,
@@ -97,6 +102,7 @@ from .secret_refs import (
 )
 from .state import AgentGraphState
 from agent.utils.redaction import secret_values
+from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
 from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
 
 
@@ -160,6 +166,78 @@ def _source_secret_projection(
     return replacements, bindings, raw_by_reference
 _ROUTE_KEYS = frozenset({"owner", "group"})
 _BINDING_KEYS = frozenset({"unit_id", "action_indexes", "disposition", "reason"})
+
+
+def _registered_route_has_compiler(
+    owner: str,
+    group: str,
+    operation: str,
+) -> bool:
+    """Return whether the action registry authorizes one semantic route.
+
+    A workflow group has a primary runtime owner, but a registered cross-cutting
+    service may own a specific action for that group.  Configuration proposal
+    review is one such service.  Route authority therefore belongs to the
+    action registry rather than to ``GroupSpec.owner`` alone.
+    """
+
+    return any(
+        not spec.internal_only
+        and spec.owner == owner
+        and _action_spec_applies(
+            spec,
+            groups=frozenset({group}) if group else frozenset(),
+            operations=frozenset({operation}),
+        )
+        for spec in ACTION_SPECS
+    )
+
+
+def _registered_cross_owner_routes() -> frozenset[tuple[str, str]]:
+    """Project cross-owner group routes declared by executable actions."""
+
+    return frozenset(
+        (str(row["owner"]), str(group))
+        for row in action_schema()
+        for group in row.get("route_groups") or ()
+        if str(group)
+    )
+
+
+def _runtime_field_intake_routes() -> list[dict[str, Any]]:
+    """Project runtime-field proposal ownership into the Stage A contract."""
+
+    runtime_fields = {
+        field.env: field
+        for field in ALL_RUNTIME_FIELDS
+        if field.env
+    }
+    proposal_spec = ACTION_BY_TYPE["propose_config_values"]
+    rows: list[dict[str, Any]] = []
+    for field_name in sorted(CONFIG_PROPOSAL_FIELDS):
+        groups = sorted(
+            group.name
+            for group in GROUP_SPEC_BY_NAME.values()
+            if field_name in group.fields
+            and action_spec_serves_route(
+                proposal_spec,
+                operation="domain_request",
+                group=group.name,
+            )
+        )
+        if not groups:
+            continue
+        field = runtime_fields.get(field_name)
+        rows.append({
+            "field": field_name,
+            "logical_key": str(field.key if field is not None else ""),
+            "label": str(field.label if field is not None else ""),
+            "description": str(field.description if field is not None else ""),
+            "owner": proposal_spec.owner,
+            "groups": groups,
+            "action_type": proposal_spec.action_type,
+        })
+    return rows
 
 
 @dataclass(frozen=True)
@@ -338,14 +416,19 @@ def _review_bound_semantic_draft_clarification(
         ).encode("utf-8")
     )
     valid_reviews = [dict(item) for item in reviews if item]
-    clarifying_identities = [
+    clarifying_rows = [
         (
-            str(item.get("evidence_quote") or ""),
+            _semantic_evidence_lexical_core(
+                str(item.get("evidence_quote") or "")
+            ),
             str(item.get("resolution_disposition") or ""),
+            str(item.get("evidence_quote") or ""),
         )
         for item in valid_reviews
         if str(item.get("verdict") or "") == "clarifies_atom"
     ]
+    clarifying_rows = [row for row in clarifying_rows if row[0]]
+    clarifying_identities = [(row[0], row[1]) for row in clarifying_rows]
     identity_votes = {
         identity: clarifying_identities.count(identity)
         for identity in set(clarifying_identities)
@@ -354,12 +437,26 @@ def _review_bound_semantic_draft_clarification(
         identity_votes,
         key=lambda identity: (
             identity_votes[identity],
+            max(
+                len(row[2])
+                for row in clarifying_rows
+                if (row[0], row[1]) == identity
+            ),
             len(identity[0]),
             identity,
         ),
         default=("", ""),
     )
-    selected_quote, selected_disposition = selected_identity
+    _selected_core, selected_disposition = selected_identity
+    selected_quote = max(
+        (
+            row[2]
+            for row in clarifying_rows
+            if (row[0], row[1]) == selected_identity
+        ),
+        key=lambda quote: (len(quote), quote),
+        default="",
+    )
     clarifying_votes = identity_votes.get(selected_identity, 0)
     candidate = (
         {
@@ -460,7 +557,9 @@ def _bind_active_semantic_draft_disposition(
         index
         for index, unit in enumerate(partition)
         if str(unit.get("operation") or "") == "pending_answer"
-        and str(unit.get("source_text") or "") == evidence
+        and _is_exact_evidence_envelope(
+            str(unit.get("source_text") or ""), evidence
+        )
         and any(
             str(route.get("owner") or "") == "coordinator"
             for route in unit.get("owner_routes") or ()
@@ -474,6 +573,40 @@ def _bind_active_semantic_draft_disposition(
     output = [dict(unit) for unit in partition]
     output[matches[0]]["_semantic_draft_resolution_disposition"] = disposition
     return output, ()
+
+
+def _is_exact_evidence_envelope(source: str, evidence: str) -> bool:
+    """Accept lossless punctuation around one unique exact evidence quote."""
+
+    if not source or not evidence:
+        return False
+    start = source.find(evidence)
+    if start < 0 or source.find(evidence, start + 1) >= 0:
+        return False
+    boundary = source[:start] + source[start + len(evidence):]
+    return all(
+        character.isspace()
+        or unicodedata.category(character).startswith("P")
+        for character in boundary
+    )
+
+
+def _semantic_evidence_lexical_core(value: str) -> str:
+    """Remove only Unicode whitespace/punctuation at an evidence boundary."""
+
+    start = 0
+    end = len(value)
+
+    def is_boundary(character: str) -> bool:
+        return character.isspace() or unicodedata.category(character).startswith(
+            "P"
+        )
+
+    while start < end and is_boundary(value[start]):
+        start += 1
+    while end > start and is_boundary(value[end - 1]):
+        end -= 1
+    return value[start:end]
 
 
 def begin_semantic_partition(
@@ -628,6 +761,7 @@ def begin_semantic_partition(
                 state,
                 stage_a_prompt,
                 independent=True,
+                rejected_semantic_claims=_primary_scope_rejections,
             )
             document["request_sizes"].extend(independent_sizes)
             document["stage_a_calls"] += len(independent_sizes)
@@ -729,7 +863,8 @@ def begin_semantic_partition(
                         *independent_admission_errors,
                         *replacement_errors,
                     )))
-            if independent_admission_errors:
+            challenger_rejected = bool(independent_admission_errors)
+            if challenger_rejected and not primary_review_valid:
                 document["status"] = "failed"
                 document["errors"] = list(dict.fromkeys((
                     *admission_errors,
@@ -737,72 +872,82 @@ def begin_semantic_partition(
                 )))
                 document["unit_count"] = len(source_partition)
                 return document
-            (
-                independent_source_partition,
-                independent_compilation_partition,
-            ) = _partition_after_stage_a_admission(
-                independent_partition,
-                independent_redundant_unit_ids,
-            )
-            primary_eligible = (
-                primary_review_valid
-                and _proposal_selection_eligible(source_partition)
-            )
-            secondary_eligible = _proposal_selection_eligible(
-                independent_source_partition
-            )
-            if (
-                primary_eligible
-                and secondary_eligible
-                and _partition_semantic_hash(source_partition)
-                != _partition_semantic_hash(independent_source_partition)
-            ):
-                compilation_reviews = run_independent_llm_tasks((
-                    lambda: _proposal_compilation_eligible(
-                        state,
-                        compilation_partition,
+            if challenger_rejected:
+                document["stage_a_challenger_rejection"] = {
+                    "retained_proposal": "primary",
+                    "reason": (
+                        "The independently reviewed challenger was rejected; "
+                        "the structurally valid primary remains authoritative."
                     ),
-                    lambda: _proposal_compilation_eligible(
-                        state,
-                        independent_compilation_partition,
-                    ),
-                ))
-                primary_eligible, primary_compilation_sizes = (
-                    compilation_reviews[0]
+                    "errors": list(independent_admission_errors),
+                }
+            else:
+                (
+                    independent_source_partition,
+                    independent_compilation_partition,
+                ) = _partition_after_stage_a_admission(
+                    independent_partition,
+                    independent_redundant_unit_ids,
                 )
-                secondary_eligible, secondary_compilation_sizes = (
-                    compilation_reviews[1]
+                primary_eligible = (
+                    primary_review_valid
+                    and _proposal_selection_eligible(source_partition)
                 )
-                compilation_sizes = (
-                    *primary_compilation_sizes,
-                    *secondary_compilation_sizes,
+                secondary_eligible = _proposal_selection_eligible(
+                    independent_source_partition
                 )
-                document["request_sizes"].extend(compilation_sizes)
-                document["stage_b_calls"] += len(compilation_sizes)
-            (
-                selected_partition,
-                convergence_errors,
-                convergence_sizes,
-                convergence_receipt,
-            ) = _select_stage_a_proposal(
-                provider,
-                stage_a_payload,
-                source_partition,
-                independent_source_partition,
-                primary_eligible=primary_eligible,
-                secondary_eligible=secondary_eligible,
-            )
-            document["request_sizes"].extend(convergence_sizes)
-            document["admission_calls"] += len(convergence_sizes)
-            document["stage_a_convergence"] = convergence_receipt
-            if convergence_errors:
-                document["status"] = "failed"
-                document["errors"] = list(convergence_errors)
-                document["unit_count"] = len(source_partition)
-                return document
-            if convergence_receipt["selected_proposal"] == "secondary":
-                source_partition = independent_source_partition
-                compilation_partition = independent_compilation_partition
+                if (
+                    primary_eligible
+                    and secondary_eligible
+                    and _partition_semantic_hash(source_partition)
+                    != _partition_semantic_hash(independent_source_partition)
+                ):
+                    compilation_reviews = run_independent_llm_tasks((
+                        lambda: _proposal_compilation_eligible(
+                            state,
+                            compilation_partition,
+                        ),
+                        lambda: _proposal_compilation_eligible(
+                            state,
+                            independent_compilation_partition,
+                        ),
+                    ))
+                    primary_eligible, primary_compilation_sizes = (
+                        compilation_reviews[0]
+                    )
+                    secondary_eligible, secondary_compilation_sizes = (
+                        compilation_reviews[1]
+                    )
+                    compilation_sizes = (
+                        *primary_compilation_sizes,
+                        *secondary_compilation_sizes,
+                    )
+                    document["request_sizes"].extend(compilation_sizes)
+                    document["stage_b_calls"] += len(compilation_sizes)
+                (
+                    selected_partition,
+                    convergence_errors,
+                    convergence_sizes,
+                    convergence_receipt,
+                ) = _select_stage_a_proposal(
+                    provider,
+                    stage_a_payload,
+                    source_partition,
+                    independent_source_partition,
+                    primary_eligible=primary_eligible,
+                    secondary_eligible=secondary_eligible,
+                )
+                document["request_sizes"].extend(convergence_sizes)
+                document["admission_calls"] += len(convergence_sizes)
+                document["stage_a_convergence"] = convergence_receipt
+                if convergence_errors:
+                    document["status"] = "failed"
+                    document["errors"] = list(convergence_errors)
+                    document["unit_count"] = len(source_partition)
+                    return document
+                if convergence_receipt["selected_proposal"] == "secondary":
+                    source_partition = independent_source_partition
+                    compilation_partition = independent_compilation_partition
         elif admission_errors:
             document["status"] = "failed"
             document["errors"] = list(admission_errors)
@@ -991,7 +1136,15 @@ def _project_ready_semantic_draft_backgrounds(
         if isinstance(row, Mapping)
         and str(row.get("resolution_disposition") or "") == "background"
     ]
-    if not backgrounds:
+    settled_read_only_unit_ids = {
+        str(item)
+        for item in stage_a_payload.get(
+            "semantic_draft_settled_read_only_unit_ids"
+        )
+        or ()
+        if str(item)
+    }
+    if not backgrounds and not settled_read_only_unit_ids:
         return [dict(unit) for unit in partition], ()
     output = [dict(unit) for unit in partition]
     errors: list[str] = []
@@ -1014,6 +1167,26 @@ def _project_ready_semantic_draft_backgrounds(
         unit["operation"] = "context"
         unit["owner_routes"] = []
         unit["reason"] = "Harness-proven semantic draft background disposition."
+        unit["_admission_support"] = True
+    for unit_id in sorted(settled_read_only_unit_ids):
+        matches = [
+            index
+            for index, unit in enumerate(output)
+            if str(unit.get("unit_id") or "") == unit_id
+        ]
+        if len(matches) != 1:
+            errors.append(
+                "settled semantic draft read-only unit has no unique final "
+                f"source: {unit_id}"
+            )
+            continue
+        unit = output[matches[0]]
+        unit["operation"] = "context"
+        unit["owner_routes"] = []
+        unit["reason"] = (
+            "Harness-proven read-only consultation was delivered before "
+            "semantic draft clarification."
+        )
         unit["_admission_support"] = True
     return output, tuple(dict.fromkeys(errors))
 
@@ -1133,7 +1306,9 @@ def _semantic_draft_resolution_contract_errors(
         unit
         for unit in partition
         if str(unit.get("operation") or "") == "pending_answer"
-        and str(unit.get("source_text") or "") == evidence
+        and _is_exact_evidence_envelope(
+            str(unit.get("source_text") or ""), evidence
+        )
         and [
             {
                 "owner": str(route.get("owner") or ""),
@@ -1964,6 +2139,221 @@ def _semantic_rejection_draft_projection(
     return logical_partition, logical_units, retained_actions, validation
 
 
+def _split_semantic_draft_read_only_detour(
+    semantic_units: Sequence[Mapping[str, Any]],
+    candidate_actions: Sequence[Mapping[str, Any]],
+) -> tuple[
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    tuple[str, ...],
+]:
+    """Separate independently safe consultations from durable draft work.
+
+    Eligibility is registry-owned. A logical demand is settled only when every
+    action it owns is turn-local and read-only, and no selected action is shared
+    with a non-settled demand.
+    """
+
+    units = [dict(item) for item in semantic_units if isinstance(item, Mapping)]
+    actions = [dict(item) for item in candidate_actions if isinstance(item, Mapping)]
+    action_owners: dict[int, set[str]] = defaultdict(set)
+    eligible_units: set[str] = set()
+    for unit in units:
+        unit_id = str(unit.get("unit_id") or "")
+        indexes = [
+            index
+            for index in unit.get("action_indexes") or ()
+            if isinstance(index, int)
+            and not isinstance(index, bool)
+            and 0 <= index < len(actions)
+        ]
+        for index in indexes:
+            action_owners[index].add(unit_id)
+        if not indexes or str(unit.get("disposition") or "") != "action":
+            continue
+        specs = [ACTION_BY_TYPE.get(str(actions[index].get("type") or "")) for index in indexes]
+        if all(
+            spec is not None
+            and spec.effect == "read_only"
+            and spec.lifetime == "turn_local"
+            for spec in specs
+        ):
+            eligible_units.add(unit_id)
+    detour_indexes = {
+        index
+        for index, owners in action_owners.items()
+        if owners and owners.issubset(eligible_units)
+    }
+    settled_ids = tuple(
+        str(unit.get("unit_id") or "")
+        for unit in units
+        if str(unit.get("unit_id") or "") in eligible_units
+        and unit.get("action_indexes")
+        and all(index in detour_indexes for index in unit.get("action_indexes") or ())
+    )
+    settled_set = set(settled_ids)
+    detour_indexes = {
+        index
+        for index in detour_indexes
+        if action_owners[index].issubset(settled_set)
+    }
+    if not detour_indexes or not settled_ids:
+        return None, units, actions, ()
+
+    detour_order = sorted(detour_indexes)
+    detour_map = {old: new for new, old in enumerate(detour_order)}
+    draft_order = [index for index in range(len(actions)) if index not in detour_indexes]
+    draft_map = {old: new for new, old in enumerate(draft_order)}
+    detour_units: list[dict[str, Any]] = []
+    draft_units: list[dict[str, Any]] = []
+    for source in units:
+        unit_id = str(source.get("unit_id") or "")
+        source_indexes = [
+            index
+            for index in source.get("action_indexes") or ()
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+        detour = dict(source)
+        if unit_id in settled_set:
+            detour["disposition"] = "action"
+            detour["action_indexes"] = [
+                detour_map[index] for index in source_indexes if index in detour_map
+            ]
+        else:
+            detour["disposition"] = "context"
+            detour["action_indexes"] = []
+            detour["reason"] = (
+                "Harness-isolated sibling demand remains outside this "
+                "turn-local read-only transaction."
+            )
+        detour_units.append(detour)
+
+        durable = dict(source)
+        if unit_id in settled_set:
+            durable["disposition"] = "context"
+            durable["action_indexes"] = []
+            durable["reason"] = (
+                "Read-only consultation is settled by the draft detour "
+                "transaction."
+            )
+        elif str(durable.get("disposition") or "") == "action":
+            durable["action_indexes"] = [
+                draft_map[index] for index in source_indexes if index in draft_map
+            ]
+        draft_units.append(durable)
+
+    detour_candidate = {
+        "actions": [actions[index] for index in detour_order],
+        "semantic_units": detour_units,
+        "semantic_support_unit_ids": [
+            str(unit.get("unit_id") or "")
+            for unit in detour_units
+            if str(unit.get("disposition") or "") == "context"
+        ],
+        "reason": "registry-isolated turn-local read-only detour",
+    }
+    return (
+        detour_candidate,
+        draft_units,
+        [actions[index] for index in draft_order],
+        settled_ids,
+    )
+
+
+def _review_and_admit_semantic_draft_read_only_detour(
+    provider: Any,
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    semantic_units: Sequence[Mapping[str, Any]],
+    candidate_actions: Sequence[Mapping[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    tuple[str, ...],
+    dict[str, Any] | None,
+    int,
+    tuple[int, ...],
+]:
+    """Run the sole admission path for a draft's read-only detour.
+
+    Coverage uncertainty and explicit whole-plan rejection both call this
+    helper. Registry metadata selects the projection, while a fresh whole-plan
+    review and normal queue construction remain the only execution authority.
+    """
+
+    units = [dict(item) for item in semantic_units if isinstance(item, Mapping)]
+    actions = [dict(item) for item in candidate_actions if isinstance(item, Mapping)]
+    (
+        detour_candidate,
+        durable_units,
+        durable_actions,
+        settled_ids,
+    ) = _split_semantic_draft_read_only_detour(units, actions)
+    if detour_candidate is None:
+        return units, actions, (), None, 0, ()
+
+    support_ids = frozenset(
+        str(item)
+        for item in detour_candidate.get("semantic_support_unit_ids") or ()
+        if str(item)
+    )
+    detour_text, detour_validation = prepare_hierarchical_candidate(
+        json.dumps(
+            detour_candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        state,
+        clauses,
+        pending_choice_unit_ids=frozenset(),
+        semantic_support_unit_ids=support_ids,
+    )
+    if not detour_validation.valid:
+        return units, actions, (), None, 0, ()
+
+    action_types = frozenset(
+        str(item.get("type") or "")
+        for item in detour_candidate.get("actions") or ()
+        if isinstance(item, Mapping) and str(item.get("type") or "")
+    )
+    plan, admission, _errors = _review_bounded_semantic_candidate(
+        provider,
+        detour_text,
+        detour_validation,
+        state,
+        clauses,
+        allowed_action_types=action_types,
+        whole_plan_contract_repair=True,
+        reasoning_mode=STRICT_JSON_REASONING_MODE,
+        authoritative_direct_unit_ids=frozenset(settled_ids),
+        authoritative_context_unit_ids=support_ids,
+    )
+    admission_calls = (
+        int(getattr(admission, "request_count", 1))
+        if admission is not None
+        else 0
+    )
+    request_sizes = tuple(
+        int(value)
+        for value in getattr(admission, "request_sizes", ()) or ()
+    ) if admission is not None else ()
+    if plan is None or admission is None or not admission.valid:
+        return units, actions, (), None, admission_calls, request_sizes
+    try:
+        admitted = _admitted_action_queue(plan, admission, state)
+    except ValueError:
+        return units, actions, (), None, admission_calls, request_sizes
+    return (
+        durable_units,
+        durable_actions,
+        settled_ids,
+        admitted,
+        admission_calls,
+        request_sizes,
+    )
+
+
 def _build_semantic_draft_result(
     state: AgentGraphState,
     clauses: Sequence[TurnClause],
@@ -1973,6 +2363,8 @@ def _build_semantic_draft_result(
     candidate_actions: Sequence[Mapping[str, Any]],
     validation: PlanCoverageResult,
     reason: str,
+    settled_read_only_unit_ids: Sequence[str] = (),
+    admitted_detour: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist unresolved source atoms without admitting unsafe mutations."""
 
@@ -2012,6 +2404,7 @@ def _build_semantic_draft_result(
         ),
         validation=validation,
         source_secret_bindings=source_secret_bindings,
+        settled_read_only_unit_ids=settled_read_only_unit_ids,
     )
     for binding in source_secret_bindings:
         reference = str(binding["reference"])
@@ -2029,12 +2422,29 @@ def _build_semantic_draft_result(
                 atom_id=str(binding["atom_id"]),
                 expected_hash=str(binding["value_hash"]),
             )
-    return {
-        "actions": [],
-        "semantic_units": [dict(item) for item in semantic_units],
+    result = {
+        str(key): value for key, value in dict(admitted_detour or {}).items()
+    }
+    result.update({
+        "actions": [
+            dict(item)
+            for item in result.get("actions") or ()
+            if isinstance(item, Mapping)
+        ],
+        "semantic_units": [
+            dict(item)
+            for item in (
+                result.get("semantic_units")
+                if result.get("actions")
+                else semantic_units
+            )
+            or ()
+            if isinstance(item, Mapping)
+        ],
         "semantic_draft": draft,
         "reason": reason,
-    }
+    })
+    return result
 
 
 def _is_finalizing_ready_semantic_draft(
@@ -2152,6 +2562,7 @@ def review_semantic_plan(
             ),
         )
     )
+    provider = provider_from_config()
     if not validation.valid:
         if validation.unresolved_units and not validation.errors:
             if _is_finalizing_ready_semantic_draft(state):
@@ -2176,23 +2587,43 @@ def review_semantic_plan(
                     owner_count=owner_count,
                     unit_count=unit_count,
                 )
+            semantic_units = [
+                dict(item)
+                for item in candidate.get("semantic_units") or []
+                if isinstance(item, Mapping)
+            ]
+            candidate_actions = [
+                dict(item)
+                for item in candidate.get("actions") or []
+                if isinstance(item, Mapping)
+            ]
+            (
+                durable_units,
+                durable_actions,
+                settled_ids,
+                admitted_detour,
+                detour_admission_calls,
+                detour_request_sizes,
+            ) = _review_and_admit_semantic_draft_read_only_detour(
+                provider,
+                state,
+                clauses,
+                semantic_units,
+                candidate_actions,
+            )
+            admission_calls += detour_admission_calls
+            request_sizes.extend(detour_request_sizes)
             return _with_metrics(
                 _build_semantic_draft_result(
                     state,
                     clauses,
                     source_partition=source_partition,
-                    semantic_units=[
-                        dict(item)
-                        for item in candidate.get("semantic_units") or []
-                        if isinstance(item, Mapping)
-                    ],
-                    candidate_actions=[
-                        dict(item)
-                        for item in candidate.get("actions") or []
-                        if isinstance(item, Mapping)
-                    ],
+                    semantic_units=durable_units,
+                    candidate_actions=durable_actions,
                     validation=validation,
                     reason="semantic plan requires atom clarification",
+                    settled_read_only_unit_ids=settled_ids,
+                    admitted_detour=admitted_detour,
                 ),
                 started,
                 request_sizes=request_sizes,
@@ -2212,7 +2643,6 @@ def review_semantic_plan(
             owner_count=owner_count,
             unit_count=unit_count,
         )
-    provider = provider_from_config()
     plan, admission, admission_errors = _review_bounded_semantic_candidate(
         provider,
         candidate_text,
@@ -2238,7 +2668,7 @@ def review_semantic_plan(
         request_sizes.append(
             len(
                 whole_plan_admission_prompt(
-                    _semantic_fulfillment_prompt()
+                    _whole_plan_fulfillment_policy()
                 ).encode("utf-8")
             )
             + len(plan.request_json.encode("utf-8"))
@@ -2348,16 +2778,34 @@ def review_semantic_plan(
             draft_validation.unresolved_units
             and not _is_finalizing_ready_semantic_draft(state)
         ):
+            (
+                durable_draft_units,
+                durable_candidate_actions,
+                settled_read_only_unit_ids,
+                admitted_detour,
+                detour_admission_calls,
+                detour_request_sizes,
+            ) = _review_and_admit_semantic_draft_read_only_detour(
+                provider,
+                state,
+                clauses,
+                draft_units,
+                safe_candidate_actions,
+            )
+            admission_calls += detour_admission_calls
+            request_sizes.extend(detour_request_sizes)
             result = _build_semantic_draft_result(
                 state,
                 clauses,
                 source_partition=logical_partition,
-                semantic_units=draft_units,
-                candidate_actions=safe_candidate_actions,
+                semantic_units=durable_draft_units,
+                candidate_actions=durable_candidate_actions,
                 validation=draft_validation,
                 reason=(
                     "independent admission requires durable clarification"
                 ),
+                settled_read_only_unit_ids=settled_read_only_unit_ids,
+                admitted_detour=admitted_detour,
             )
         else:
             result = _unresolved_action_queue(
@@ -2496,7 +2944,9 @@ def _turn_clauses(
         raw
         and pending.get("manual_input_allowed") is True
         and str(validation.get("value_type") or "") == "evidence_contribution"
+        and any(clause.input_shape == "structured" for clause in segmented)
         and not has_contract_option_prefix
+        and not isinstance(pending.get("semantic_draft_binding"), Mapping)
     ):
         return (TurnClause("clause-1", raw, "structured"),)
     return segmented
@@ -2536,6 +2986,19 @@ def _stage_a_prompt() -> str:
         "do not invent the missing value. A question about requirements, format, meaning, or "
         "validity is consultation rather than a mutation merely because it names a group or "
         "field. "
+        "A declarative assignment of a registered runtime field to a concrete present value is "
+        "a domain_request for that field's registered intake owner and group, including when natural-language "
+        "prose surrounds the value. This is distinct from an example, hypothetical value, log, "
+        "or quoted documentation and must still be reviewed through the registered action contract. "
+        "registered_runtime_field_intakes is authoritative for these assignments. Its owner may "
+        "differ from the group's primary workflow owner because a registered cross-cutting intake "
+        "service owns proposal review. Route an assignment to that intake owner and exactly one "
+        "listed group whose field meaning matches the source; do not replace it with the primary "
+        "group owner, another action in the same group, or context. "
+        "When one explicit workflow-mode change is accompanied only by retain/clear scope that "
+        "restates the registered transition's compatibility and invalidation effects, route the "
+        "mode change as the present domain_request and keep those scope clauses with that owner; "
+        "do not invent separate field mutations or mark the transition scope unresolved. "
         "contract_proven_pending_prefixes contains Harness-proven exact option prefixes from "
         "the active signed question. Emit each declared prefix as its own coordinator-owned "
         "pending_answer unit and independently classify every remaining source character. "
@@ -2633,7 +3096,11 @@ def _stage_a_prompt() -> str:
         "purposes are the authoritative read-only capabilities of that action. Route a "
         "question when exactly one registered topic purpose represents it; do not require "
         "the user to name the topic identifier and do not convert the question into a "
-        "mutation or pending answer. "
+        "mutation or pending answer. When topic_subject_policies declares a policy for the "
+        "selected topic, its subject argument must satisfy that policy exactly; a metric or "
+        "client name cannot stand in for a chain subject. When topic_route_groups declares "
+        "groups for that topic, route the consultation to exactly one matching subject "
+        "group; a blank group or another workflow group is invalid. "
         "Use exact owner and group identifiers from the supplied registries. "
         "Do not infer a mutation from examples, hypothetical values, logs, or current state."
         " When semantic_draft_resolutions is present, each row is an exact "
@@ -2702,6 +3169,11 @@ def _stage_a_payload(
         if isinstance(item, Mapping)
         and str(item.get("resolution") or "").strip()
     ] if draft.get("status") == "ready_for_review" else []
+    settled_read_only_unit_ids = [
+        str(item)
+        for item in draft.get("settled_read_only_unit_ids") or ()
+        if str(item)
+    ] if draft.get("status") == "ready_for_review" else []
     option_prefix = _unique_option_prefix_candidate(state, clauses)
     projected_actions = action_schema()
 
@@ -2713,6 +3185,15 @@ def _stage_a_payload(
         topic_purposes = row.get("topic_purposes")
         if isinstance(topic_purposes, Mapping) and topic_purposes:
             purpose["consultation_topic_purposes"] = dict(topic_purposes)
+        subject_policies = row.get("topic_subject_policies")
+        if isinstance(subject_policies, Mapping) and subject_policies:
+            purpose["topic_subject_policies"] = dict(subject_policies)
+        topic_route_groups = row.get("topic_route_groups")
+        if isinstance(topic_route_groups, Mapping) and topic_route_groups:
+            purpose["topic_route_groups"] = {
+                str(topic): list(groups)
+                for topic, groups in topic_route_groups.items()
+            }
         return purpose
 
     return {
@@ -2752,13 +3233,17 @@ def _stage_a_payload(
         "workflow_goals": state.get("workflow_goals") or [],
         "structured_candidates": structured_candidates,
         "structured_intake_contracts": structured_intake_contracts,
+        "registered_runtime_field_intakes": _runtime_field_intake_routes(),
         **(
             {
                 "semantic_draft_resolutions": draft_resolutions,
+                "semantic_draft_settled_read_only_unit_ids": (
+                    settled_read_only_unit_ids
+                ),
                 "semantic_draft_id": str(draft.get("draft_id") or ""),
                 "semantic_draft_revision": int(draft.get("revision") or 0),
             }
-            if draft_resolutions
+            if draft_resolutions or settled_read_only_unit_ids
             else {}
         ),
         "universal_operations": sorted(_UNIVERSAL_OPERATIONS),
@@ -3049,6 +3534,13 @@ def _cross_domain_pending_errors(
         }
         for record in conflicts:
             target_group = str(record.get("target_group") or "")
+            if (
+                target_group
+                and target_group not in routed_groups
+                and any(group and group != target_group for group in routed_groups)
+                and _registered_value_matches_current_state(record, state)
+            ):
+                continue
             if target_group and target_group not in routed_groups:
                 errors.append(
                     "Stage A routed a registered cross-group semantic value "
@@ -3057,6 +3549,30 @@ def _cross_domain_pending_errors(
                     f"{record.get('action_type')}/{record.get('value')}"
                 )
     return tuple(dict.fromkeys(errors))
+
+
+def _registered_value_matches_current_state(
+    record: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> bool:
+    """Return whether a registered mention names already-selected state.
+
+    A current value may identify the subject of another explicit operation. It
+    must not be forced into a duplicate mutation merely because an unrelated
+    group currently owns the pending question.
+    """
+
+    spec = ACTION_BY_TYPE.get(str(record.get("action_type") or ""))
+    path = tuple(spec.semantic_current_value_path) if spec is not None else ()
+    if not path:
+        return False
+    current: Any = state
+    for segment in path:
+        if not isinstance(current, Mapping) or segment not in current:
+            return False
+        current = current[segment]
+    expected = record.get("canonical_value")
+    return str(current or "").strip().casefold() == str(expected or "").strip().casefold()
 
 
 def _pending_answer_contract_errors(
@@ -3336,12 +3852,23 @@ def _validate_partition_document(
                 errors.append(
                     f"Stage A domain request route has no group: {unit_id}/{owner}"
                 )
+            if operation == "consultation" and not group:
+                errors.append(
+                    f"Stage A consultation route has no subject group: "
+                    f"{unit_id}/{owner}"
+                )
             if group and group_spec is None:
                 errors.append(f"Stage A route group is invalid: {unit_id}/{group}")
+            route_has_compiler = _registered_route_has_compiler(
+                owner,
+                group,
+                operation,
+            )
             if (
                 group_spec is not None
                 and owner not in {"coordinator", "orientation", "analysis"}
                 and group_spec.owner != owner
+                and not route_has_compiler
             ):
                 errors.append(
                     f"Stage A route owner/group mismatch: {unit_id}/{owner}/{group}"
@@ -3353,16 +3880,7 @@ def _validate_partition_document(
                 )
             route_identities.add(identity)
             normalized_routes.append({"owner": owner, "group": group})
-            if operation not in {"context", "unresolved"} and not any(
-                not spec.internal_only
-                and spec.owner == owner
-                and _action_spec_applies(
-                    spec,
-                    groups=frozenset({group}) if group else frozenset(),
-                    operations=frozenset({operation}),
-                )
-                for spec in ACTION_SPECS
-            ):
+            if operation not in {"context", "unresolved"} and not route_has_compiler:
                 errors.append(
                     "Stage A route has no registered compiler action: "
                     f"{unit_id}/{operation}/{owner}/{group}"
@@ -3547,6 +4065,11 @@ def _project_uncompilable_routes_to_unresolved(
                 in {"coordinator", "orientation", "analysis"}
                 or GROUP_SPEC_BY_NAME[str(route.get("group") or "")].owner
                 == str(route.get("owner") or "")
+                or _registered_route_has_compiler(
+                    str(route.get("owner") or ""),
+                    str(route.get("group") or ""),
+                    operation,
+                )
             )
             for route in routes
         )
@@ -4020,7 +4543,10 @@ def _stage_a_admission_prompt() -> str:
         "When that purpose declares consultation_topic_purposes, treat the closed topic "
         "map as authoritative: a read-only question is safely represented only when one "
         "topic purpose matches its complete subject. The topic identifier need not appear "
-        "verbatim in user text. "
+        "verbatim in user text. Enforce any topic_subject_policies supplied with that "
+        "action; do not accept a metric or client name as a chain subject. Enforce "
+        "topic_route_groups as the authoritative subject-group set for the matching topic; "
+        "a blank group does not represent a workflow-specific consultation. "
         "Return one strict JSON object with exactly unit_verdicts, clause_verdicts, and reason. "
         "unit_verdicts contains exactly one row per supplied unit in order: "
         "{unit_id,verdict:'complete'|'redundant'|'unresolved',supports_unit_id,reason}. "
@@ -4083,10 +4609,14 @@ def _stage_a_admission_prompt() -> str:
         "for pending entailment; continue to review their clause for omitted "
         "sibling demands and do not use that proof for any other unit. "
         "contract_rejected_pending_entailment_unit_ids are exact pending-answer "
-        "units that failed the specialized jury. Such a unit may be redundant "
-        "only when its supports_unit_id names another complete unit in "
-        "contract_proven_pending_entailment_unit_ids; otherwise keep it "
-        "unresolved. This relation never authorizes last-value-wins. "
+        "units that failed the specialized jury. When no other pending-answer "
+        "unit reached quorum, such a unit may be redundant when it is only "
+        "contrast, reason, or transition-scope support for another complete "
+        "non-pending unit in this turn. It may also be redundant to a later "
+        "complete proven pending unit when the source explicitly supersedes the "
+        "earlier value. Otherwise keep it unresolved. For researched_identity "
+        "questions, only the proven-pending supersession case is allowed. This "
+        "relation never authorizes last-value-wins. "
         "When semantic_draft_resolutions is present, treat each row as the "
         "Harness-bound user clarification for that exact source DemandAtom. "
         "It may make that atom semantically complete, but it is not a new "
@@ -4150,8 +4680,20 @@ def _review_stage_a_candidate(
 
     review_payload = dict(stage_a_payload)
     pending = dict(stage_a_payload.get("pending_question") or {})
-    pre_admission_entailment = (
+    operations = {
+        str(unit.get("operation") or "")
+        for unit in partition
+        if isinstance(unit, Mapping)
+    }
+    pre_admission_entailment = bool(pending) and (
         str(pending.get("value_domain") or "") == "researched_identity"
+        or (
+            "pending_answer" in operations
+            and bool(
+                operations
+                - {"", "context", "pending_answer", "unresolved"}
+            )
+        )
     )
     pending_sizes: tuple[int, ...] = ()
     pending_errors: tuple[str, ...] = ()
@@ -4188,6 +4730,7 @@ def _review_stage_a_candidate(
         )
     )
     request_sizes = [*pending_sizes, *sizes]
+    required_rejections: frozenset[str] = frozenset()
     if pre_admission_entailment:
         required_rejections = rejected_pending_unit_ids - redundant
         pending_errors = tuple(
@@ -4216,12 +4759,30 @@ def _review_stage_a_candidate(
         )
         request_sizes.extend(scope_sizes)
         errors = tuple(dict.fromkeys((*errors, *scope_errors)))
+    rejected_pending_claims = tuple(
+        {
+            "unit_id": str(unit.get("unit_id") or ""),
+            "operation": "pending_answer",
+            "owner": str(
+                ((unit.get("owner_routes") or [{}])[0]).get("owner") or ""
+            ),
+            "group": str(
+                ((unit.get("owner_routes") or [{}])[0]).get("group") or ""
+            ),
+            "reason": (
+                "specialized pending-entailment jury rejected this exact "
+                "source unit as a present answer to the active question"
+            ),
+        }
+        for unit in partition
+        if str(unit.get("unit_id") or "") in required_rejections
+    )
     return (
         errors,
         tuple(request_sizes),
         redundant,
         contract_valid,
-        rejected_scope_claims,
+        (*rejected_scope_claims, *rejected_pending_claims),
     )
 
 
@@ -4836,6 +5397,9 @@ def _validate_stage_a_admission_document(
         or ()
         if str(unit_id)
     }
+    pending_value_domain = str(
+        (stage_a_payload.get("pending_question") or {}).get("value_domain") or ""
+    )
     partition_unit_ids = {
         str(unit.get("unit_id") or "")
         for unit in partition
@@ -4897,16 +5461,21 @@ def _validate_stage_a_admission_document(
     valid_routes = {
         (str(group["owner"]), str(group["name"]))
         for group in stage_a_payload["groups"]
-    }
+    } | set(_registered_cross_owner_routes())
     for row in unit_verdicts:
-        if set(row) != {
+        expected_fields = {
             "unit_id",
             "verdict",
             "supports_unit_id",
             "reason",
-        }:
+        }
+        if set(row) != expected_fields:
+            missing = sorted(expected_fields - set(row))
+            unexpected = sorted(set(row) - expected_fields)
             contract_errors.append(
-                "Stage A admission unit verdict contract is invalid"
+                "Stage A admission unit verdict contract is invalid "
+                f"(missing fields: {', '.join(missing) or '<none>'}; "
+                f"unexpected fields: {', '.join(unexpected) or '<none>'})"
             )
             continue
         if not str(row.get("reason") or "").strip():
@@ -4935,14 +5504,19 @@ def _validate_stage_a_admission_document(
                 f"Stage A admission found unresolved unit: {row.get('unit_id')}"
             )
     for row in clause_verdicts:
-        if set(row) != {
+        expected_fields = {
             "clause_id",
             "verdict",
             "omitted_owner_routes",
             "reason",
-        }:
+        }
+        if set(row) != expected_fields:
+            missing = sorted(expected_fields - set(row))
+            unexpected = sorted(set(row) - expected_fields)
             contract_errors.append(
-                "Stage A admission clause verdict contract is invalid"
+                "Stage A admission clause verdict contract is invalid "
+                f"(missing fields: {', '.join(missing) or '<none>'}; "
+                f"unexpected fields: {', '.join(unexpected) or '<none>'})"
             )
             continue
         verdict = str(row.get("verdict") or "")
@@ -5067,18 +5641,26 @@ def _validate_stage_a_admission_document(
             contract_errors.append(
                 f"Stage A admission redundant unit has invalid support: {unit_id}"
             )
-        if (
-            unit_id in rejected_pending_unit_ids
-            and (
+        if unit_id in rejected_pending_unit_ids:
+            supports_proven_pending = (
+                support_unit_id in proven_pending_unit_ids
+                and unit_operations.get(support_unit_id) == "pending_answer"
+            )
+            supports_non_pending = (
+                pending_value_domain != "researched_identity"
+                and not proven_pending_unit_ids
+                and unit_operations.get(support_unit_id)
+                not in {"", "context", "pending_answer", "unresolved"}
+            )
+            if (
                 unit_operations.get(unit_id) != "pending_answer"
-                or support_unit_id not in proven_pending_unit_ids
-                or unit_operations.get(support_unit_id) != "pending_answer"
-            )
-        ):
-            contract_errors.append(
-                "Stage A rejected pending unit is not redundant to a proven "
-                f"pending unit: {unit_id}"
-            )
+                or not (supports_proven_pending or supports_non_pending)
+            ):
+                contract_errors.append(
+                    "Stage A rejected pending unit is not redundant to a proven "
+                    "pending unit or an admissible transition-support unit: "
+                    f"{unit_id}"
+                )
     return (
         tuple(dict.fromkeys(contract_errors)),
         tuple(dict.fromkeys(semantic_errors)),
@@ -5637,6 +6219,29 @@ def _bind_owner_semantic_draft_dispositions(
             )
             continue
         action = normalized["actions"][index]
+        if str(action.get("type") or "") == "answer_pending":
+            pending = dict(payload.get("pending_question") or {})
+            manual_action = dict(pending.get("manual_action") or {})
+            value_argument = str(
+                manual_action.pop("value_argument", "") or ""
+            )
+            manual_type = str(manual_action.pop("type", "") or "")
+            answer = str(action.get("answer") or "")
+            source_evidence = str(action.get("source_evidence") or "")
+            if (
+                manual_type == "resolve_semantic_draft_atom"
+                and value_argument == "resolution"
+                and answer
+                and source_evidence
+                and not str(action.get("selected_value") or "")
+            ):
+                action = {
+                    "type": manual_type,
+                    **manual_action,
+                    value_argument: answer,
+                    "source_evidence": source_evidence,
+                }
+                normalized["actions"][index] = action
         if str(action.get("type") or "") != "resolve_semantic_draft_atom":
             errors.append(
                 f"semantic draft disposition targets wrong action: {unit_id}"
@@ -6128,6 +6733,19 @@ def _validate_owner_document(
                     f"Stage B {owner} action {spec.action_type} is outside "
                     f"unit route {unit_id}/{operation}/{sorted(groups)}"
                 )
+            if spec.action_type == "answer_opening_question" and groups:
+                topic = str(normalized_action.get("topic") or "")
+                allowed_topic_groups = CONSULTATION_TOPIC_ROUTE_GROUPS.get(
+                    topic
+                )
+                if (
+                    allowed_topic_groups is not None
+                    and groups.isdisjoint(allowed_topic_groups)
+                ):
+                    errors.append(
+                        f"Stage B {owner} consultation topic {topic} is outside "
+                        f"unit route groups {sorted(groups)}"
+                    )
             sources = tuple(
                 str(value)
                 for value in (expected_sources or {}).get(unit_id, ())

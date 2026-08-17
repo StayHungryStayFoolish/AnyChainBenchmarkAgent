@@ -16,13 +16,20 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from client_metric_profiles import (
+    CLIENT_METRIC_FIELDS,
+    collect_client_metrics,
+    parse_prometheus_samples,
+    select_sample,
+)
+
 
 EXECUTION_HEADER = [
     "execution_mgas_per_sec",
     "execution_gas_per_sec",
     "execution_metric_source",
     "execution_metric_status",
-]
+] + list(CLIENT_METRIC_FIELDS)
 
 NODE_CPU_HEADER = [
     "node_process_pid",
@@ -38,6 +45,8 @@ NODE_CPU_HEADER = [
     "node_top_cores_cpu_pct",
     "node_cpu_concentration_top1_pct",
     "node_cpu_concentration_top5_pct",
+    "node_process_rss_mib",
+    "node_process_memory_pct",
     "node_cpu_status",
 ]
 
@@ -71,21 +80,27 @@ def _fmt(value: Optional[float], digits: int = 2) -> str:
         return "0"
 
 
-def _metric_value(metrics_text: str, metric_name: str) -> Optional[float]:
-    pattern = re.compile(
-        rf"^{re.escape(metric_name)}\s*(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)\s*$"
-    )
-    for line in metrics_text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        match = pattern.match(line.strip())
-        if not match:
-            continue
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
+def _fmt_optional(value: object, digits: int = 2) -> str:
+    if value is None:
+        return ""
+    return _fmt(value, digits)
+
+
+def _profile_fields(result: Dict[str, object]) -> List[str]:
+    fields: List[str] = []
+    for field in CLIENT_METRIC_FIELDS:
+        value = result.get(field)
+        if field in {"client_metric_profile", "client_metric_quality"}:
+            fields.append(str(value or ""))
+        else:
+            fields.append(_fmt_optional(value))
+    return fields
+
+
+def _empty_profile_fields(chain: str, quality: str) -> List[str]:
+    result = collect_client_metrics(chain, "")
+    result["client_metric_quality"] = quality
+    return _profile_fields(result)
 
 
 def collect_execution_data() -> List[str]:
@@ -95,27 +110,46 @@ def collect_execution_data() -> List[str]:
         or os.getenv("EXECUTION_METRICS_URL")
         or ""
     ).strip()
+    chain = os.getenv("BLOCKCHAIN_NODE", "").strip().lower()
     if not url:
-        return ["0", "0", "unconfigured", "unavailable"]
+        return ["0", "0", "unconfigured", "unavailable"] + _empty_profile_fields(
+            chain, "unconfigured"
+        )
 
     timeout = float(os.getenv("NODE_PROMETHEUS_TIMEOUT_SECONDS", "2") or "2")
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             metrics_text = response.read().decode("utf-8", errors="replace")
     except Exception:
-        return ["0", "0", "prometheus_fetch_error", "error"]
+        return ["0", "0", "prometheus_fetch_error", "error"] + _empty_profile_fields(
+            chain, "fetch_error"
+        )
 
+    native = collect_client_metrics(chain, metrics_text)
+    if native["client_metric_profile"] != "none":
+        mgas = native.get("execution_mgas_per_sec")
+        gas = native.get("execution_gas_per_sec")
+        return [
+            _fmt(mgas if isinstance(mgas, (int, float)) else None),
+            _fmt(gas if isinstance(gas, (int, float)) else None),
+            str(native["execution_metric_source"]),
+            str(native["execution_metric_status"]),
+        ] + _profile_fields(native)
+
+    samples = parse_prometheus_samples(metrics_text)
     for name in DIRECT_MGAS_METRICS:
-        value = _metric_value(metrics_text, name)
+        labels = {"quantile": "0.5"} if name == "chain_mgasps" else {}
+        value = select_sample(samples, name, labels)
         if value is not None:
-            return [_fmt(value), _fmt(value * 1_000_000), name, "available"]
+            source = 'chain_mgasps{quantile="0.5"}' if labels else name
+            return [_fmt(value), _fmt(value * 1_000_000), source, "available"] + _profile_fields(native)
 
     for name in GAS_PER_SEC_METRICS:
-        value = _metric_value(metrics_text, name)
+        value = select_sample(samples, name)
         if value is not None:
-            return [_fmt(value / 1_000_000), _fmt(value), name, "available"]
+            return [_fmt(value / 1_000_000), _fmt(value), name, "available"] + _profile_fields(native)
 
-    return ["0", "0", "no_supported_metric", "unavailable"]
+    return ["0", "0", "no_supported_metric", "unavailable"] + _profile_fields(native)
 
 
 def _proc_root() -> Path:
@@ -228,6 +262,28 @@ def _read_threads(pid: int, proc: Path) -> Dict[str, Dict[str, object]]:
     return threads
 
 
+def _read_process_memory(pid: int, proc: Path) -> Tuple[Optional[float], Optional[float]]:
+    rss_kib: Optional[float] = None
+    total_kib: Optional[float] = None
+    try:
+        for line in (proc / str(pid) / "status").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("VmRSS:"):
+                rss_kib = float(line.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        for line in (proc / "meminfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("MemTotal:"):
+                total_kib = float(line.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    rss_mib = rss_kib / 1024.0 if rss_kib is not None else None
+    memory_pct = rss_kib * 100.0 / total_kib if rss_kib is not None and total_kib else None
+    return rss_mib, memory_pct
+
+
 def _load_state(path: Path) -> Dict[str, object]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -247,10 +303,11 @@ def collect_node_cpu_data() -> List[str]:
     proc = _proc_root()
     pid = _find_pid()
     if pid is None:
-        return ["0", "0", "0", "0", "unavailable", "0", "-1", "", "-1", "0", "", "0", "0", "unavailable"]
+        return ["0", "0", "0", "0", "unavailable", "0", "-1", "", "-1", "0", "", "0", "0", "", "", "unavailable"]
 
     total_jiffies, cores = _read_total_cpu_jiffies(proc)
     threads = _read_threads(pid, proc)
+    rss_mib, memory_pct = _read_process_memory(pid, proc)
     state_file = _state_path()
     previous = _load_state(state_file)
     now_state = {
@@ -264,7 +321,7 @@ def collect_node_cpu_data() -> List[str]:
 
     prev_total = int(previous.get("total_jiffies", 0) or 0)
     if not previous or int(previous.get("pid", 0) or 0) != pid or total_jiffies <= prev_total:
-        return [str(pid), "0", str(len(threads)), "0", "warmup", "0", "-1", "", "-1", "0", "", "0", "0", "warmup"]
+        return [str(pid), "0", str(len(threads)), "0", "warmup", "0", "-1", "", "-1", "0", "", "0", "0", _fmt_optional(rss_mib), _fmt_optional(memory_pct), "warmup"]
 
     ncpu = os.cpu_count() or 1
     total_delta = max(total_jiffies - prev_total, 1)
@@ -320,6 +377,8 @@ def collect_node_cpu_data() -> List[str]:
         _csv_safe(top_cores_desc, 200),
         _fmt(concentration_top1),
         _fmt(concentration_top5),
+        _fmt_optional(rss_mib),
+        _fmt_optional(memory_pct),
         "available",
     ]
 

@@ -71,7 +71,9 @@ Read these files before testing or changing code:
 - Use an isolated Python 3.10+ Agent environment. `.venv-adk` is a retained
   compatibility path, not a statement that Google ADK is required.
 - Run `bash scripts/install_agent_deps.sh --yes` before terminal testing, or
-  let the Agent request approval to install missing Agent dependencies.
+  let the launcher request approval and run it before the REPL starts. Once the
+  REPL is running, dependency prompts return an external shell command instead
+  of executing installers inside the conversation.
 - Do not commit API keys, ADC files, service account JSON, `.agent/`, live logs,
   generated benchmark archives, or terminal recordings containing secrets.
 - Redact credentials, local usernames, hostnames, internal project IDs, and
@@ -124,23 +126,22 @@ explain what it will install and verify it requests approval before invoking
 Run before any fix and again after any fix:
 
 ```bash
-python3 -m unittest \
-  tests.test_agent_product_terminal \
-  tests.test_agent_runtime_contract \
-  tests.test_agent_langgraph_harness \
-  tests.test_agent_harness_architecture \
-  tests.test_agent_response_authority
+PYTHONDONTWRITEBYTECODE=1 python3 tests/run_offline_python_suite.py
 python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
 
 Run these commands inside the Linux `bench` service. Checkpoint schema version
-23 is the current contract. Migration coverage must prove the version-16
+24 is the current contract. Migration coverage must prove the version-16
 pending-owner/Chain-RPC context boundary, version-17 semantic planning,
 version-18 response authority, version-19 drafts, version-20 Product Head
 binding, version-21 atom evidence and secret references, version-22 durable
 bindings, and version-23 signed sensitivity, memory-hard verifiers, registry
-transactions, and reference-only durable plans. Version-21 raw
+transactions, and reference-only durable plans. Version 24 must additionally
+prove the admission-bound semantic-draft no-op finalization receipt: only a
+ready draft whose atoms are all settled as background and whose source units
+are admitted as context may clear without an action. Ordinary empty model plans
+remain fail-closed. Version-21 raw
 credentials/references and version-22 legacy bindings/references must be
 quarantined.
 
@@ -168,8 +169,9 @@ Google Search coverage unless Gemini ADK `google_search` is actually available.
 evidence-admission controller. It generates revision-bound catalogs and admits
 evidence created by subordinate retained-regression, real-CLI, dynamic Chaos,
 and real-execution providers; it does not run those conversations or jobs
-itself. Phase 8 is implemented, but G3-G6 remain open until all required
-provider evidence and product-review evidence are admitted.
+itself. This long-lived guide does not declare the current G3-G6 result; run
+the controller for the target revision. Any gate without all required admitted
+provider and product-review evidence remains open.
 
 ## Dual-AI Chaos Verification
 
@@ -297,15 +299,15 @@ doctor
 
 Expected:
 
-- Agent reports provider, model, auth mode, and web-research status;
+- the startup banner reports provider, model, auth mode, and web-research status;
 - Agent reports cloud/deployment discovery such as GCE, GKE, EC2, EKS,
   generic Kubernetes, VM, container, or unknown;
 - Agent reports CPU, memory, network interface candidates, and disk candidates
   when the host exposes them;
 - when metadata services are unavailable, Agent says what is unknown instead
   of inventing cloud, region, zone, or machine type;
-- if benchmark dependencies are missing, Agent asks for installation approval
-  before using `scripts/install_deps.sh --yes`;
+- if benchmark dependencies are missing, Agent asks for consent before showing
+  `scripts/install_deps.sh --yes`, and does not execute it inside the session;
 - if Agent runtime dependencies are missing, the launcher asks before using
   `scripts/install_agent_deps.sh --yes`.
 

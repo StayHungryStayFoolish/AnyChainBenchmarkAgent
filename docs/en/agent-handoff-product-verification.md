@@ -48,7 +48,7 @@ complete terminal turn
 -> persist/invoke/receipt when the action has an external side effect
 -> repeat selection through graph transitions while admitted work remains
 -> canonical fallback and one response with at most one blocking question
--> validate and checkpoint schema version 23
+-> validate and checkpoint schema version 24
 ```
 
 The deterministic fast path does not include arbitrary manually entered typed
@@ -147,6 +147,27 @@ workflow business routers must not return. Architecture tests enforce these
 boundaries without making retired implementation files part of the active
 design contract.
 
+### Terminology And Generated-Path Acceptance
+
+Product review must exercise the published surfaces rather than checking only
+source comments:
+
+- startup may report optional Gemini search/Google ADK availability, but must
+  identify LangGraph Harness as the core runtime;
+- empty model output and provider failures must refer to the configured model
+  or AnyChain Agent, not claim that ADK owns the response;
+- structured doctor `warnings` and `next_actions` must not recommend an ADK
+  Agent or ADK terminal;
+- model-facing framework context and programmatic tool schema must preserve the
+  same ownership boundary;
+- unknown-chain gap/onboarding output must reference the existing
+  `config/chain_template.json.bak`.
+
+Add deterministic assertions for these outputs before changing implementation.
+An internal compatibility identifier may retain its name, but a stale
+user/model-visible string or nonexistent generated path fails this acceptance
+boundary.
+
 The runtime compiles one graph with its SQLite checkpointer. It must not create
 a second uncheckpointed turn graph or drain the complete durable queue inside
 one Python node. Current-version turns must not invoke checkpoint compatibility
@@ -168,7 +189,10 @@ drafts that outlive an authority change become stale before admission.
 Version 21 adds atom evidence, secret references, and atomic finalization;
 version 22 adds durable secret bindings. Version 23 signs input sensitivity,
 uses salted memory-hard secret verifiers, transacts registry mutations with
-Product Head, and keeps durable plans reference-only. Version 21 raw
+Product Head, and keeps durable plans reference-only. Version 24 adds the
+admission-bound semantic-draft no-op finalization receipt; it may clear only a
+ready all-background draft whose source units are admitted as context, and does
+not permit ordinary empty model plans. Version 21 raw
 credentials/references and version 22 legacy bindings/references are
 quarantined. Older state is quarantined and only allowlisted environment facts
 may be offered for reconfirmation.
@@ -317,8 +341,10 @@ controller: it generates revision-bound obligation catalogs and validates
 artifacts supplied by retained-regression, real-CLI, response-driven dual-AI
 Chaos, and real-execution providers. It does not itself conduct those
 conversations or jobs. Ledger, matrix, PTY, simulator, and execution scripts
-remain subordinate evidence providers; their direct exit codes never declare product
-readiness. G3-G6 are not closed, so the product status remains not ready.
+remain subordinate evidence providers; their direct exit codes never declare
+product readiness. This long-lived contract does not declare the current
+G3-G6 result; run the controller for the target revision. A revision is not
+ready while any required gate remains open.
 
 PTY workers persist candidate JSON only. Before workers start, the immutable
 batch manifest freezes an Ed25519 public trust root. The private key is created
@@ -409,15 +435,7 @@ transcripts, local coverage ledgers, caches, or known development keys.
 Run in Docker/Linux:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
-  tests.test_agent_product_terminal \
-  tests.test_agent_runtime_contract \
-  tests.test_agent_langgraph_harness \
-  tests.test_agent_harness_architecture \
-  tests.test_agent_response_authority \
-  tests.test_agent_legacy_issue_map \
-  tests.test_agent_failure_recovery \
-  tests.test_agent_benchmark_pipeline
+PYTHONDONTWRITEBYTECODE=1 python3 tests/run_offline_python_suite.py
 python3 tools/check_agent_boundaries.py --root .
 PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q agent tests
 git diff --check

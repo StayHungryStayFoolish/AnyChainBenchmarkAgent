@@ -1698,6 +1698,126 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertIsNotNone(head)
         self.assertGreater(head.revision, source_draft["source_checkpoint_revision"])
 
+    def test_semantic_draft_delivers_admitted_read_only_detour_atomically(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.semantic_drafts import build_semantic_plan_draft
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        original = "Compare the modes and change the mystery setting."
+
+        def resolver(state, text):
+            draft = build_semantic_plan_draft(
+                state,
+                original_input=original,
+                source_clauses=[{
+                    "clause_id": "clause-1",
+                    "text": original,
+                    "input_shape": "prose",
+                }],
+                source_partition=[
+                    {
+                        "unit_id": "consult",
+                        "clause_id": "clause-1",
+                        "source_text": "Compare the modes",
+                        "operation": "consultation",
+                        "owner_routes": [{
+                            "owner": "orientation",
+                            "group": "opening",
+                        }],
+                        "reason": "read-only explanation",
+                    },
+                    {
+                        "unit_id": "unknown",
+                        "clause_id": "clause-1",
+                        "source_text": "change the mystery setting",
+                        "operation": "unresolved",
+                        "owner_routes": [],
+                        "reason": "target is ambiguous",
+                    },
+                ],
+                semantic_units=[
+                    {
+                        "unit_id": "consult",
+                        "clause_id": "clause-1",
+                        "source_text": "Compare the modes",
+                        "disposition": "context",
+                        "action_indexes": [],
+                        "reason": "settled read-only consultation",
+                    },
+                    {
+                        "unit_id": "unknown",
+                        "clause_id": "clause-1",
+                        "source_text": "change the mystery setting",
+                        "disposition": "unresolved",
+                        "action_indexes": [],
+                        "reason": "target is ambiguous",
+                    },
+                ],
+                candidate_actions=[],
+                validation=PlanCoverageResult(
+                    valid=False,
+                    errors=(),
+                    unresolved_clauses=("change the mystery setting",),
+                    unresolved_units=({
+                        "unit_id": "unknown",
+                        "clause_id": "clause-1",
+                        "source_text": "change the mystery setting",
+                        "source_path": "",
+                        "reason": "target is ambiguous",
+                    },),
+                ),
+                settled_read_only_unit_ids=("consult",),
+            )
+            queue = _admitted_mock_plan(
+                state,
+                text,
+                {
+                    "actions": [{
+                        "type": "answer_opening_question",
+                        "topic": "mode_comparison",
+                        "source_evidence": "Compare the modes",
+                    }],
+                    "semantic_units": [{
+                        "unit_id": "consult",
+                        "clause_id": "clause-1",
+                        "source_text": "Compare the modes",
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    }],
+                },
+            )
+            queue["semantic_draft"] = draft
+            queue["reason"] = "read-only detour plus durable clarification"
+            return queue
+
+        with tempfile.TemporaryDirectory() as tmpdir, reviewed_stage_planner(
+            resolver
+        ):
+            runtime = AnyChainGraphRuntime(
+                thread_id="draft-read-only-detour",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            result = runtime.invoke(original, language="en")
+            runtime.close()
+
+        text = "\n".join(result.get("visible_response") or [])
+        self.assertIn("real-node benchmark", text)
+        self.assertIn("I could not safely determine", text)
+        self.assertIn("change the mystery setting", text)
+        self.assertEqual(
+            result["semantic_plan_draft"]["settled_read_only_unit_ids"],
+            ("consult",),
+        )
+        self.assertEqual(result.get("target_mode"), "")
+        self.assertEqual(result.get("confirmed_config"), {})
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("group"),
+            "opening",
+        )
+
     def test_split_planner_checkpoints_one_ordered_owner_batch(self) -> None:
         """The graph persists one batch plus strict per-owner receipts."""
 
@@ -2315,6 +2435,27 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertNotIn("LOCAL_RPC_URL", state["confirmed_config"])
         self.assertNotIn("MAINNET_RPC_URL", state["confirmed_config"])
         self.assertEqual(state["endpoint_evidence"], {})
+
+    def test_adapter_family_change_clears_superseded_case3_handoff(self) -> None:
+        from agent.harness.state import new_state
+        from agent.harness.transitions import invalidate_for_adapter_family_change
+
+        state = new_state("adapter-family-change-handoff", language="en")
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "chain": "WeirdP2PChain",
+            "adapter_family": "unsupported",
+            "evidence": ["protocol: weird-p2p"],
+        }
+        state["endpoint_evidence"] = {"candidate_endpoint": "https://old.invalid"}
+        state["custom_rpc"] = {"status": "needs_schema_evidence"}
+
+        invalidate_for_adapter_family_change(state)
+
+        self.assertEqual(state["secondary_handoff"], {})
+        self.assertEqual(state["endpoint_evidence"], {})
+        self.assertEqual(state["custom_rpc"], {})
 
     def test_target_mode_choice_asks_chain_before_provider_values(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
@@ -3834,6 +3975,71 @@ network:
         self.assertTrue(result["qps_profile"]["confirmed"])
         self.assertFalse(result["confirmed_config"]["has_accounts_device"])
         self.assertEqual(result["pending_question"]["id"], "DATA_VOL_SIZE")
+        visible = "\n".join(result.get("visible_response") or [])
+        self.assertIn("已应用 QPS profile 覆盖值：INITIAL_QPS=5", visible)
+        self.assertIn("DATA_VOL_SIZE", visible)
+        self.assertTrue(any(
+            item.get("message_id")
+            == "harness.performance.qps_overrides_applied"
+            for item in (result.get("turn_context") or {}).get(
+                "response_manifest"
+            ) or []
+        ))
+
+    def test_exact_config_answer_consumes_equal_deferred_proposal_as_noop(
+        self,
+    ) -> None:
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_actions
+
+        state = new_state("equal-deferred-config", language="en")
+        state.update({
+            "active_group": "ledger_disk",
+            "discovery": {
+                "disks": {
+                    "candidates": [
+                        {"name": "vda", "size": "926.3G", "type": "disk"},
+                        {"name": "vdb", "size": "624.9M", "type": "disk"},
+                    ],
+                },
+            },
+        })
+        state["pending_question"] = question_for_environment(
+            state,
+            "ledger_disk",
+        )
+
+        result = invoke_actions(
+            state,
+            [
+                {
+                    "type": "answer_pending",
+                    "selected_value": "vda",
+                    "source_evidence": "1",
+                    "confidence": "high",
+                },
+                {
+                    "type": "propose_config_values",
+                    "config_values": {"LEDGER_DEVICE": "vda"},
+                    "source_format": "prose",
+                    "source_evidence": "use vda",
+                    "confidence": "high",
+                },
+            ],
+            "1",
+        )
+
+        self.assertEqual(result["confirmed_config"]["LEDGER_DEVICE"], "vda")
+        self.assertEqual(result["pending_question"]["id"], "DATA_VOL_TYPE")
+        self.assertNotIn(
+            "pending_review",
+            result.get("inferred_config") or {},
+        )
+        self.assertNotIn(
+            "Review the configuration inferred",
+            "\n".join(result.get("visible_response") or []),
+        )
 
     def test_jump_to_completed_optional_group_reopens_its_owned_question(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -4054,6 +4260,51 @@ network:
 
         self.assertEqual(proposal["config_values"], {"CLOUD_REGION": "test-region"})
         self.assertEqual(proposal["unmapped_values"], {})
+
+    def test_environment_proposal_accepts_registered_sync_observe_endpoints(self) -> None:
+        from agent.harness.domains.environment import build_config_proposal
+
+        proposal = build_config_proposal({
+            "config_values": {
+                "sync_observe_rpc_url": "http://node:8545",
+                "node_prometheus_metrics_url": "http://node:6060/debug/metrics/prometheus",
+            },
+        })
+
+        self.assertEqual(
+            proposal["config_values"],
+            {
+                "SYNC_OBSERVE_RPC_URL": "http://node:8545",
+                "NODE_PROMETHEUS_METRICS_URL": "http://node:6060/debug/metrics/prometheus",
+            },
+        )
+
+    def test_sync_observe_metrics_url_is_confirmed_after_proposal_review(self) -> None:
+        from agent.harness.domains.environment import (
+            _apply_config_values,
+            build_config_proposal,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("sync-metrics-proposal", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        proposal = build_config_proposal({
+            "config_values": {
+                "NODE_PROMETHEUS_METRICS_URL": "http://node:6060/debug/metrics/prometheus",
+            },
+        })
+
+        result = _apply_config_values(state, proposal["config_values"])
+
+        self.assertEqual(
+            state["confirmed_config"]["NODE_PROMETHEUS_METRICS_URL"],
+            "http://node:6060/debug/metrics/prometheus",
+        )
+        self.assertEqual(
+            result["applied"]["NODE_PROMETHEUS_METRICS_URL"],
+            "http://node:6060/debug/metrics/prometheus",
+        )
 
     def test_environment_proposal_rejects_prose_url_as_structured_key(self) -> None:
         from agent.harness.domains.environment import (
@@ -9315,6 +9566,76 @@ network:
         self.assertEqual(result["chain_identity"]["status"], "existing_family_needs_endpoint")
         self.assertEqual(result["pending_question"]["id"], "new_chain_endpoint")
 
+    def test_unknown_chain_confirmation_routes_deferred_unsupported_family_to_case3(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unsupported-family-after-identity", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "WeirdP2PChain",
+            "canonical": "WeirdP2PChain",
+            "adapter_family": "unknown",
+            "status": "needs_identity_confirmation",
+            "case": "unknown",
+        }
+        state["pending_question"] = {
+            "id": "unknown_chain_identity_confirm",
+            "group": "chain_identity",
+            "kind": "numbered_choice",
+            "field": "unknown_chain_decision",
+            "options": [
+                {
+                    "label": "Real chain; continue to protocol confirmation",
+                    "value": "choose_protocol",
+                },
+                {"label": "Re-enter the chain name", "value": "reenter_chain"},
+            ],
+            "manual_input_allowed": False,
+        }
+        source = (
+            "This is a real chain using a custom binary protocol outside the "
+            "supported adapter families."
+        )
+        state["last_user_input"] = source
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "answer_pending",
+                    "answer": source,
+                    "selected_value": "choose_protocol",
+                    "source_evidence": source,
+                    "pending_option_semantic_verified": True,
+                    "semantic_purpose_verified": True,
+                    "confidence": "high",
+                },
+                {
+                    "type": "choose_adapter_family",
+                    "adapter_family": "unsupported",
+                    "confidence": "high",
+                },
+            ],
+        )
+
+        self.assertEqual(result["chain_identity"]["case"], "case3")
+        self.assertEqual(
+            result["chain_identity"]["status"],
+            "unsupported_family_handoff",
+        )
+        self.assertEqual(
+            result["pending_question"]["id"],
+            "case3_protocol_evidence",
+        )
+        self.assertEqual(
+            result["secondary_handoff"]["status"],
+            "collecting_evidence",
+        )
+        self.assertNotIn("DOMAIN_ACTION_BLOCKED", "\n".join(result["visible_response"]))
+
     def test_protocol_correction_invalidates_old_evidence_and_defers_method(
         self,
     ) -> None:
@@ -10804,6 +11125,77 @@ response:
             _render_question(state["pending_question"], "en"),
         )
 
+    def test_inline_labelled_exchange_reaches_schema_confirmation(self) -> None:
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
+        from agent.harness.state import new_state
+
+        state = new_state("inline-labelled-rpc-evidence", language="en")
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "adapter_family": "jsonrpc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["custom_rpc"] = {
+            "status": "needs_schema_evidence",
+            "endpoint": "https://example.invalid/rpc",
+            "endpoint_ready": True,
+            "method": "eth_chainId",
+        }
+        question = _typed_rpc_question(
+            {
+                "id": "custom_rpc_schema_evidence",
+                "group": "endpoint_process",
+                "field": "custom_rpc_schema_evidence",
+                "kind": "evidence",
+                "manual_input_allowed": True,
+            },
+            rpc_case="custom_rpc",
+        )
+        evidence = (
+            'Request: {"jsonrpc":"2.0","id":1,"method":"eth_chainId",'
+            '"params":[]}; response: '
+            '{"jsonrpc":"2.0","id":1,"result":"0x38"}'
+        )
+        extracted = {
+            "status": "draft",
+            "method": "eth_chainId",
+            "params": [],
+            "params_json": [],
+            "response_summary": "hex quantity chain id",
+            "confidence": "high",
+        }
+        _bind_admitted_action(
+            state,
+            "inline-labelled-exchange-action",
+            rpc_schema_evidence=evidence,
+        )
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+            return_value=extracted,
+        ):
+            outcome = apply_chain_rpc_answer(
+                state,
+                question,
+                evidence,
+                evidence,
+            )
+            result = _commit_result(state, outcome, owner="chain_rpc")
+
+        self.assertNotIn(
+            "chain_rpc.response.rpc_exchange_uncorrelated",
+            [fragment.message_id for fragment in outcome.response_fragments],
+        )
+        self.assertEqual(result["custom_rpc"]["status"], "schema_needs_confirmation")
+        self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_confirm")
+        self.assertEqual(_catalog_draft(result)["params_json"], [])
+        self.assertEqual(
+            _catalog_draft(result)["exchange_correlation"]["status"],
+            "correlated",
+        )
+
     def test_split_response_wire_shape_survives_stale_model_extraction(self) -> None:
         from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
         from agent.harness.state import new_state
@@ -11013,6 +11405,31 @@ response:
 
         self.assertEqual(correlation["status"], "response_id_mismatch")
         self.assertNotEqual(
+            correlation["request_id_hashes"],
+            correlation["response_id_hashes"],
+        )
+
+    def test_inline_labelled_rpc_exchange_preserves_both_documents(self) -> None:
+        from agent.harness.input_values import (
+            extract_rpc_exchange_correlation,
+            extract_rpc_wire_values,
+        )
+
+        evidence = (
+            'Request: {"jsonrpc":"2.0","id":1,"method":"eth_chainId",'
+            '"params":[]}; response: '
+            '{"jsonrpc":"2.0","id":1,"result":"0x38"}'
+        )
+
+        documents = extract_rpc_wire_values(evidence)
+        correlation = extract_rpc_exchange_correlation(evidence)
+
+        self.assertEqual(len(documents), 2)
+        self.assertEqual(correlation["status"], "correlated")
+        self.assertEqual(correlation["methods"], ["eth_chainId"])
+        self.assertEqual(correlation["request_count"], 1)
+        self.assertEqual(correlation["response_count"], 1)
+        self.assertEqual(
             correlation["request_id_hashes"],
             correlation["response_id_hashes"],
         )
@@ -15190,6 +15607,64 @@ response:
         self.assertEqual(result["secondary_handoff"]["evidence"], ["protocol: weird-p2p"])
         self.assertNotIn("已记录第", "\n".join(result.get("visible_response") or []))
 
+    def test_case3_chain_replacement_discards_old_handoff_and_resumes_fallback(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc_questions import _case3_evidence_question
+        from agent.harness.state import new_state
+
+        state = new_state("case3-chain-replacement", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "chain_identity"
+        state["chain_identity"] = {
+            "raw": "WeirdP2PChain",
+            "canonical": "WeirdP2PChain",
+            "adapter_family": "unsupported",
+            "status": "case3_collecting_evidence",
+            "case": "case3",
+        }
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "chain": "WeirdP2PChain",
+            "adapter_family": "unsupported",
+            "evidence": ["protocol: weird-p2p"],
+        }
+        state["confirmed_config"] = {"BLOCKCHAIN_NODE": "WeirdP2PChain"}
+        state["pending_question"] = _case3_evidence_question(state)
+        source = "Actually, leave this handoff and switch back to BSC fake-node."
+        state["last_user_input"] = source
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                    "confidence": "high",
+                },
+                {
+                    "type": "choose_chain",
+                    "chain_text": "BSC",
+                    "source_evidence": "switch back to BSC",
+                    "confidence": "high",
+                },
+            ],
+        )
+
+        self.assertEqual(result["chain_identity"]["canonical"], "bsc")
+        self.assertEqual(result["chain_identity"]["case"], "known")
+        self.assertEqual(result["confirmed_config"]["BLOCKCHAIN_NODE"], "bsc")
+        self.assertEqual(result["secondary_handoff"], {})
+        self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
+        self.assertNotIn(
+            result.get("pending_question", {}).get("id"),
+            {"case3_protocol_evidence", "case3_evidence_input", "case3_evidence_next"},
+        )
+
     def test_case3_handoff_generation_request_uses_collected_evidence(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
@@ -16164,9 +16639,14 @@ response:
             result = process_turn(state)
 
         text = "\n".join(result.get("visible_response") or [])
-        self.assertIn("测试类型", text)
+        self.assertIn("准备项按模式区分", text)
+        self.assertIn("通用主机信息", text)
         self.assertIn("CLOUD_REGION", text)
         self.assertIn("Ledger/data", text)
+        self.assertIn("LOCAL_RPC_URL", text)
+        self.assertIn("RPC workload", text)
+        self.assertIn("观察停止策略", text)
+        self.assertIn("不走 Vegeta", text)
         self.assertIn("preflight/smoke", text)
         self.assertNotIn("已知链：acala", text)
 

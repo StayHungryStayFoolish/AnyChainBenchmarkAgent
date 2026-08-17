@@ -8,6 +8,7 @@ from unittest.mock import patch
 from agent.harness.plan_coverage import PlanCoverageResult
 from agent.harness.semantic_drafts import (
     build_semantic_draft_finalization_receipt,
+    build_semantic_draft_noop_finalization_receipt,
     build_semantic_plan_draft,
     cancel_semantic_plan_draft,
     mark_semantic_plan_draft_stale,
@@ -16,6 +17,7 @@ from agent.harness.semantic_drafts import (
     missing_semantic_draft_secret_bindings,
     semantic_draft_staleness_reasons,
     semantic_hash,
+    validate_semantic_draft_noop_finalization_receipt,
     validate_semantic_plan_draft,
     workflow_precondition_projection,
 )
@@ -127,6 +129,198 @@ class SemanticPlanDraftTests(unittest.TestCase):
         state["pending_question"] = _semantic_draft_question(draft)
         return state
 
+    def _background_only_ready_draft(
+        self,
+        *,
+        disposition: str = "background",
+    ) -> dict:
+        state = new_state("background-draft", language="en")
+        state["turn_index"] = 3
+        _bind_product_head(state)
+        draft = build_semantic_plan_draft(
+            state,
+            original_input="Keep no future goal.",
+            source_clauses=[{
+                "clause_id": "clause-1",
+                "text": "Keep no future goal.",
+                "input_shape": "prose",
+            }],
+            source_partition=[{
+                "unit_id": "unit-goal",
+                "clause_id": "clause-1",
+                "source_text": "Keep no future goal.",
+                "operation": "unresolved",
+                "owner_routes": [],
+                "reason": "future goal was not selected",
+            }],
+            semantic_units=[{
+                "unit_id": "unit-goal",
+                "clause_id": "clause-1",
+                "source_text": "Keep no future goal.",
+                "disposition": "unresolved",
+                "action_indexes": [],
+                "reason": "future goal was not selected",
+            }],
+            candidate_actions=[],
+            validation=PlanCoverageResult(
+                valid=False,
+                errors=(),
+                unresolved_clauses=("Keep no future goal.",),
+                unresolved_units=({
+                    "unit_id": "unit-goal",
+                    "clause_id": "clause-1",
+                    "source_text": "Keep no future goal.",
+                    "source_path": "",
+                    "reason": "future goal was not selected",
+                },),
+            ),
+        )
+        return resolve_semantic_draft_atom(
+            draft,
+            draft_id=draft["draft_id"],
+            revision=draft["revision"],
+            atom_id=draft["active_atom_id"],
+            resolution="do not save a goal",
+            resolution_disposition=disposition,
+        )
+
+    def test_read_only_detour_partition_is_registry_driven(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _split_semantic_draft_read_only_detour,
+        )
+
+        detour, draft_units, draft_actions, settled = (
+            _split_semantic_draft_read_only_detour(
+                [
+                    {
+                        "unit_id": "consult",
+                        "clause_id": "clause-1",
+                        "source_text": "compare modes",
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    },
+                    {
+                        "unit_id": "mutation",
+                        "clause_id": "clause-1",
+                        "source_text": "use real-node later",
+                        "disposition": "action",
+                        "action_indexes": [1],
+                    },
+                    {
+                        "unit_id": "unknown",
+                        "clause_id": "clause-1",
+                        "source_text": "change the other thing",
+                        "disposition": "unresolved",
+                        "action_indexes": [],
+                        "reason": "ambiguous target",
+                    },
+                ],
+                [
+                    {
+                        "type": "answer_opening_question",
+                        "topic": "mode_comparison",
+                    },
+                    {
+                        "type": "choose_target_mode",
+                        "target_mode": "real-node",
+                        "target_mode_explicit": True,
+                        "source_evidence": "use real-node later",
+                    },
+                ],
+            )
+        )
+
+        self.assertIsNotNone(detour)
+        assert detour is not None
+        self.assertEqual(
+            [item["type"] for item in detour["actions"]],
+            ["answer_opening_question"],
+        )
+        self.assertEqual(settled, ("consult",))
+        self.assertEqual(
+            [item["type"] for item in draft_actions],
+            ["choose_target_mode"],
+        )
+        by_id = {item["unit_id"]: item for item in draft_units}
+        self.assertEqual(by_id["consult"]["disposition"], "context")
+        self.assertEqual(by_id["mutation"]["action_indexes"], [0])
+        self.assertEqual(by_id["unknown"]["disposition"], "unresolved")
+
+    def test_semantic_draft_settled_read_only_identity_is_strict(self) -> None:
+        state = new_state("settled-draft", language="en")
+        _bind_product_head(state)
+        common = {
+            "state": state,
+            "original_input": "compare modes and change something",
+            "source_clauses": [{
+                "clause_id": "clause-1",
+                "text": "compare modes and change something",
+                "input_shape": "prose",
+            }],
+            "source_partition": [
+                {
+                    "unit_id": "consult",
+                    "clause_id": "clause-1",
+                    "source_text": "compare modes",
+                    "operation": "consultation",
+                    "owner_routes": [{"owner": "orientation", "group": "opening"}],
+                    "reason": "read-only explanation",
+                },
+                {
+                    "unit_id": "unknown",
+                    "clause_id": "clause-1",
+                    "source_text": "change something",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "ambiguous target",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "consult",
+                    "clause_id": "clause-1",
+                    "source_text": "compare modes",
+                    "disposition": "context",
+                    "action_indexes": [],
+                    "reason": "settled read-only consultation",
+                },
+                {
+                    "unit_id": "unknown",
+                    "clause_id": "clause-1",
+                    "source_text": "change something",
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                    "reason": "ambiguous target",
+                },
+            ],
+            "candidate_actions": [],
+            "validation": PlanCoverageResult(
+                valid=False,
+                errors=(),
+                unresolved_clauses=("change something",),
+                unresolved_units=({
+                    "unit_id": "unknown",
+                    "clause_id": "clause-1",
+                    "start": 18,
+                    "end": 34,
+                    "source_text": "change something",
+                    "source_path": "",
+                    "reason": "ambiguous target",
+                },),
+            ),
+        }
+        draft = build_semantic_plan_draft(
+            **common,
+            settled_read_only_unit_ids=("consult",),
+        )
+        self.assertEqual(draft["contract_version"], 4)
+        self.assertEqual(draft["settled_read_only_unit_ids"], ("consult",))
+        with self.assertRaisesRegex(ValueError, "settled read-only"):
+            build_semantic_plan_draft(
+                **common,
+                settled_read_only_unit_ids=("missing",),
+            )
+
     def test_bound_clarification_jury_authorizes_complete_turn_once(self) -> None:
         from agent.harness.hierarchical_planner import (
             _bound_semantic_draft_resolution_partition,
@@ -211,6 +405,80 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(receipt["clarifying_vote_count"], 2)
         self.assertEqual(receipt["resolution_disposition"], "background")
 
+    def test_bound_clarification_jury_groups_boundary_punctuation_only(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        text = "Cancel this unresolved item; keep the settled explanation."
+        verdicts = iter((
+            ("Cancel this unresolved item;", "background"),
+            ("Cancel this unresolved item", "semantic_value"),
+            ("Cancel this unresolved item", "background"),
+        ))
+
+        def review(_provider, *, request_payload, **_kwargs):
+            quote, disposition = next(verdicts)
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": quote,
+                "resolution_disposition": disposition,
+                "reason": "the quoted span classifies the unresolved atom",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(), state, text, segment_user_turn(text)
+                )
+            )
+
+        self.assertEqual(candidate["evidence_quote"], "Cancel this unresolved item;")
+        self.assertEqual(candidate["resolution_disposition"], "background")
+        self.assertEqual(receipt["clarifying_vote_count"], 2)
+
+    def test_bound_clarification_jury_does_not_merge_lexical_siblings(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_bound_semantic_draft_clarification,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = self._awaiting_draft_state()
+        text = "Cancel this item; cancel this item and change QPS."
+        quotes = iter((
+            "Cancel this item;",
+            "cancel this item and change QPS.",
+            "Cancel this item and change QPS.",
+        ))
+
+        def review(_provider, *, request_payload, **_kwargs):
+            return json.dumps({
+                "contract_hash": request_payload["contract_hash"],
+                "verdict": "clarifies_atom",
+                "evidence_quote": next(quotes),
+                "resolution_disposition": "background",
+                "reason": "the quoted span appears related to the unresolved atom",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=review,
+        ):
+            candidate, _sizes, receipt = (
+                _review_bound_semantic_draft_clarification(
+                    object(), state, text, segment_user_turn(text)
+                )
+            )
+
+        self.assertEqual(candidate, {})
+        self.assertEqual(receipt["clarifying_vote_count"], 1)
+
     def test_background_resolution_is_lifecycle_bound_and_tamper_evident(self) -> None:
         draft = self._draft()
         resolved = resolve_semantic_draft_atom(
@@ -267,6 +535,34 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(projected[0]["owner_routes"], [])
         self.assertIs(projected[0]["_admission_support"], True)
 
+    def test_settled_read_only_unit_projects_to_context_on_finalization(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _project_ready_semantic_draft_backgrounds,
+        )
+
+        source = {
+            "unit_id": "unit-consultation",
+            "clause_id": "clause-1",
+            "source_path": "",
+            "source_text": "Compare real-node and sync-observe.",
+            "operation": "consultation",
+            "owner_routes": [{"owner": "orientation", "group": "opening"}],
+            "reason": "read-only question",
+        }
+        projected, errors = _project_ready_semantic_draft_backgrounds(
+            [source],
+            {
+                "semantic_draft_settled_read_only_unit_ids": [
+                    "unit-consultation"
+                ]
+            },
+        )
+
+        self.assertFalse(errors)
+        self.assertEqual(projected[0]["operation"], "context")
+        self.assertEqual(projected[0]["owner_routes"], [])
+        self.assertIs(projected[0]["_admission_support"], True)
+
     def test_model_authored_background_disposition_is_rejected(self) -> None:
         from agent.harness.hierarchical_planner import (
             _bind_owner_semantic_draft_dispositions,
@@ -308,6 +604,43 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(
             bound["actions"][0]["resolution_disposition"],
             "background",
+        )
+
+        generic_document = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "no action",
+                "source_evidence": "no action",
+            }],
+            "bindings": deepcopy(document["bindings"]),
+        }
+        generic_payload = {
+            **payload,
+            "pending_question": {
+                "manual_action": {
+                    "type": "resolve_semantic_draft_atom",
+                    "draft_id": "draft-1",
+                    "revision": 1,
+                    "atom_id": "atom-1",
+                    "value_argument": "resolution",
+                }
+            },
+        }
+        bound, errors = _bind_owner_semantic_draft_dispositions(
+            generic_document, generic_payload
+        )
+        self.assertFalse(errors)
+        self.assertEqual(
+            bound["actions"],
+            [{
+                "type": "resolve_semantic_draft_atom",
+                "draft_id": "draft-1",
+                "revision": 1,
+                "atom_id": "atom-1",
+                "resolution": "no action",
+                "source_evidence": "no action",
+                "resolution_disposition": "background",
+            }],
         )
 
     def test_old_semantic_draft_contract_version_fails_closed(self) -> None:
@@ -1074,10 +1407,25 @@ class SemanticPlanDraftTests(unittest.TestCase):
 
     def test_semantic_question_hash_rejects_prompt_and_option_drift(self) -> None:
         from agent.harness.coordinator import _semantic_draft_question
-        from agent.harness.questions import validate_pending_question_contract
+        from agent.harness.questions import (
+            semantic_pending_question,
+            validate_pending_question_contract,
+        )
 
         question = _semantic_draft_question(self._draft())
         validate_pending_question_contract(question)
+        cancel_option = next(
+            option
+            for option in semantic_pending_question(question)["options"]
+            if option["value"] == "cancel"
+        )
+        self.assertEqual(
+            cancel_option["semantic_labels"],
+            [
+                "Discard all unresolved, unapplied items in this draft",
+                "丢弃这个草稿中所有尚未解决且未应用的内容",
+            ],
+        )
         changed_prompt = deepcopy(question)
         changed_prompt["prompt_ref"]["arguments"]["source"] = "different atom"
         with self.assertRaisesRegex(ValueError, "integrity hash"):
@@ -2275,6 +2623,242 @@ class SemanticPlanDraftTests(unittest.TestCase):
         )
         self.assertEqual(updated["action_queue"], [])
 
+    def test_admission_proven_background_plan_finalizes_as_noop(self) -> None:
+        from agent.harness.coordinator import admit_turn_step
+
+        ready = self._background_only_ready_draft()
+        unit_verdicts = [{
+            "unit_id": "unit-goal",
+            "verdict": "context",
+            "owner_action_ids": [],
+            "evidence_quote": "Keep no future goal.",
+            "omitted_action_type": "",
+            "reason": "the user explicitly retained no product action",
+        }]
+        receipt = build_semantic_draft_noop_finalization_receipt(
+            ready,
+            plan_hash="a" * 64,
+            unit_verdicts=unit_verdicts,
+            review_hashes=("b" * 64,),
+            review_ids=("primary/attempt_1",),
+            request_count=1,
+        )
+        state = new_state(ready["session_id"], language="en")
+        state["turn_index"] = ready["creation_turn"]
+        state["semantic_plan_draft"] = ready
+        state["turn_context"] = {
+            "text": ready["original_input"],
+            "semantic_units": [{
+                "unit_id": "unit-goal",
+                "disposition": "context",
+                "action_indexes": [],
+            }],
+            "semantic_draft_noop_finalization_receipt": receipt,
+        }
+        state["turn_receipt"] = {
+            "turn_id": "background-draft:7",
+            "input_hash": ready["original_input_hash"],
+            "submitted_input_hash": ready["original_input_hash"],
+            "admitted_action_ids": [],
+            "semantic_order": [],
+            "execution_order": [],
+            "action_unit_bindings": {},
+            "unit_action_bindings": {},
+            "semantic_units": deepcopy(state["turn_context"]["semantic_units"]),
+            "unresolved_units": [],
+            "status": "planned",
+        }
+
+        updated = admit_turn_step(state)
+
+        self.assertEqual(updated["semantic_plan_draft"], {})
+        self.assertEqual(updated["proposed_actions"], [])
+        self.assertEqual(updated["action_queue"], [])
+        self.assertEqual(updated["action_errors"], [])
+        self.assertEqual(updated["turn_receipt"]["status"], "completed")
+        self.assertEqual(updated["control"]["phase"], "fallback")
+        self.assertTrue(any(
+            item.get("event") == "semantic_draft_noop_finalized"
+            and item.get("receipt_hash") == receipt["receipt_hash"]
+            for item in updated["audit_events"]
+        ))
+        validate_state(updated)
+
+    def test_admitted_zero_action_plan_mints_noop_receipt(self) -> None:
+        from agent.harness.semantic_admission import _admitted_action_queue
+        from agent.harness.semantic_compiler import (
+            ImmutableSemanticPlan,
+            WholePlanAdmission,
+        )
+
+        ready = self._background_only_ready_draft()
+        unit = {
+            "unit_id": "unit-goal",
+            "clause_id": "clause-1",
+            "source_text": "Keep no future goal.",
+            "disposition": "context",
+            "action_indexes": [],
+        }
+        document = {
+            "actions": [],
+            "semantic_units": [unit],
+            "pending_choice_contracts": [],
+        }
+        plan = ImmutableSemanticPlan(
+            plan_hash="a" * 64,
+            document_json=json.dumps(document),
+            request_json=json.dumps(document),
+            action_ids=(),
+            unit_ids=("unit-goal",),
+        )
+        admission = WholePlanAdmission(
+            valid=True,
+            errors=(),
+            unit_verdicts=({
+                "unit_id": "unit-goal",
+                "verdict": "context",
+                "owner_action_ids": [],
+                "evidence_quote": "Keep no future goal.",
+                "omitted_action_type": "",
+                "reason": "context only",
+            },),
+            request_count=1,
+            review_hashes=("b" * 64,),
+            review_ids=("primary/attempt_1",),
+        )
+        state = new_state(ready["session_id"], language="en")
+        state["semantic_plan_draft"] = ready
+
+        queue = _admitted_action_queue(plan, admission, state)
+
+        self.assertEqual(queue["actions"], [])
+        self.assertNotIn("unknown", json.dumps(queue))
+        self.assertEqual(
+            queue["semantic_draft_noop_finalization_receipt"]["draft_id"],
+            ready["draft_id"],
+        )
+
+    def test_noop_finalization_contract_rejects_unsafe_empty_plans(self) -> None:
+        unit_verdicts = [{
+            "unit_id": "unit-goal",
+            "verdict": "context",
+            "owner_action_ids": [],
+            "evidence_quote": "Keep no future goal.",
+            "omitted_action_type": "",
+            "reason": "context only",
+        }]
+        common = {
+            "plan_hash": "a" * 64,
+            "unit_verdicts": unit_verdicts,
+            "review_hashes": ("b" * 64,),
+            "review_ids": ("primary/attempt_1",),
+            "request_count": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "all-background"):
+            build_semantic_draft_noop_finalization_receipt(
+                self._background_only_ready_draft(
+                    disposition="semantic_value"
+                ),
+                **common,
+            )
+        candidate_draft = self._draft()
+        candidate_ready = resolve_semantic_draft_atom(
+            candidate_draft,
+            draft_id=candidate_draft["draft_id"],
+            revision=candidate_draft["revision"],
+            atom_id=candidate_draft["active_atom_id"],
+            resolution="retain as background",
+            resolution_disposition="background",
+        )
+        candidate_verdicts = [
+            {
+                **unit_verdicts[0],
+                "unit_id": str(item.get("unit_id") or ""),
+            }
+            for item in candidate_ready["source_partition"]
+        ]
+        with self.assertRaisesRegex(ValueError, "cannot omit candidates"):
+            build_semantic_draft_noop_finalization_receipt(
+                candidate_ready,
+                **{**common, "unit_verdicts": candidate_verdicts},
+            )
+
+    def test_noop_finalization_receipt_is_tamper_evident(self) -> None:
+        ready = self._background_only_ready_draft()
+        receipt = build_semantic_draft_noop_finalization_receipt(
+            ready,
+            plan_hash="a" * 64,
+            unit_verdicts=[{
+                "unit_id": "unit-goal",
+                "verdict": "context",
+                "owner_action_ids": [],
+                "evidence_quote": "Keep no future goal.",
+                "omitted_action_type": "",
+                "reason": "context only",
+            }],
+            review_hashes=("b" * 64,),
+            review_ids=("primary/attempt_1",),
+            request_count=1,
+        )
+        validated = validate_semantic_draft_noop_finalization_receipt(
+            receipt,
+            draft=ready,
+            session_id=ready["session_id"],
+        )
+        self.assertEqual(validated, receipt)
+        tampered = deepcopy(receipt)
+        tampered["admission_request_count"] = 2
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            validate_semantic_draft_noop_finalization_receipt(
+                tampered,
+                draft=ready,
+                session_id=ready["session_id"],
+            )
+
+    def test_noop_finalization_event_cannot_coexist_with_live_or_applied_draft(
+        self,
+    ) -> None:
+        from agent.harness.invariants import StateInvariantError
+
+        ready = self._background_only_ready_draft()
+        receipt = build_semantic_draft_noop_finalization_receipt(
+            ready,
+            plan_hash="a" * 64,
+            unit_verdicts=[{
+                "unit_id": "unit-goal",
+                "verdict": "context",
+                "owner_action_ids": [],
+                "evidence_quote": "Keep no future goal.",
+                "omitted_action_type": "",
+                "reason": "context only",
+            }],
+            review_hashes=("b" * 64,),
+            review_ids=("primary/attempt_1",),
+            request_count=1,
+        )
+        state = new_state(ready["session_id"], language="en")
+        state["audit_events"] = [{
+            "event": "semantic_draft_noop_finalized",
+            **receipt,
+        }]
+        validate_state(state)
+
+        live = deepcopy(state)
+        live["semantic_plan_draft"] = ready
+        with self.assertRaisesRegex(StateInvariantError, "retained the live draft"):
+            validate_state(live)
+
+        applied = deepcopy(state)
+        applied["audit_events"].append({
+            "event": "semantic_draft_finalization_action_applied",
+            "draft_id": ready["draft_id"],
+            "admission_transaction_hash": "c" * 64,
+            "receipt_hash": "d" * 64,
+            "action_id": "forbidden",
+        })
+        with self.assertRaisesRegex(StateInvariantError, "action application"):
+            validate_state(applied)
+
     def test_finalization_clears_draft_before_execution(self) -> None:
         from agent.harness.coordinator import admit_turn_step
 
@@ -2533,9 +3117,11 @@ class SemanticPlanDraftTests(unittest.TestCase):
         result = _prepare_pending_answer_result(
             state,
             {
-                "answer": "Cancel the complete pending plan.",
+                "answer": "Cancel that unresolved item; do not save a later goal.",
                 "selected_value": "cancel",
-                "source_evidence": "Cancel the complete pending plan.",
+                "source_evidence": (
+                    "Cancel that unresolved item; do not save a later goal."
+                ),
             },
             SimpleNamespace(action_id="cancel-answer", confidence="high"),
         )

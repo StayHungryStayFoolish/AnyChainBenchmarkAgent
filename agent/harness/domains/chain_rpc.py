@@ -62,6 +62,7 @@ CHAIN_RPC_ACTIONS = frozenset(
         "request_chain_selection",
         "request_target_mode_selection",
         "cancel_target_change",
+        "apply_reviewed_chain_rpc_config",
     }
 )
 SUPPORTED_ADAPTER_FAMILIES = frozenset(SUPPORTED_FAMILIES)
@@ -382,6 +383,14 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
                 source=__name__,
             )
         )
+    if action.action_type == "apply_reviewed_chain_rpc_config":
+        from .environment import apply_reviewed_owned_config_values
+
+        return apply_reviewed_owned_config_values(
+            state,
+            action,
+            owner="chain_rpc",
+        )
     responses: ResponseCollector = []
     next_state = deepcopy(state)
     arguments = dict(action.arguments)
@@ -549,8 +558,6 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     if action_type == "choose_adapter_family":
         family = normalize_scalar(arguments.get("adapter_family")).casefold()
         identity = next_state.setdefault("chain_identity", {})
-        if family not in SUPPORTED_ADAPTER_FAMILIES:
-            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "unsupported_adapter_family"}, source=__name__))
         if (
             normalize_scalar(identity.get("adapter_family")).casefold() == family
             and is_existing_family_lifecycle(identity)

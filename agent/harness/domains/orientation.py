@@ -670,6 +670,89 @@ def consultation_fragment(
             ),
             source=__name__,
         )
+    if topic == "sync_observe_metrics":
+        current_chain = str(
+            (state.get("chain_identity") or {}).get("canonical")
+            or (state.get("chain_identity") or {}).get("raw")
+            or ""
+        )
+        configured = set(repo_chain_names())
+        requested_chain = subject or current_chain
+        chain = canonicalize_chain_scalar(
+            requested_chain,
+            known_chains=configured,
+        )
+        profiles = [
+            dict(item)
+            for item in facts.get("client_metric_profiles") or []
+            if isinstance(item, dict)
+        ]
+        matches = [
+            profile
+            for profile in profiles
+            if chain
+            and chain in {
+                str(item).strip().lower()
+                for item in profile.get("chains") or []
+            }
+        ]
+        if len(matches) == 1:
+            profile = matches[0]
+            response_language = (
+                "zh" if str(state.get("language") or "en") == "zh" else "en"
+            )
+            missing_endpoint = profile.get("missing_endpoint")
+            if not isinstance(missing_endpoint, dict):
+                missing_endpoint = {}
+            requirement_separator = "，" if response_language == "zh" else ", "
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.sync_observe_metrics_profile",
+                arguments={
+                    "chain": chain,
+                    "profile": str(profile.get("display_name") or profile.get("profile_id") or "<unknown>"),
+                    "native_samples": ", ".join(
+                        str(item) for item in profile.get("native_samples") or []
+                    ) or "<none>",
+                    "report_kpis": ", ".join(
+                        str(item) for item in profile.get("report_kpis") or []
+                    ) or "<none>",
+                    "metrics_path": str(profile.get("metrics_path") or "<not specified>"),
+                    "requirements": requirement_separator.join(
+                        str(item.get(response_language) or "")
+                        for item in profile.get("requirements") or []
+                        if isinstance(item, dict)
+                        and str(item.get(response_language) or "")
+                    ) or "<none>",
+                    "missing_endpoint_behavior": str(
+                        missing_endpoint.get(response_language) or "<not specified>"
+                    ),
+                },
+                source=__name__,
+            )
+        registered_chains = sorted(
+            {
+                str(item).strip()
+                for profile in profiles
+                for item in profile.get("chains") or []
+                if str(item).strip()
+            }
+        )
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.sync_observe_metrics_generic",
+            arguments={
+                "chain": chain or requested_chain or "<not selected>",
+                "registered_chains": ", ".join(registered_chains) or "<none>",
+            },
+            source=__name__,
+        )
+    if topic == "sync_observe_behavior":
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.sync_observe_behavior",
+            source=__name__,
+        )
     if topic in {"correction", "clarification"} and not _active_failure_record(state):
         return ResponseFragment(
             kind="message",

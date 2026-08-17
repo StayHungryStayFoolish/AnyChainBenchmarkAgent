@@ -1,9 +1,9 @@
 # 区块链节点 QPS 性能基准测试框架
 
-[English](README.md) | [中文](README_ZH.md)
+[English](../../README.md) | [中文](../../README_ZH.md)
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](COMMERCIAL.md)
+[![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](../../COMMERCIAL.md)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
@@ -60,7 +60,7 @@ flowchart LR
 - **可选观测出口**：Prometheus/Grafana 通过只读 exporter 读取运行产物，
   默认关闭。
 
-完整执行链路见：[框架流程与数据生命周期](docs/zh/framework-flow.md)。
+完整执行链路见：[框架流程与数据生命周期](framework-flow.md)。
 
 ## 🚀 快速开始
 
@@ -194,6 +194,12 @@ BLOCKCHAIN_PROCESS_NAMES=bsc \
 RX/TX。如果客户端没有暴露 MGas/s，报告会记录指标来源和状态，便于区分真实 0、
 指标不可用和框架数据丢失。
 
+对于 BSC v1.7.x，需要用 `--metrics` 启动 BSC client，并将
+`NODE_PROMETHEUS_METRICS_URL` 指向其 `/debug/metrics/prometheus` endpoint。BSC
+profile 会增加客户端原生的区块导入、导入 MGas/s、justified/finalized 落后、交易、
+Gas、TPS、CPU、内存和样本质量结果。该 profile 只在规范链名 `bsc` 下选择，不能把它
+解释成所有 EVM client 的通用承诺。
+
 ### 4. 查看报告
 
 当前运行文件位于 runtime `current/` 目录，最终结果会在运行结束后归档。关键输出：
@@ -225,8 +231,10 @@ Exporter 是只读的，会读取 runtime JSON 和
 `current/logs/performance_latest.csv`，所以普通 RPC benchmark 和
 `sync-observe` 使用同一个 `/metrics` 入口。`sync-observe` 下会暴露区块高度、
 节点 metrics 提供的 MGas/s 或 gas/s、execution metric source/status、节点进程
-CPU、热点线程/核心 CPU、CPU iowait，以及现有磁盘、网络、系统指标。如果客户端
-没有暴露 execution gas 指标，MGas/s 不会被伪造，`execution_metric_available`
+CPU、热点线程/核心 CPU、CPU iowait、节点进程 RSS/内存占比，以及现有磁盘、网络、
+系统指标。BSC profile 还会暴露最新的原始区块导入、MGas/s、交易、gas-used、
+imported/justified/finalized 高度和 observation count，并携带 profile/quality label。
+如果客户端没有暴露 execution gas 指标，MGas/s 不会被伪造，`execution_metric_available`
 会通过 source/status label 说明不可用状态。
 
 也可以手动启动或停止：
@@ -243,7 +251,7 @@ deploy/observability/stop.sh
 - Grafana: `http://localhost:3001`
 
 Docker Compose、路径覆盖和 dashboard 行为见
-[Prometheus / Grafana Observability](./deploy/observability/README.md)。
+[Prometheus / Grafana Observability](../../deploy/observability/README.md)。
 
 如果用户已经有 Prometheus/Grafana，使用 `OBSERVABILITY_STACK_MODE=exporter`。
 该模式只启动只读 exporter，已有 Prometheus 抓取
@@ -257,7 +265,7 @@ Docker Compose、路径覆盖和 dashboard 行为见
 
 **在运行框架之前**，您必须配置以下参数：
 完整配置层级和高级选项说明请查看
-[`config/README.md`](config/README.md)。
+[`config/README.md`](../../config/README.md)。
 
 ### 必需配置（在 `config/user_config.sh` 中）
 
@@ -350,10 +358,10 @@ lsblk
 - `config/config_loader.sh` - 配置加载器、运行时探测、派生路径和 chain template 解析
 - `config/chains/*.json` - 每条链的 RPC method 模板、协议 family、参数格式和 REST path 映射
 
-本地 fake-node 闭环测试手册：[本地闭环测试与 fake-node 使用指南](docs/zh/local-closed-loop-testing.md)。
+本地 fake-node 闭环测试手册：[本地闭环测试与 fake-node 使用指南](local-closed-loop-testing.md)。
 
 GKE、EKS 和自建 Kubernetes 集群的监控部署入口位于
-[deploy/k8s](deploy/k8s/README.md)。仓库内已通过静态测试和 mock API 测试验证
+[deploy/k8s](../../deploy/k8s/README.md)。仓库内已通过静态测试和 mock API 测试验证
 manifest 与 K8s 监控 helper，但真实集群部署仍取决于使用者自己的 RBAC、
 admission policy、hostPath、hostPID 和 privileged workload 权限配置。
 
@@ -376,7 +384,7 @@ admission policy、hostPath、hostPID 和 privileged workload 权限配置。
 
 ### 如何在现有 family 内新增一条链
 
-完整实操手册见：[如何新增区块链或 RPC Method](docs/zh/how-to-add-chain.md)。
+完整实操手册见：[如何新增区块链或 RPC Method](how-to-add-chain.md)。
 
 如果新链的 RPC 形态属于现有 family，通常只需要新增配置并录制真实 fixture：
 
@@ -552,7 +560,7 @@ REST 类 method 的名字可以是逻辑 key，真实 HTTP 请求由 `_meta.rest
   benchmark、proxy、monitor、per-method attribution 和报告生成。
 - **GKE / EKS / 自建 Kubernetes**：入口脚本**不会**自动创建集群资源。
   如果目标区块链节点运行在 Kubernetes 中，需要先部署并验证
-  [`deploy/k8s`](deploy/k8s/README.md) 下的 collector DaemonSet，包括镜像、
+  [`deploy/k8s`](../../deploy/k8s/README.md) 下的 collector DaemonSet，包括镜像、
   RBAC、`hostPath`、`hostPID`、security context 和 runtime path 配置。
   当 collector 已经可以持续输出 cgroup CSV 数据后，再从选定的 runner
   按正常方式配置 `config/user_config.sh` 并运行 benchmark 入口。
@@ -687,7 +695,7 @@ runner 执行 `./blockchain_node_benchmark.sh --quick` 或更长时间的测试�
 框架默认集群管理员已经审阅并批准所需的 Kubernetes 权限。
 
 完整的逐步命令、每一步会发生什么、如何判断可以进入下一步，请查看
-[Kubernetes Operator Runbook](deploy/k8s/README.md#kubernetes-operator-runbook)。
+[Kubernetes Operator Runbook](../../deploy/k8s/README.md#kubernetes-operator-runbook)。
 
 ### 自定义测试
 
@@ -708,50 +716,50 @@ runner 执行 `./blockchain_node_benchmark.sh --quick` 或更长时间的测试�
 
 ### 核心文档
 
-#### [框架流程与数据生命周期](./docs/zh/framework-flow.md)
+#### [框架流程与数据生命周期](framework-flow.md)
 - 从入口命令到 QPS 执行、监控、分析、报告生成和归档的完整链路。
 - 解耦文件生命周期：`current/`、`archives/` 和 `MEMORY_SHARE_DIR`。
 - 可插拔监控、sync-health、per-method 归因和 observer-cost 计算。
 - 可选 Prometheus/Grafana 数据流及其只读边界。
 
-#### [模块说明](./docs/zh/module-guide.md)
+#### [模块说明](module-guide.md)
 - 按模块说明职责、输入、输出和扩展边界。
 - 覆盖配置、chain adapter、benchmark core、proxy、monitoring、analysis、report、archive、fake-node 和 observability。
 
-#### [配置层说明](./config/README.md)
+#### [配置层说明](../../config/README.md)
 - `config/user_config.sh` 中的用户配置。
 - runtime path registry 和生成文件位置。
 - chain template 格式与环境变量覆盖。
 
-#### [Kubernetes Operator Runbook](./deploy/k8s/README.md)
+#### [Kubernetes Operator Runbook](../../deploy/k8s/README.md)
 - GKE、EKS 和自建 Kubernetes 的监控部署路径。
 - preflight 检查、DaemonSet 部署和 post-deploy 验证。
 
-#### [Prometheus / Grafana Observability](./deploy/observability/README.md)
+#### [Prometheus / Grafana Observability](../../deploy/observability/README.md)
 - 可选只读 exporter 和本地 Prometheus/Grafana 栈。
 - runtime artifact 路径和 dashboard 启停命令。
 
-#### [GitHub PR Gate 与分支保护](./docs/zh/github-pr-gates.md)
+#### [GitHub PR Gate 与分支保护](github-pr-gates.md)
 - PR CI、CODEOWNERS、Pull Request 模板和分支保护设置。
 - GitHub 可以自动验证的内容，以及维护者需要手动 smoke 的内容。
 
-#### [Contributing](./CONTRIBUTING.md)
+#### [Contributing](../../CONTRIBUTING.md)
 - 按变更类型划分的本地验证命令。
 - 开发、review 和公开仓库 hygiene 规则。
 
 #### Chain 扩展与本地闭环测试
-- [如何新增区块链或 RPC Method](./docs/zh/how-to-add-chain.md)
-- [使用 fake-node 进行本地闭环测试](./docs/zh/local-closed-loop-testing.md)
+- [如何新增区块链或 RPC Method](how-to-add-chain.md)
+- [使用 fake-node 进行本地闭环测试](local-closed-loop-testing.md)
 
 按语言划分的文档索引：
 
-- [英文文档索引](./docs/en/README.md)
-- [中文文档索引](./docs/zh/README.md)
+- [英文文档索引](../en/README.md)
+- [中文文档索引](README.md)
 
 ## ⚙️ 配置参考
 
 必需运行参数已经在上文“必需配置”中列出。完整配置层级、默认值和
-环境变量覆盖方式请查看[配置层说明](./config/README.md)。
+环境变量覆盖方式请查看[配置层说明](../../config/README.md)。
 
 ### 高级配置
 
@@ -1210,8 +1218,8 @@ bash --version
 - 可复现 bug、功能请求、chain/RPC 支持请求请使用 GitHub Issues。
 - 安装、配置、路线讨论和运行经验请使用 GitHub Discussions。
 - 漏洞、泄露密钥、私有 RPC endpoint 或敏感 benchmark artifact 请按
-  [SECURITY.md](SECURITY.md) 处理。
-- 支持渠道说明见 [SUPPORT.md](SUPPORT.md)。
+  [SECURITY.md](../../SECURITY.md) 处理。
+- 支持渠道说明见 [SUPPORT.md](../../SUPPORT.md)。
 
 
 ## 📄 许可证
@@ -1221,13 +1229,13 @@ bash --version
 ### 开源许可证（AGPL 3.0 或更高版本）
 - 商业和非商业用途都可以在 AGPL 条款下使用
 - 如果修改、分发，或通过网络向用户提供该软件，需要遵守 AGPL 的源码公开要求
-- 详见 [LICENSE](LICENSE) 文件
+- 详见 [LICENSE](../../LICENSE) 文件
 
 ### 商业授权选项
 - 面向需要不同于 AGPL 条款的专有使用场景
 - 允许闭源集成
 - 在单独签署的商业授权协议下无 AGPL 义务
 - 提供企业支持
-- 详见 [COMMERCIAL.md](COMMERCIAL.md) 文件
+- 详见 [COMMERCIAL.md](../../COMMERCIAL.md) 文件
 
 **联系方式：** 在 GitHub 提交 Issue 并添加 `commercial-license` 标签咨询商业许可

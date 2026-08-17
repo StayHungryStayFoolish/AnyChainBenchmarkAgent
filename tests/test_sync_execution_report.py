@@ -37,10 +37,23 @@ def main() -> int:
                 "sync_status": ["syncing", "syncing", "healthy"],
                 "execution_mgas_per_sec": [10.0, 20.0, 15.0],
                 "execution_gas_per_sec": [10000000.0, 20000000.0, 15000000.0],
-                "execution_metric_source": ["chain_insert_mgasps"] * 3,
+                "execution_metric_source": ['chain_mgasps{quantile="0.5"}'] * 3,
                 "execution_metric_status": ["available"] * 3,
+                "client_metric_profile": ["bsc_v1_7"] * 3,
+                "client_block_insert_ms_p50": [300.0, 350.0, 400.0],
+                "client_import_mgas_per_sec_p50": [10.0, 20.0, 15.0],
+                "client_import_observation_count": [1, 2, 3],
+                "client_block_tx_count": [10, 20, 30],
+                "client_block_gas_used": [1_000_000, 2_000_000, 3_000_000],
+                "client_head_block": [100, 110, 125],
+                "client_justified_block": [99, 109, 123],
+                "client_finalized_block": [98, 108, 122],
+                "client_inserted_blocks_count": [1, 2, 3],
+                "client_metric_quality": ["complete"] * 3,
                 "node_process_pid": [1234, 1234, 1234],
                 "node_process_cpu_pct": [100.0, 220.0, 180.0],
+                "node_process_rss_mib": [1024.0, 1536.0, 2048.0],
+                "node_process_memory_pct": [12.5, 18.75, 25.0],
                 "node_thread_count": [12, 12, 12],
                 "node_hottest_thread_tid": [1235, 1235, 1235],
                 "node_hottest_thread_name": ["geth", "geth", "geth"],
@@ -53,6 +66,8 @@ def main() -> int:
                 "node_cpu_concentration_top1_pct": [80.0, 43.0, 42.0],
                 "node_cpu_concentration_top5_pct": [95.0, 90.0, 88.0],
                 "node_cpu_status": ["available"] * 3,
+                "mem_used": [2048, 2304, 2560],
+                "mem_usage": [25.0, 28.0, 30.0],
                 "data_nvme0n1_avg_await": [1.2, 2.5, 1.7],
                 "data_nvme0n1_util": [20.0, 45.0, 35.0],
                 "data_nvme0n1_total_iops": [1000, 1200, 1100],
@@ -76,8 +91,11 @@ def main() -> int:
         html = Path(output).read_text(encoding="utf-8")
         assert "Node Sync Execution Analysis" in html
         assert "MGas/s min / avg / peak" in html
-        assert "chain_insert_mgasps" in html
+        assert "chain_mgasps{quantile=&quot;0.5&quot;}" in html
+        assert "BNB Smart Chain Native Import Metrics" in html
+        assert "Estimated transactions" in html
         assert (reports_dir / "sync_execution_timeline.png").exists()
+        assert (reports_dir / "bsc_sync_kpis.png").exists()
 
         df["execution_mgas_per_sec"] = [0.0, 0.0, 0.0]
         df["execution_gas_per_sec"] = [0.0, 0.0, 0.0]
@@ -93,6 +111,7 @@ def main() -> int:
         output = ReportGenerator(str(csv_path), language="zh").generate_html_report()
         html = Path(output).read_text(encoding="utf-8")
         assert "节点同步执行分析" in html
+        assert "BNB Smart Chain 客户端原生导入指标" in html
         assert "Node Sync Execution Analysis" not in html
 
         os.environ["SYNC_OBSERVE_MODE"] = "false"

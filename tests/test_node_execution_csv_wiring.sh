@@ -14,8 +14,8 @@ source monitoring/lib/node_execution_collector_wrapper.sh
 execution_header="$(get_execution_header)"
 node_cpu_header="$(get_node_cpu_header)"
 
-[[ "$(echo "$execution_header" | awk -F, '{print NF}')" -eq 4 ]] || fail "execution header must have 4 fields"
-[[ "$(echo "$node_cpu_header" | awk -F, '{print NF}')" -eq 14 ]] || fail "node CPU header must have 14 fields"
+[[ "$(echo "$execution_header" | awk -F, '{print NF}')" -eq 15 ]] || fail "execution header must have 15 fields"
+[[ "$(echo "$node_cpu_header" | awk -F, '{print NF}')" -eq 16 ]] || fail "node CPU header must have 16 fields"
 
 grep -q 'node_execution_collector_wrapper.sh' monitoring/unified_monitor.sh \
     || fail "unified_monitor does not source node_execution_collector_wrapper.sh"
@@ -41,12 +41,12 @@ line="$(build_performance_data_line false \
     "1" \
     "2" \
     "true" \
-    "3,3000000,chain_insert_mgasps,available" \
-    "123,4,5,124,geth,6,7,124:geth:6:7,7,8,7:8,9,10,available" \
+    "3,3000000,chain_insert_mgasps,available,none,,,,,,,,,,unsupported" \
+    "123,4,5,124,geth,6,7,124:geth:6:7,7,8,7:8,9,10,2048,25,available" \
     "21,22" \
     "other")"
 
-expected_cols=$((1 + 6 + 3 + 2 + 3 + 2 + 12 + 3 + 4 + 14 + 2 + 1))
+expected_cols=$((1 + 6 + 3 + 2 + 3 + 2 + 12 + 3 + 15 + 16 + 2 + 1))
 actual_cols="$(echo "$line" | awk -F, '{print NF}')"
 [[ "$actual_cols" -eq "$expected_cols" ]] || fail "data line field count mismatch: expected $expected_cols got $actual_cols"
 

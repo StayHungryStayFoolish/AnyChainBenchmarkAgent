@@ -27,7 +27,7 @@ from .contracts import (
 from .plan_coverage import PlanCoverageResult
 
 
-SEMANTIC_DRAFT_CONTRACT_VERSION = 3
+SEMANTIC_DRAFT_CONTRACT_VERSION = 4
 _RESOLUTION_DISPOSITIONS = frozenset({"semantic_value", "background"})
 _TERMINAL_STATUSES = frozenset({"stale", "cancelled"})
 _OPEN_STATUSES = frozenset({"awaiting_clarification", "ready_for_review"})
@@ -214,6 +214,7 @@ def build_semantic_plan_draft(
     candidate_actions: Sequence[Mapping[str, Any]],
     validation: PlanCoverageResult,
     source_secret_bindings: Sequence[Mapping[str, str]] = (),
+    settled_read_only_unit_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a durable draft without creating admission or queue receipts."""
 
@@ -251,6 +252,21 @@ def build_semantic_plan_draft(
         dict(redact(dict(item))) for item in source_partition
         if isinstance(item, Mapping)
     )
+    source_unit_ids = {
+        str(item.get("unit_id") or "")
+        for item in safe_partition
+        if str(item.get("unit_id") or "")
+    }
+    settled_unit_ids = tuple(
+        str(item) for item in settled_read_only_unit_ids if str(item)
+    )
+    if (
+        len(settled_unit_ids) != len(set(settled_unit_ids))
+        or any(item not in source_unit_ids for item in settled_unit_ids)
+    ):
+        raise ValueError(
+            "semantic draft settled read-only unit identities are invalid"
+        )
     action_sources: dict[int, list[str]] = {}
     for unit in semantic_units:
         if not isinstance(unit, Mapping):
@@ -294,6 +310,13 @@ def build_semantic_plan_draft(
                 "action_registry": action_registry_contract_hash(),
             },
         ))
+    if any(
+        set(candidate.source_atom_ids).intersection(settled_unit_ids)
+        for candidate in candidates
+    ):
+        raise ValueError(
+            "semantic draft candidate overlaps a settled read-only unit"
+        )
     source_by_id = {
         str(unit.get("unit_id") or ""): unit
         for unit in safe_partition
@@ -396,6 +419,7 @@ def build_semantic_plan_draft(
         "source_active_group": str(state.get("active_group") or "opening"),
         "pending_contract_hash": source_pending_hash,
         "candidate_ids": [item.candidate_id for item in candidates],
+        "settled_read_only_unit_ids": list(settled_unit_ids),
         "atom_ids": [item.atom_id for item in unresolved_atoms],
         "registry_hash": registry_hash,
         "action_registry_hash": action_contract_hash,
@@ -427,6 +451,7 @@ def build_semantic_plan_draft(
             dict(item) for item in source_secret_bindings
         ),
         candidates=tuple(candidates),
+        settled_read_only_unit_ids=settled_unit_ids,
         unresolved_atoms=tuple(unresolved_atoms),
         active_atom_id=unresolved_atoms[0].atom_id,
         registry_hash=registry_hash,
@@ -478,11 +503,16 @@ def validate_semantic_plan_draft(
             raise ValueError(f"semantic plan draft {field} is invalid")
     atoms = draft.get("unresolved_atoms")
     candidates = draft.get("candidates")
+    settled_read_only_unit_ids = draft.get("settled_read_only_unit_ids")
     source_secret_bindings = draft.get("source_secret_bindings")
     if not isinstance(atoms, (list, tuple)) or not atoms:
         raise ValueError("semantic plan draft requires unresolved_atoms")
     if not isinstance(candidates, (list, tuple)):
         raise ValueError("semantic plan draft candidates must be a list")
+    if not isinstance(settled_read_only_unit_ids, (list, tuple)):
+        raise ValueError(
+            "semantic plan draft settled read-only unit ids must be a list"
+        )
     if not isinstance(source_secret_bindings, (list, tuple)):
         raise ValueError("semantic plan draft source secret bindings must be a list")
     seen_source_refs: set[str] = set()
@@ -575,6 +605,17 @@ def validate_semantic_plan_draft(
         for item in draft.get("source_partition") or ()
         if isinstance(item, Mapping) and str(item.get("unit_id") or "")
     }
+    normalized_settled_ids = [
+        str(item) for item in settled_read_only_unit_ids if str(item)
+    ]
+    if (
+        len(normalized_settled_ids) != len(settled_read_only_unit_ids)
+        or len(normalized_settled_ids) != len(set(normalized_settled_ids))
+        or any(item not in source_unit_ids for item in normalized_settled_ids)
+    ):
+        raise ValueError(
+            "semantic plan draft settled read-only unit identities are invalid"
+        )
     for candidate in candidates:
         action = dict(candidate.get("action") or {})
         if any(
@@ -609,6 +650,10 @@ def validate_semantic_plan_draft(
         )
         if any(item not in source_unit_ids for item in source_atom_ids):
             raise ValueError("semantic plan draft candidate source identity is invalid")
+        if set(source_atom_ids).intersection(normalized_settled_ids):
+            raise ValueError(
+                "semantic draft candidate overlaps a settled read-only unit"
+            )
         identity_payload = {
             "action": action,
             "source_atom_ids": source_atom_ids,
@@ -711,6 +756,7 @@ def validate_semantic_plan_draft(
             draft.get("pending_contract_hash") or ""
         ),
         "candidate_ids": candidate_ids,
+        "settled_read_only_unit_ids": normalized_settled_ids,
         "atom_ids": atom_ids,
         "registry_hash": str(draft.get("registry_hash") or ""),
         "action_registry_hash": str(
@@ -1087,6 +1133,231 @@ def build_semantic_draft_finalization_receipt(
         {key: value for key, value in body.items() if key != "receipt_hash"}
     )
     return body
+
+
+def build_semantic_draft_noop_finalization_receipt(
+    payload: Mapping[str, Any],
+    *,
+    plan_hash: str,
+    unit_verdicts: Sequence[Mapping[str, Any]],
+    review_hashes: Sequence[str],
+    review_ids: Sequence[str],
+    request_count: int,
+) -> dict[str, Any]:
+    """Bind one all-background ready draft to an admitted zero-action plan."""
+
+    draft = validate_semantic_plan_draft(payload)
+    if draft.get("status") != "ready_for_review":
+        raise ValueError("semantic draft is not ready for no-op finalization")
+    if draft.get("candidates"):
+        raise ValueError("semantic draft no-op finalization cannot omit candidates")
+    atoms = [
+        dict(item)
+        for item in draft.get("unresolved_atoms") or ()
+        if isinstance(item, Mapping)
+    ]
+    if not atoms or any(
+        not str(item.get("resolution_hash") or "")
+        or str(item.get("resolution_disposition") or "") != "background"
+        for item in atoms
+    ):
+        raise ValueError(
+            "semantic draft no-op finalization requires all-background atoms"
+        )
+    normalized_verdicts = [
+        dict(item) for item in unit_verdicts if isinstance(item, Mapping)
+    ]
+    expected_unit_ids = {
+        str(item.get("unit_id") or "")
+        for item in draft.get("source_partition") or ()
+        if isinstance(item, Mapping) and str(item.get("unit_id") or "")
+    }
+    verdict_unit_ids = {
+        str(item.get("unit_id") or "") for item in normalized_verdicts
+    }
+    if (
+        not normalized_verdicts
+        or verdict_unit_ids != expected_unit_ids
+        or len(verdict_unit_ids) != len(normalized_verdicts)
+        or any(
+            str(item.get("verdict") or "") != "context"
+            or item.get("owner_action_ids")
+            or str(item.get("omitted_action_type") or "")
+            for item in normalized_verdicts
+        )
+    ):
+        raise ValueError(
+            "semantic draft no-op finalization requires complete context verdicts"
+        )
+    normalized_review_hashes = tuple(str(item) for item in review_hashes)
+    normalized_review_ids = tuple(str(item) for item in review_ids)
+    if (
+        not _is_sha256(plan_hash)
+        or not normalized_review_hashes
+        or len(normalized_review_hashes) != len(normalized_review_ids)
+        or request_count != len(normalized_review_hashes)
+        or any(not _is_sha256(item) for item in normalized_review_hashes)
+        or any(not item for item in normalized_review_ids)
+        or len(set(normalized_review_ids)) != len(normalized_review_ids)
+    ):
+        raise ValueError(
+            "semantic draft no-op finalization admission proof is invalid"
+        )
+    resolution_rows = [{
+        "atom_id": str(item.get("atom_id") or ""),
+        "resolution_hash": str(item.get("resolution_hash") or ""),
+        "resolution_disposition": str(
+            item.get("resolution_disposition") or ""
+        ),
+    } for item in atoms]
+    body = {
+        "contract_version": 1,
+        "draft_id": str(draft.get("draft_id") or ""),
+        "draft_revision": int(draft.get("revision") or 0),
+        "session_id": str(draft.get("session_id") or ""),
+        "source_product_authority_id": str(
+            draft.get("source_product_authority_id") or ""
+        ),
+        "source_checkpoint_revision": int(
+            draft.get("source_checkpoint_revision") or 0
+        ),
+        "source_checkpoint_thread_id": str(
+            draft.get("source_checkpoint_thread_id") or ""
+        ),
+        "source_checkpoint_id": str(draft.get("source_checkpoint_id") or ""),
+        "source_checkpoint_fingerprint": str(
+            draft.get("source_checkpoint_fingerprint") or ""
+        ),
+        "source_partition_hash": str(draft.get("source_partition_hash") or ""),
+        "candidate_set_hash": semantic_hash([]),
+        "settled_read_only_unit_ids_hash": semantic_hash(
+            list(draft.get("settled_read_only_unit_ids") or ())
+        ),
+        "source_secret_binding_manifest_hash": semantic_hash(
+            list(draft.get("source_secret_bindings") or ())
+        ),
+        "resolution_hash": semantic_hash(resolution_rows),
+        "final_plan_hash": semantic_final_plan_hash([]),
+        "admission_plan_hash": str(plan_hash),
+        "admission_unit_verdicts": normalized_verdicts,
+        "admission_review_hashes": list(normalized_review_hashes),
+        "admission_review_ids": list(normalized_review_ids),
+        "admission_request_count": int(request_count),
+    }
+    body["receipt_hash"] = semantic_hash(body)
+    return body
+
+
+def validate_semantic_draft_noop_finalization_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    draft: Mapping[str, Any],
+    session_id: str,
+) -> dict[str, Any]:
+    """Validate one Harness-minted no-op finalization against its ready draft."""
+
+    normalized = validate_semantic_draft_noop_finalization_receipt_body(
+        receipt,
+        session_id=session_id,
+    )
+    rebuilt = build_semantic_draft_noop_finalization_receipt(
+        draft,
+        plan_hash=str(normalized.get("admission_plan_hash") or ""),
+        unit_verdicts=normalized.get("admission_unit_verdicts") or (),
+        review_hashes=normalized.get("admission_review_hashes") or (),
+        review_ids=normalized.get("admission_review_ids") or (),
+        request_count=int(normalized.get("admission_request_count") or 0),
+    )
+    if rebuilt != normalized:
+        raise ValueError("semantic draft no-op finalization receipt mismatch")
+    return normalized
+
+
+def validate_semantic_draft_noop_finalization_receipt_body(
+    receipt: Mapping[str, Any],
+    *,
+    session_id: str,
+) -> dict[str, Any]:
+    """Validate a persisted no-op finalization proof without live draft state."""
+
+    normalized = dict(receipt)
+    expected_fields = {
+        "contract_version",
+        "draft_id",
+        "draft_revision",
+        "session_id",
+        "source_product_authority_id",
+        "source_checkpoint_revision",
+        "source_checkpoint_thread_id",
+        "source_checkpoint_id",
+        "source_checkpoint_fingerprint",
+        "source_partition_hash",
+        "candidate_set_hash",
+        "settled_read_only_unit_ids_hash",
+        "source_secret_binding_manifest_hash",
+        "resolution_hash",
+        "final_plan_hash",
+        "admission_plan_hash",
+        "admission_unit_verdicts",
+        "admission_review_hashes",
+        "admission_review_ids",
+        "admission_request_count",
+        "receipt_hash",
+    }
+    if set(normalized) != expected_fields:
+        raise ValueError(
+            "semantic draft no-op finalization receipt fields are invalid"
+        )
+    if int(normalized.get("contract_version") or 0) != 1:
+        raise ValueError(
+            "semantic draft no-op finalization receipt version is invalid"
+        )
+    if str(normalized.get("session_id") or "") != session_id:
+        raise ValueError(
+            "semantic draft no-op finalization receipt session mismatch"
+        )
+    if (
+        int(normalized.get("draft_revision") or 0) < 1
+        or int(normalized.get("source_checkpoint_revision") or 0) < 0
+        or not str(normalized.get("source_product_authority_id") or "")
+        or not str(normalized.get("source_checkpoint_thread_id") or "")
+        or not str(normalized.get("source_checkpoint_id") or "")
+    ):
+        raise ValueError(
+            "semantic draft no-op finalization Product Head identity is invalid"
+        )
+    for field in (
+        "draft_id",
+        "source_checkpoint_fingerprint",
+        "source_partition_hash",
+        "candidate_set_hash",
+        "settled_read_only_unit_ids_hash",
+        "source_secret_binding_manifest_hash",
+        "resolution_hash",
+        "final_plan_hash",
+        "admission_plan_hash",
+        "receipt_hash",
+    ):
+        if not _is_sha256(normalized.get(field)):
+            raise ValueError(
+                f"semantic draft no-op finalization receipt {field} is invalid"
+            )
+    if str(normalized.get("candidate_set_hash") or "") != semantic_hash([]):
+        raise ValueError(
+            "semantic draft no-op finalization candidate set is not empty"
+        )
+    if str(normalized.get("final_plan_hash") or "") != semantic_final_plan_hash(
+        []
+    ):
+        raise ValueError(
+            "semantic draft no-op finalization plan is not empty"
+        )
+    unsigned = {
+        key: value for key, value in normalized.items() if key != "receipt_hash"
+    }
+    if semantic_hash(unsigned) != str(normalized.get("receipt_hash") or ""):
+        raise ValueError("semantic draft no-op finalization receipt hash mismatch")
+    return normalized
 
 
 def _finalization_action_payload(action: Mapping[str, Any]) -> dict[str, Any]:

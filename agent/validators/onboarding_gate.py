@@ -13,7 +13,7 @@ def build_onboarding_handoff(
     methods: list[str] | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build an evidence-aware onboarding handoff for ADK agents."""
+    """Build an evidence-aware onboarding handoff for AnyChain Agent consumers."""
     package = generate_onboarding_package(chain, methods=methods or [], adapter_family=family)
     evidence = evidence or {}
     missing_evidence = []

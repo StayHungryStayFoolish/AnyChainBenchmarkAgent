@@ -8,7 +8,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
-from agent.knowledge.chain_identity import canonical_chain_aliases, repo_chain_names
+from agent.knowledge.chain_identity import (
+    canonical_chain_aliases,
+    canonicalize_chain_scalar,
+    repo_chain_names,
+)
 from agent.workflows.group_registry import GROUP_SPEC_BY_NAME, USER_NAVIGABLE_GROUPS
 
 from .input_values import (
@@ -370,6 +374,35 @@ def _validate_config_field_intake(action: Mapping[str, Any]) -> None:
         )
 
 
+def _reviewed_config_validator(owner: str) -> ActionValidator:
+    """Bind an internal reviewed-config commit to one registry owner."""
+
+    def validate(action: Mapping[str, Any]) -> None:
+        values = action.get("config_values")
+        if not isinstance(values, Mapping) or not values:
+            raise ValueError("reviewed config commit requires non-empty config_values")
+        invalid = []
+        for raw_field in values:
+            field = str(raw_field or "").strip().upper()
+            group = next(
+                (
+                    spec
+                    for spec in GROUP_SPEC_BY_NAME.values()
+                    if field in spec.fields
+                ),
+                None,
+            )
+            if group is None or group.owner != owner:
+                invalid.append(field or "<missing>")
+        if invalid:
+            raise ValueError(
+                f"reviewed config commit contains fields not owned by {owner}: "
+                + ", ".join(sorted(invalid))
+            )
+
+    return validate
+
+
 def _content_hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -431,12 +464,14 @@ class ActionSpec:
     state_transition_path: tuple[str, ...] = ()
     state_transition_value: Any = None
     state_transition_resolver: StateTransitionResolver | None = None
+    semantic_current_value_path: tuple[str, ...] = ()
     entry_intake: bool = False
     entry_intake_purpose: str = ""
     entry_intake_fixed_arguments: tuple[tuple[str, Any], ...] = ()
     entry_intake_value_arguments: tuple[str, ...] = ()
     structured_intake: tuple[StructuredIntakeSpec, ...] = ()
     invalidates_groups: tuple[str, ...] = ()
+    target_groups_strategy: Literal["declared", "config_values"] = "declared"
     internal_only: bool = False
     typed_option_only: bool = False
     validator: ActionValidator | None = None
@@ -473,6 +508,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("language", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("language",),
+        semantic_current_value_path=("language",),
     ),
     ActionSpec(
         "clarify_unresolved",
@@ -542,7 +578,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "choose_target_mode",
         "chain_rpc",
-        "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.",
+        "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation. The deterministic target-mode transition preserves compatible cross-mode configuration and invalidates mode-incompatible endpoint, workload, fixture, and QPS state; source clauses that only restate that retain/invalidate scope support this same action rather than creating separate mutations.",
         ("target_mode", "target_mode_explicit", "source_evidence"),
         10,
         "target_mode",
@@ -551,9 +587,13 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         provides_capabilities=("target_mode",),
         crosses_pending_barrier=True,
         required_arguments=("target_mode", "target_mode_explicit", "source_evidence"),
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
         semantic_value_grounding_arguments=("target_mode",),
         semantic_value_representative=True,
+        semantic_current_value_path=("target_mode",),
         entry_intake=True,
         entry_intake_purpose="Enter target-mode selection from any active workflow group.",
         entry_intake_fixed_arguments=(("target_mode_explicit", True),),
@@ -562,7 +602,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "choose_chain",
         "chain_rpc",
-        "Select the exact user-supplied raw chain identity as the current benchmark target, or preserve multiple user-supplied candidates for typed disambiguation without choosing silently.",
+        "Select the exact user-supplied raw chain identity as the current benchmark target, or preserve multiple user-supplied candidates for typed disambiguation without choosing silently. Replacing the chain also abandons any chain-specific extension handoff or evidence collection, so departure wording that only frames the replacement belongs to this same mutation.",
         ("chain_text", "chain_candidates", "source_evidence"),
         20,
         "chain_identity",
@@ -575,6 +615,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_value_grounding_arguments=("chain_text", "chain_candidates"),
         open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         semantic_value_representative=True,
+        semantic_current_value_path=("chain_identity", "canonical"),
         entry_intake=True,
         entry_intake_purpose="Enter source-grounded chain target selection from any active workflow group.",
         entry_intake_value_arguments=("chain_text", "chain_candidates"),
@@ -749,6 +790,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("rpc_mode", "mutation_explicit", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("rpc_mode",),
+        semantic_current_value_path=("rpc_mode",),
     ),
     ActionSpec(
         "choose_adapter_family",
@@ -859,7 +901,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         option_navigation_groups=("chain_identity", "target_mode"),
     ),
     ActionSpec("cancel_target_change", "chain_rpc", "Return to workload configuration without changing chain or target mode.", compiler_groups=("workload_rpc",)),
-    ActionSpec("set_qps_mode", "performance", "Select quick, standard, or intensive profile. Do not use set_qps_override unless concrete numeric values were supplied.", ("qps_mode", "mutation_explicit", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("qps_mode",)),
+    ActionSpec("set_qps_mode", "performance", "Select quick, standard, or intensive profile. Do not use set_qps_override unless concrete numeric values were supplied.", ("qps_mode", "mutation_explicit", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("qps_mode",), semantic_current_value_path=("qps_profile", "mode")),
     ActionSpec("request_qps_customization", "performance", "Enter QPS customization when the user wants to adjust the selected profile but has not supplied every numeric value yet.", ("qps_fields", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, requires_specific_change=True, incomplete_mutation_intake=True, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
     ActionSpec(
         "set_qps_override",
@@ -875,8 +917,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("qps_overrides",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
     ),
-    ActionSpec("set_observability", "performance", "Select disabled, local, or exporter-only observability.", ("observability_mode", "mutation_explicit", "source_evidence"), 60, "observability", preserve_pending=True, mutation_dimension="observability", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("observability_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("observability_mode",)),
-    ActionSpec("set_sync_observe_source", "sync_observe", "Select the real sync-observe data source.", ("sync_observe_source",), target_group="sync_observe", required_arguments=("sync_observe_source",), semantic_value_grounding_arguments=("sync_observe_source",)),
+    ActionSpec("set_observability", "performance", "Select disabled, local, or exporter-only observability.", ("observability_mode", "mutation_explicit", "source_evidence"), 60, "observability", preserve_pending=True, mutation_dimension="observability", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("observability_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("observability_mode",), semantic_current_value_path=("observability", "mode")),
+    ActionSpec("set_sync_observe_source", "sync_observe", "Select the real sync-observe data source.", ("sync_observe_source",), target_group="sync_observe", required_arguments=("sync_observe_source",), semantic_value_grounding_arguments=("sync_observe_source",), semantic_current_value_path=("sync_observe", "source")),
     ActionSpec("clear_sync_observe_source", "sync_observe", "Clear a sync-observe source after its endpoint setup is cancelled.", target_group="sync_observe"),
     ActionSpec(
         "set_sync_observe_options",
@@ -888,6 +930,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "duration requires sync_observe_duration_seconds; other stop conditions reject duration_seconds",
         ),
         semantic_value_grounding_arguments=("sync_observe_stop_condition",),
+        semantic_current_value_path=("sync_observe", "stop_condition"),
         validator=_validate_sync_observe_options,
     ),
     ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", compiler_groups=("preflight_smoke_execution",), effect="execution", internal_only=True, typed_option_only=True),
@@ -917,11 +960,36 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "ledger_disk",
             "accounts_disk",
             "network",
+            "endpoint_process",
+            "sync_observe",
         ),
         preserve_pending=True,
         merge_mapping_fields=("config_values", "unmapped_values"),
         merge_sequence_fields=("conflicts",),
+        target_groups_strategy="config_values",
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+    ),
+    ActionSpec(
+        "apply_reviewed_chain_rpc_config",
+        "chain_rpc",
+        "Commit only user-reviewed configuration fields owned by Chain/RPC.",
+        ("config_values",),
+        26,
+        required_arguments=("config_values",),
+        internal_only=True,
+        target_groups_strategy="config_values",
+        validator=_reviewed_config_validator("chain_rpc"),
+    ),
+    ActionSpec(
+        "apply_reviewed_sync_observe_config",
+        "sync_observe",
+        "Commit only user-reviewed configuration fields owned by sync-observe.",
+        ("config_values",),
+        26,
+        required_arguments=("config_values",),
+        internal_only=True,
+        target_groups_strategy="config_values",
+        validator=_reviewed_config_validator("sync_observe"),
     ),
     ActionSpec(
         "start_evidence_collection",
@@ -1162,7 +1230,11 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "cancel_semantic_draft",
         "coordinator",
-        "Cancel the complete pending semantic draft without applying candidate actions.",
+        (
+            "Discard every unresolved and unapplied item in the active "
+            "semantic draft without applying candidate actions or rolling "
+            "back read-only answers that were already delivered."
+        ),
         ("draft_id", "revision", "reason", "source_evidence"),
         execution_phase=0,
         effect="workflow_state_mutation",
@@ -1194,6 +1266,8 @@ CONSULTATION_TOPICS: tuple[str, ...] = (
     "workflow",
     MODE_COMPARISON_TOPIC,
     "performance_benchmark_guidance",
+    "sync_observe_metrics",
+    "sync_observe_behavior",
     "execution_preflight_smoke",
     "recommendation",
     "reset_help",
@@ -1206,20 +1280,46 @@ CONSULTATION_TOPICS: tuple[str, ...] = (
 
 CONSULTATION_TOPIC_PURPOSES: Mapping[str, str] = {
     "identity": "Identify the Agent, its runtime role, and where it operates.",
-    "capabilities": "Explain what the Agent and benchmark product can do.",
+    "capabilities": (
+        "Give a broad overview of what the Agent and benchmark product can do. "
+        "Do not use it for one selected workflow's metric availability, optional "
+        "data-source behavior, or exact configuration requirement when a narrower "
+        "registered topic applies."
+    ),
     "supported_chains": "List or explain supported blockchain chains.",
     "extension": "Explain custom RPC, new-chain, or unsupported-family extension paths.",
-    "config_explanation": "Explain one current configuration field, prompt, or option.",
+    "config_explanation": (
+        "Explain one exact configuration field, prompt, or option bound in "
+        "subject. Never infer the subject later from mutable workflow state."
+    ),
     "current_config": "Report retained and confirmed workflow configuration values.",
     "workload_config": "Report effective or default RPC methods and weights.",
     "current_context": "Report the active workflow context and pending question.",
     "next_action": "Explain the next workflow action or blocker.",
     "startup_discovery": "Report values inferred by startup environment discovery.",
-    "environment_readiness": "Report environment and dependency readiness.",
-    "requirements": "Explain what the user must prepare for a test.",
+    "environment_readiness": (
+        "Report host environment and dependency readiness only. Whether the "
+        "selected workflow can continue without an optional data source belongs "
+        "to that workflow's capability topic."
+    ),
+    "requirements": (
+        "Explain the inputs and prerequisites the user must prepare to start a "
+        "test. Do not use it to answer whether an active workflow can continue "
+        "without an optional metrics source or which workflow metrics remain."
+    ),
     "workflow": "Explain the benchmark workflow and configuration sequence.",
     MODE_COMPARISON_TOPIC: "Compare fake-node, real-node, and sync-observe modes.",
     "performance_benchmark_guidance": "Recommend a mode for a stated performance goal.",
+    "sync_observe_metrics": (
+        "Explain generic sync-observe measurements and chain/client-specific "
+        "native metric profiles. When the source names a chain, preserve that "
+        "chain as the consultation subject."
+    ),
+    "sync_observe_behavior": (
+        "Explain sync-observe lifecycle and stop-condition behavior, including "
+        "hypothetical or conditional questions about running until manually "
+        "stopped. This is read-only and never selects a stop condition."
+    ),
     "execution_preflight_smoke": "Explain preflight and smoke execution semantics.",
     "recommendation": "Recommend a safe next benchmark starting path.",
     "reset_help": "Explain how to clear or modify retained workflow configuration.",
@@ -1232,6 +1332,40 @@ CONSULTATION_TOPIC_PURPOSES: Mapping[str, str] = {
 
 if set(CONSULTATION_TOPIC_PURPOSES) != set(CONSULTATION_TOPICS):
     raise RuntimeError("consultation topic purposes must cover the consultation registry exactly")
+
+CONSULTATION_TOPIC_SUBJECT_POLICIES: Mapping[str, str] = {
+    "config_explanation": (
+        "Required subject is the exact configuration field, pending-question "
+        "identifier, or option being explained. Bind it from the source and "
+        "current pending question while planning; rendering must not infer it "
+        "from mutable workflow state after earlier actions execute."
+    ),
+    "sync_observe_metrics": (
+        "Optional subject is only one exact supported chain name or exact "
+        "registered alias. Reuse the same chain for related metric availability, "
+        "zero, or N/A questions in the turn. Never put a metric name, client "
+        "name, descriptive chain phrase, or the complete question in subject."
+    ),
+}
+
+CONSULTATION_TOPIC_ROUTE_GROUPS: Mapping[str, frozenset[str]] = {
+    "startup_discovery": frozenset({
+        "opening",
+        "provider_deployment",
+        "ledger_disk",
+        "accounts_disk",
+        "network",
+    }),
+    "environment_readiness": frozenset({
+        "opening",
+        "provider_deployment",
+        "ledger_disk",
+        "accounts_disk",
+        "network",
+    }),
+    "sync_observe_metrics": frozenset({"sync_observe"}),
+    "sync_observe_behavior": frozenset({"sync_observe"}),
+}
 
 CONSULTATION_TOPIC_ALIASES: Mapping[str, str] = {
     "who": "identity",
@@ -1517,6 +1651,7 @@ def action_registry_contract_hash() -> str:
                 for intake in spec.structured_intake
             ],
             "invalidates_groups": list(spec.invalidates_groups),
+            "target_groups_strategy": spec.target_groups_strategy,
             "required_arguments": list(spec.required_arguments),
             "constraints": list(spec.constraints),
             "suppressed_by": list(spec.suppressed_by),
@@ -1537,6 +1672,7 @@ def action_registry_contract_hash() -> str:
             "required_state_values": list(spec.required_state_values),
             "state_transition_path": list(spec.state_transition_path),
             "state_transition_value": spec.state_transition_value,
+            "semantic_current_value_path": list(spec.semantic_current_value_path),
             "internal_only": spec.internal_only,
             "typed_option_only": spec.typed_option_only,
             "state_transition_resolver": (
@@ -1556,6 +1692,13 @@ def action_registry_contract_hash() -> str:
         "semantic_scope_policies": SEMANTIC_SCOPE_POLICIES,
         "semantic_operation_purposes": SEMANTIC_OPERATION_PURPOSES,
         "consultation_topics": sorted(CONSULTATION_TOPICS),
+        "consultation_topic_subject_policies": dict(
+            CONSULTATION_TOPIC_SUBJECT_POLICIES
+        ),
+        "consultation_topic_route_groups": {
+            topic: sorted(groups)
+            for topic, groups in CONSULTATION_TOPIC_ROUTE_GROUPS.items()
+        },
         "semantic_value_domain_policy": SEMANTIC_VALUE_DOMAIN_POLICY,
         "semantic_value_domains": registered_semantic_value_domains(),
         "pending_barrier_policies": PENDING_BARRIER_POLICIES,
@@ -2633,6 +2776,28 @@ def validate_action_contract(
             _validate_argument_value(action[key], ACTION_ARGUMENT_SCHEMAS[key], f"{action_type}.{key}")
     if action_type == "answer_opening_question" and action.get("topic") not in CONSULTATION_TOPICS:
         raise ValueError(f"invalid consultation topic: {action.get('topic')!r}")
+    if (
+        action_type == "answer_opening_question"
+        and action.get("topic") == "config_explanation"
+        and not str(action.get("subject") or "").strip()
+    ):
+        raise ValueError(
+            "config_explanation requires an exact bound subject"
+        )
+    if (
+        action_type == "answer_opening_question"
+        and action.get("topic") == "sync_observe_metrics"
+        and action.get("subject")
+    ):
+        canonical_subject = canonicalize_chain_scalar(
+            action.get("subject"),
+            known_chains=set(repo_chain_names()),
+        )
+        if not canonical_subject:
+            raise ValueError(
+                "sync_observe_metrics subject must be one exact supported chain scalar"
+            )
+        action["subject"] = canonical_subject
     if action_type == "answer_pending":
         answer = action.get("answer")
         selected = action.get("selected_value")
@@ -2999,6 +3164,17 @@ def validate_action_registry() -> None:
             raise RuntimeError(f"duplicate allowed action argument: {spec.action_type}")
         if len(spec.compiler_groups) != len(set(spec.compiler_groups)):
             raise RuntimeError(f"duplicate compiler group: {spec.action_type}")
+        if spec.target_groups_strategy not in {"declared", "config_values"}:
+            raise RuntimeError(
+                f"invalid target-groups strategy: {spec.action_type}"
+            )
+        if (
+            spec.target_groups_strategy == "config_values"
+            and "config_values" not in spec.allowed_arguments
+        ):
+            raise RuntimeError(
+                f"config-values target strategy requires config_values: {spec.action_type}"
+            )
         if len(spec.semantic_operations) != len(set(spec.semantic_operations)):
             raise RuntimeError(f"duplicate semantic operation: {spec.action_type}")
         if not spec.semantic_operations:

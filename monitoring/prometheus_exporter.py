@@ -209,6 +209,8 @@ def emit_latest_csv_metrics(builder: PrometheusBuilder, latest_row: dict[str, An
         ("node_hottest_core_cpu_pct", "node_hottest_core_cpu_percent", "CPU percent of the hottest core used by the node process."),
         ("node_cpu_concentration_top1_pct", "node_cpu_concentration_top1_percent", "Node CPU concentration in the hottest thread/core."),
         ("node_cpu_concentration_top5_pct", "node_cpu_concentration_top5_percent", "Node CPU concentration across the top five threads/cores."),
+        ("node_process_rss_mib", "node_process_rss_mebibytes", "Observed blockchain node process resident memory in MiB."),
+        ("node_process_memory_pct", "node_process_memory_percent", "Observed blockchain node process resident memory as a percentage of host memory."),
         ("local_block_height", "local_block_height", "Local node block height from performance_latest.csv."),
         ("mainnet_block_height", "mainnet_block_height", "Reference/mainnet block height from performance_latest.csv."),
         ("block_height_diff", "block_height_diff_csv", "Reference minus local block height difference from performance_latest.csv."),
@@ -226,6 +228,40 @@ def emit_latest_csv_metrics(builder: PrometheusBuilder, latest_row: dict[str, An
         "Whether node execution/MGas metrics were available in the latest CSV row.",
         1 if to_float(latest_row.get("execution_mgas_per_sec")) is not None or to_float(latest_row.get("execution_gas_per_sec")) is not None else 0,
         execution_labels,
+    )
+
+    client_labels = {
+        **labels,
+        "client_profile": latest_row.get("client_metric_profile", "none"),
+        "quality": latest_row.get("client_metric_quality", "unavailable"),
+    }
+    for field, metric, help_text in (
+        ("client_block_insert_ms_p50", "client_block_insert_milliseconds_p50", "Client-native block insertion duration P50 in milliseconds."),
+        ("client_import_mgas_per_sec_p50", "client_import_mgas_per_sec_p50", "Client-native imported-block execution throughput P50 in million gas per second."),
+        ("client_block_tx_count", "client_block_transactions", "Transactions in the latest client-native imported-block sample."),
+        ("client_block_gas_used", "client_block_gas_used", "Gas used by the latest client-native imported-block sample."),
+        ("client_head_block", "client_head_block", "Client-native imported head block height."),
+        ("client_justified_block", "client_justified_block", "Client-native justified block height."),
+        ("client_finalized_block", "client_finalized_block", "Client-native finalized block height."),
+    ):
+        builder.gauge(metric, help_text, latest_row.get(field), client_labels)
+    builder.gauge(
+        "client_import_observation_count",
+        "Client-native execution observations represented by the latest resetting summary scrape.",
+        latest_row.get("client_import_observation_count"),
+        client_labels,
+    )
+    builder.counter(
+        "client_inserted_blocks_total",
+        "Client-native inserted-block observations represented by the latest summary.",
+        latest_row.get("client_inserted_blocks_count"),
+        client_labels,
+    )
+    builder.gauge(
+        "client_metric_profile_available",
+        "Whether a client-native metric profile produced at least partial data in the latest CSV row.",
+        1 if str(latest_row.get("client_metric_quality") or "").lower() in {"complete", "partial"} else 0,
+        client_labels,
     )
 
     node_labels = {

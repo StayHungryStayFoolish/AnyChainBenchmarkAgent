@@ -77,7 +77,7 @@ def onboarding_plan(chain: str, methods: list[str], gaps: list[dict[str, str]]) 
     gap_types = {gap["type"] for gap in gaps}
     if "chain_template" in gap_types:
         steps.extend([
-            f"Create config/chains/{chain}.json from config/chains/chain_template.json.bak.",
+            f"Create config/chains/{chain}.json from config/chain_template.json.bak.",
             f"Select _meta.adapter_family based on protocol: {', '.join(SUPPORTED_FAMILIES[:-1])}, or {SUPPORTED_FAMILIES[-1]}.",
             "Define rpc_methods.single, rpc_methods.mixed_weighted, param_formats, and proxy_extraction.",
         ])

@@ -644,6 +644,7 @@ class SemanticPlanDraft:
     source_pending_question: Mapping[str, Any]
     source_secret_bindings: tuple[Mapping[str, str], ...]
     candidates: tuple[SemanticDraftCandidate, ...]
+    settled_read_only_unit_ids: tuple[str, ...]
     unresolved_atoms: tuple[SemanticUnresolvedAtom, ...]
     active_atom_id: str
     registry_hash: str

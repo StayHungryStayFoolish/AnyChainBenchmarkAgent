@@ -264,7 +264,7 @@ Development locations:
 - `tools/chain_adapters/base.py`
 - `tools/fake-node/handlers/<family>.go`
 - `tools/fake-node/configs/<family>.yaml`
-- `tools/fake-node/main.go` if the handler registry needs an entry
+- `tools/fake-node/fake_node.go` if the handler registry needs an entry
 - `config/chains/<chain>.json`
 - `docs/en/how-to-add-chain.md`
 - `docs/zh/how-to-add-chain.md`
@@ -378,7 +378,7 @@ Development locations:
 Rules:
 
 - `mixed_weighted` is the source of weighted mixed-mode generation.
-- Weights should sum to 100 for readability.
+- Every enabled weight must be a positive integer, and the total must equal exactly 100.
 - Sync-health RPC methods should not be counted as workload methods.
 - Per-method report charts should only describe benchmark workload traffic.
 

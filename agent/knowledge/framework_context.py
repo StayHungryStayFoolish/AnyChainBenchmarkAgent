@@ -78,7 +78,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "purpose": "Help users configure, validate, run, resume, and analyze blockchain node benchmark jobs.",
             "entrypoint": "./bin/anychain-agent",
             "benchmark_engine_entrypoint": "./blockchain_node_benchmark.sh",
-            "agent_runtime": "Google ADK-backed Agent runtime with deterministic AnyChain tools and gates.",
+            "agent_runtime": "LangGraph Harness Agent runtime with deterministic AnyChain tools and gates.",
         },
         "operating_principles": [
             "Discover environment and dependency state before asking benchmark configuration questions.",
@@ -123,6 +123,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "unique_rpc_method_count": capabilities.get("unique_rpc_method_count"),
             "configured_rpc_method_entries": capabilities.get("configured_rpc_method_entries"),
             "fake_node_fixture_file_count": capabilities.get("fake_node", {}).get("fixture_file_count"),
+            "client_metric_profiles": capabilities.get("client_metric_profiles", []),
         },
         "extension_points": capabilities.get("extension_points", []),
         "framework_index": {

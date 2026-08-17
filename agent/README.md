@@ -140,6 +140,16 @@ question is completed, and only then may the retained action execute under the
 new context. A newly created manual question cannot be bypassed merely because
 it accepts the same multiplexed action type with different fixed arguments.
 
+Evidence ownership is determined by submitted syntax and the signed question
+contract, not merely by the fact that an evidence question is active. Actual
+JSON, YAML, curl, and other parser-recognized evidence remains atomic. Plain
+natural-language navigation or configuration mutations remain prose and route
+to their registered owner. Replacing a chain is the authoritative end of any
+chain-specific Case 2/3 handoff: chain invalidation clears that handoff and its
+evidence before fallback computes the next incomplete group. Correcting the
+adapter family uses the same handoff cleanup before entering the replacement
+family workflow.
+
 LLM output is never executed directly. The semantic path checkpoints
 `partition`, repeats `compile_owner` once per scheduled owner, checkpoints
 `review_plan` for independent whole-plan semantic admission, and then enters
@@ -156,13 +166,20 @@ review.
 If an atomized turn contains both valid candidate actions and exact unresolved
 atoms, the coordinator persists one non-executable `SemanticPlanDraft`.
 Candidates remain outside business state and `action_queue`; one question is
-bound to the exact draft revision and atom. After the last answer, the Harness
-restores the original source contract and recompiles the complete turn with
-the resolution evidence. Only a fresh whole-plan review and deterministic
-admission can enqueue the complete action set. Back, cancel, reset, migration,
-session/schema/registry changes, and workflow-precondition changes are handled
-by the draft lifecycle rather than conversational branches. A draft can never
-authorize an external execution action.
+bound to the exact draft revision and atom. Independently complete consultation
+units may use the registry-defined read-only detour: the Harness isolates a
+`turn_local/read_only` plan, runs a fresh whole-plan review and normal
+deterministic admission, and answers it in the same Product Head transaction as
+the draft question. No mutation, navigation, pending answer, durable queue item,
+or external execution is eligible. Draft contract v4 records the exact settled
+unit identities so final recompilation treats them as context and never repeats
+the answer. After the last answer, the Harness restores the original source
+contract and recompiles the complete turn with the resolution evidence. Only a
+fresh whole-plan review and deterministic admission can enqueue the remaining
+complete action set. Back, cancel, reset, migration, session/schema/registry
+changes, and workflow-precondition changes are handled by the draft lifecycle
+rather than conversational branches. A draft can never authorize an external
+execution action.
 
 For a single source-anchored scalar pending value,
 `harness/bounded_semantic_lane.py` may map once into a finite typed catalog.
@@ -278,7 +295,7 @@ interruption.
 The product compiles one checkpointer-backed graph. Each execution transition
 selects, routes, and commits at most one durable action. Side effects are
 persisted as an intent before invocation and as a receipt afterward. Checkpoint
-schema version 23 is the current contract. Version 12 crosses the isolated
+schema version 24 is the current contract. Version 12 crosses the isolated
 migration boundary; version 13 migrates deferred-queue retention into the typed
 pending-question contract; version 14 initializes typed response fragments
 before persistence as version 15; version 16 materializes the explicit
@@ -301,6 +318,10 @@ Version 22 adds the durable-state secret-binding registry. Version 23 makes
 input sensitivity part of the signed question/group contract, separates
 deterministic semantic hashes from salted memory-hard secret verifiers, and
 commits process-local registry mutations with the Product Head transaction.
+Version 24 adds a distinct admission-bound no-op finalization receipt for a
+ready semantic draft whose atoms are all proven background and whose source
+units are all admitted as context. It clears that draft without manufacturing
+an action; ordinary empty model plans remain fail-closed.
 Every accepted domain delta reconciles durable secret ownership inside the
 same atomic commit boundary before candidate validation, so replacing a
 sensitive value retires its old binding without exposing a partially updated
@@ -354,11 +375,10 @@ Older state is quarantined for explicit reconfirmation.
 - `harness/state.py`: the sole checkpoint-schema boundary. Durable compatible
   configuration may survive migration, but every legacy in-flight question,
   queue, semantic draft, or side-effect state is quarantined and never
-  recompiled into current actions.
+  recompiled into current actions. Its default group order is derived from
+  `workflows/group_registry.py`.
 - `harness/semantic_admission.py`: immutable semantic-document preparation and
   admission after owner-scoped compilation; it exposes no planner entry.
-- `harness/bounded_semantic_lane.py`: finite-catalog, source-anchored semantic
-  mapping with an immutable evidence receipt.
 - `harness/turn_transactions.py`: logical Product Head, physical attempts,
   reconciliation, and terminal outbox authority.
 - `harness/terminal_protocol.py`: versioned non-secret terminal projection and
@@ -367,8 +387,6 @@ Older state is quarantined for explicit reconfirmation.
   mutation or graph-transition authority.
 - `workflows/group_registry.py`: the single metadata authority for group order,
   fields, questions, dependencies, invalidations, and ownership.
-- `harness/state.py`: product workflow state schema; its default group order is
-  derived from `workflows/group_registry.py`.
 - `harness/domains/`: eight domain owners plus the deterministic execution
   runtime used after explicit approval. `harness/domains/registry.py` derives
   its runtime owner view from `workflows/group_registry.py`.
@@ -497,8 +515,10 @@ evidence and report G0-G6 status is
 deterministic G2 gate. Phase 8 is implemented as an evidence-admission
 controller: it creates revision-bound obligation catalogs and validates
 evidence produced by subordinate real-CLI, dynamic Chaos, and real-execution
-providers; it does not itself conduct those conversations or jobs. G3-G6 remain
-open until all required external provider evidence is produced and admitted.
+providers; it does not itself conduct those conversations or jobs. This
+long-lived document does not declare the current G3-G6 result; run the
+controller for the target revision. Any gate without admitted qualifying
+evidence remains open.
 Follow
 `tests/agent_live/README.md` and
 `docs/en/agent-handoff-product-verification.md` for dynamic

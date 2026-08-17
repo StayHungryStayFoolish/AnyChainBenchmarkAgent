@@ -191,6 +191,14 @@ def _sync_configuration_complete(sync: dict[str, Any]) -> bool:
 
 
 def apply_sync_observe_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
+    if action.action_type == "apply_reviewed_sync_observe_config":
+        from .environment import apply_reviewed_owned_config_values
+
+        return apply_reviewed_owned_config_values(
+            state,
+            action,
+            owner="sync_observe",
+        )
     if action.action_type == "clear_sync_observe_source":
         sync = dict(state.get("sync_observe") or {})
         sync.pop("source", None)

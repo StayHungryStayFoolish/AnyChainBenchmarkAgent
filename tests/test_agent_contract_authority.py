@@ -470,6 +470,138 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "arguments": {"topic": "current_config"},
             })
 
+    def test_sync_observe_metric_consultation_is_a_registered_read_only_topic(self) -> None:
+        from agent.harness.action_registry import (
+            ACTION_BY_TYPE,
+            CONSULTATION_TOPIC_PURPOSES,
+            validate_action_contract,
+        )
+        from agent.harness.context import action_schema
+
+        action = validate_action_contract({
+            "type": "answer_opening_question",
+            "topic": "sync_observe_metrics",
+            "subject": "bsc",
+            "source_evidence": "What native metrics does BSC sync-observe report?",
+        })
+
+        self.assertEqual(action["topic"], "sync_observe_metrics")
+        self.assertEqual(action["subject"], "bsc")
+        self.assertIn("sync_observe_metrics", CONSULTATION_TOPIC_PURPOSES)
+        self.assertEqual(ACTION_BY_TYPE["answer_opening_question"].effect, "read_only")
+        consultation = next(
+            item
+            for item in action_schema()
+            if item["type"] == "answer_opening_question"
+        )
+        self.assertIn(
+            "sync_observe_metrics",
+            consultation["topic_subject_policies"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "exact supported chain scalar"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "sync_observe_metrics",
+                "subject": "MGas/s",
+                "source_evidence": "Should MGas/s be N/A?",
+            })
+
+        with self.assertRaisesRegex(ValueError, "exact supported chain scalar"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "sync_observe_metrics",
+                "subject": "Ethereum Geth node",
+                "source_evidence": "Does this apply to an Ethereum Geth node?",
+            })
+
+    def test_config_explanation_requires_bound_subject(self) -> None:
+        from agent.harness.action_registry import (
+            CONSULTATION_TOPIC_PURPOSES,
+            CONSULTATION_TOPIC_ROUTE_GROUPS,
+            CONSULTATION_TOPIC_SUBJECT_POLICIES,
+            validate_action_contract,
+        )
+
+        self.assertIn(
+            "mutable workflow state",
+            CONSULTATION_TOPIC_SUBJECT_POLICIES["config_explanation"],
+        )
+        self.assertIn(
+            "host environment",
+            CONSULTATION_TOPIC_PURPOSES["environment_readiness"],
+        )
+        self.assertNotIn(
+            "sync_observe",
+            CONSULTATION_TOPIC_ROUTE_GROUPS["environment_readiness"],
+        )
+        self.assertEqual(
+            CONSULTATION_TOPIC_ROUTE_GROUPS["sync_observe_metrics"],
+            frozenset({"sync_observe"}),
+        )
+        self.assertEqual(
+            CONSULTATION_TOPIC_ROUTE_GROUPS["sync_observe_behavior"],
+            frozenset({"sync_observe"}),
+        )
+        with self.assertRaisesRegex(ValueError, "exact bound subject"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "config_explanation",
+                "source_evidence": "What does this stop option mean?",
+            })
+
+        action = validate_action_contract({
+            "type": "answer_opening_question",
+            "topic": "config_explanation",
+            "subject": "sync_observe_stop_condition",
+            "source_evidence": "Can I keep observing until I stop it?",
+        })
+        self.assertEqual(action["subject"], "sync_observe_stop_condition")
+
+    def test_mode_switch_and_config_proposal_publish_full_workflow_scope(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        mode = ACTION_BY_TYPE["choose_target_mode"]
+        proposal = ACTION_BY_TYPE["propose_config_values"]
+
+        self.assertIn("non_mutation_scope", mode.semantic_support_relations)
+        self.assertIn("preserves compatible cross-mode configuration", mode.purpose)
+        self.assertIn("invalidates mode-incompatible", mode.purpose)
+        self.assertIn("endpoint_process", proposal.compiler_groups)
+        self.assertIn("sync_observe", proposal.compiler_groups)
+        self.assertEqual(proposal.target_groups_strategy, "config_values")
+
+    def test_config_proposal_targets_only_groups_present_in_the_transaction(self) -> None:
+        from agent.harness.queue import action_target_groups
+
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {"CLOUD_REGION": "us-1"},
+            }),
+            {"provider_deployment"},
+        )
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {
+                    "NODE_PROMETHEUS_METRICS_URL": "http://node:6060/debug/metrics/prometheus",
+                    "SYNC_OBSERVE_STOP_CONDITION": "until_stopped",
+                },
+            }),
+            {"sync_observe"},
+        )
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {
+                    "HAS_ACCOUNTS_DEVICE": False,
+                    "CHAIN_EVM_RPC_URL": "http://node:8545",
+                },
+            }),
+            {"accounts_disk", "chain_auxiliary_endpoints"},
+        )
+
     def test_production_prompts_defer_routing_and_fields_to_typed_schemas(
         self,
     ) -> None:
@@ -486,6 +618,8 @@ class ActionContractAuthorityTest(unittest.TestCase):
             "structured_candidates describe terminal syntax only",
             stage_a,
         )
+        self.assertIn("declarative assignment of a registered runtime field", stage_a)
+        self.assertIn("registered transition's compatibility and invalidation effects", stage_a)
         self.assertIn("do not classify intent", stage_a)
         self.assertIn("do not guess, omit, or repair a route", stage_a)
         self.assertIn("Follow owner_action_schema exactly", stage_b)
@@ -504,6 +638,24 @@ class ActionContractAuthorityTest(unittest.TestCase):
         self.assertIn("immutable disposition=context", prompt)
         self.assertIn("never reinterpret it as complete or support", prompt)
         self.assertIn("never invent an owner", prompt)
+
+    def test_whole_plan_admission_has_one_response_authority(self) -> None:
+        from agent.harness.semantic_admission import (
+            _semantic_fulfillment_prompt,
+            _whole_plan_fulfillment_policy,
+        )
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt(_whole_plan_fulfillment_policy())
+
+        self.assertIn("action_verdicts", prompt)
+        self.assertIn("unit_verdicts", prompt)
+        self.assertNotIn("{reviews:[", prompt)
+        self.assertNotIn("{unit_reviews:[", prompt)
+        self.assertNotIn("{context_reviews:[", prompt)
+        self.assertNotIn("For unit_reviews", prompt)
+        self.assertNotIn("For context_reviews", prompt)
+        self.assertIn("{reviews:[", _semantic_fulfillment_prompt())
 
     def test_pending_semantic_policy_preserves_contrastive_option_selection(
         self,

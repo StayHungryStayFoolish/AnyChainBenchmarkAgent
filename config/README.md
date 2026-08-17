@@ -28,9 +28,10 @@ chain template, and exports derived variables for child processes.
 
 | File or directory | Audience | Purpose |
 | --- | --- | --- |
-| `agent_config.sh` | All Agent users | Agent provider settings: LLM provider/model/auth, context compaction, default Agent output dir, and optional enterprise Knowledge Base integration. |
+| `agent_config.sh` | All Agent users | Agent provider settings: LLM provider/model/auth, optional enterprise Knowledge Base integration, notification settings, and local override loading. |
 | `user_config.sh` | Direct engine users / advanced users | Benchmark defaults: chain name, local RPC endpoint, RPC mode, node process names, cloud/machine metadata, disk baselines, network bandwidth, QPS profile defaults. Agent jobs normally materialize final values into `runtime.env`. |
 | `chains/*.json` | Chain integrators | Chain templates for the 36 supported blockchains. Add or modify these only when adding a chain or changing RPC method coverage. |
+| `client_metrics/*.json` | Framework maintainers | Versioned client-native Prometheus profiles used by sync-observe. A profile binds exact upstream samples and units to profile-neutral CSV fields; it does not imply support for every client in the same protocol family. |
 | `system_config.sh` | Advanced users | Deployment platform override, logging behavior, monitoring overhead process list, and generic runtime behavior. Defaults are suitable for most runs. |
 | `provider_disk_config.sh` | Framework maintainers | Provider-specific post-processing for disk baseline values after `user_config.sh` is loaded. |
 | `internal_config.sh` | Framework maintainers | Bottleneck thresholds, block-height health thresholds, and internal monitor defaults. Change only when you intentionally tune framework behavior. |
@@ -42,9 +43,11 @@ chain template, and exports derived variables for child processes.
 
 ## First-Run Required Settings
 
-Most users should start the Agent and let `doctor`, `plan`, and `preflight`
-tell them which benchmark values are missing. Direct engine users should edit
-these values in `config/user_config.sh` before a production benchmark:
+Most users should start the Agent, use its automatic startup diagnostics, and
+let the workflow plan and preflight identify missing benchmark values. The
+interactive `doctor` command reruns the environment check. Direct engine users
+should edit these values in `config/user_config.sh` before a production
+benchmark:
 
 | Variable | Required | Description |
 | --- | --- | --- |
@@ -72,16 +75,17 @@ these values in `config/user_config.sh` before a production benchmark:
 
 Edit these values in `config/agent_config.sh`. The benchmark engine can run
 without an LLM when invoked directly, but the human-facing Agent runtime is
-Google ADK and requires a real configured model provider for natural-language
-interaction. No-key checks validate configuration and tool contracts only.
+the LangGraph Harness and requires a real configured model provider for
+natural-language interaction. Google ADK is optional and limited to Gemini
+search grounding. No-key checks validate configuration and tool contracts only.
 
 Supported auth paths are direct API keys and Vertex AI with Google
 service-account based authentication:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Required for Agent chat | `gemini`, `claude`, `openai`, or `deepseek`. Defaults to `gemini`. |
-| `LLM_MODEL` | Required for Agent chat | Model name, for example `gemini-3.1-pro`, `gemini-3.5-flash`, `claude-opus-4-8`, `gpt-5.5`, or `deepseek-v4-flash`. |
+| `LLM_PROVIDER` | Required for Agent chat | `gemini`, `claude`, `openai`, or `deepseek`. The repository default is `openai`; local deployments should select an explicitly configured provider. |
+| `LLM_MODEL` | Required for Agent chat | A model ID supported by the selected provider and auth path. The repository default for `openai` is `gpt-4.1-mini`; local deployments should verify their chosen model with `python3 -m agent.cli llm-config`. |
 | `LLM_AUTH_MODE` | Required for real providers | `api_key`, `google_adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Required for Gemini API-key mode | Direct Gemini API key. |
 | `ANTHROPIC_API_KEY` | Required for `claude` API-key mode | Direct Anthropic API key. |
@@ -93,12 +97,15 @@ service-account based authentication:
 | `GOOGLE_APPLICATION_CREDENTIALS` | Required for `service_account_file` | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
 
 `scripts/install_deps.sh` installs benchmark-engine dependencies.
-`scripts/install_agent_deps.sh` installs Agent runtime dependencies: Google ADK
-in an isolated Python 3.10+ venv, and optionally Google Cloud CLI with
-`--with-gcloud`. Google Cloud CLI is required only for local ADC setup
-(`LLM_AUTH_MODE=google_adc`) or local impersonation bootstrap; `doctor` reports
-whether `gcloud` and the ADC file are available, and the Agent can call the
-installer after explicit user approval.
+`scripts/install_agent_deps.sh` installs the core LangGraph Agent runtime in an
+isolated Python 3.10+ venv. The default install does not include or require
+Google ADK; add `--with-google-search` only for Gemini search grounding. Google
+Cloud CLI is optional through `--with-gcloud` and is required only for local
+ADC setup (`LLM_AUTH_MODE=google_adc`) or local impersonation bootstrap. The
+structured `python3 -m agent.cli doctor` report states whether `gcloud` and the
+ADC file are available. Run the installer explicitly, or invoke the
+programmatic `install_dependencies` tool with `approved=true` and
+`include_gcloud=true`; the interactive terminal does not silently install it.
 
 ## Agent Knowledge Base Integration
 

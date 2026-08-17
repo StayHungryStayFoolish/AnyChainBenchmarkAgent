@@ -1,9 +1,9 @@
 # AnyChain Benchmark Agent Framework
 
-[English](README.md) | [中文](README_ZH.md)
+[English](../../README.md) | [中文](../../README_ZH.md)
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](COMMERCIAL.md)
+[![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](../../COMMERCIAL.md)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
@@ -67,7 +67,7 @@ flowchart LR
 - **Optional observability**: Prometheus/Grafana reads existing runtime
   artifacts through a read-only exporter and remains disabled by default.
 
-For the full execution path, see [Framework Flow and Data Lifecycle](docs/en/framework-flow.md).
+For the full execution path, see [Framework Flow and Data Lifecycle](framework-flow.md).
 
 ## 🚀 Quick Start
 
@@ -211,6 +211,12 @@ queue depth, disk throughput/IOPS/utilization, and network RX/TX. If a client
 does not expose MGas/s, the report records the metric source/status so zero or
 missing values can be distinguished from framework data loss.
 
+For BSC v1.7.x, start the BSC client with `--metrics` and point
+`NODE_PROMETHEUS_METRICS_URL` at its `/debug/metrics/prometheus` endpoint. The
+BSC profile adds native block-insert, import MGas/s, justified/finalized lag,
+transaction, gas, TPS, CPU, memory, and sample-quality results. This profile is
+selected only for canonical chain `bsc`; it is not a generic EVM promise.
+
 ### 4. Find the Report
 
 Current-run files are under the runtime `current/` directory. Durable results
@@ -246,7 +252,10 @@ The exporter is read-only. It reads runtime JSON plus
 RPC benchmarks and `sync-observe`. In `sync-observe`, it exposes block-height
 progress, execution MGas/s/gas/s when the node client reports it, execution
 metric status/source, node process CPU, hottest thread/core CPU, CPU iowait,
-and the existing disk/network/system gauges. If the client does not expose
+node process RSS/memory percentage, and the existing disk/network/system gauges.
+For the BSC profile it also exposes the latest raw block-insert, MGas/s,
+transaction, gas-used, imported/justified/finalized height, and observation
+count samples with profile/quality labels. If the client does not expose
 execution gas metrics, the MGas/s gauge is omitted and
 `execution_metric_available` is emitted with the source/status labels.
 
@@ -263,7 +272,7 @@ Open:
 - Prometheus: `http://localhost:9091`
 - Grafana: `http://localhost:3001`
 
-See [Prometheus / Grafana Observability](./deploy/observability/README.md)
+See [Prometheus / Grafana Observability](../../deploy/observability/README.md)
 for Docker Compose details, path overrides, and dashboard behavior.
 
 Use `OBSERVABILITY_STACK_MODE=exporter` when you already have
@@ -278,7 +287,7 @@ subject to your Prometheus retention policy.
 
 **Before running the framework**, you must configure the following parameters:
 For the full configuration layer map and advanced options, see
-[`config/README.md`](config/README.md).
+[`config/README.md`](../../config/README.md).
 
 ### Required Configuration (in `config/user_config.sh`)
 
@@ -372,10 +381,10 @@ lsblk
 - `config/config_loader.sh` - configuration loader, runtime detection, derived paths, and chain-template resolution
 - `config/chains/*.json` - Per-chain RPC method templates, protocol family, parameter formats, and REST path mappings
 
-Local fake-node closed-loop testing guide: [Local closed-loop testing and fake-node guide](docs/en/local-closed-loop-testing.md).
+Local fake-node closed-loop testing guide: [Local closed-loop testing and fake-node guide](local-closed-loop-testing.md).
 
 Kubernetes monitoring deployment for GKE, EKS, and self-managed clusters is
-provided under [deploy/k8s](deploy/k8s/README.md). The repository validates the
+provided under [deploy/k8s](../../deploy/k8s/README.md). The repository validates the
 manifests and K8s monitoring helpers with static and mocked tests, but live
 cluster deployment depends on the operator's RBAC, admission policy, hostPath,
 hostPID, and privileged-workload permissions.
@@ -399,7 +408,7 @@ This grouping is not based on chain brand, token, or ecosystem. It is based on t
 
 ### How to Add a New Chain in an Existing Family
 
-For the step-by-step operational guide, see [How to add a chain or RPC method](docs/en/how-to-add-chain.md).
+For the step-by-step operational guide, see [How to add a chain or RPC method](how-to-add-chain.md).
 
 If the new chain uses an existing RPC shape, add a chain template and record real fixtures:
 
@@ -578,7 +587,7 @@ The framework has two deployment paths:
 - **GKE / EKS / self-managed Kubernetes**: the entry script does **not** create
   cluster resources for you. Before running benchmark traffic against a node in
   Kubernetes, deploy and verify the collector DaemonSet under
-  [`deploy/k8s`](deploy/k8s/README.md), including its image, RBAC,
+  [`deploy/k8s`](../../deploy/k8s/README.md), including its image, RBAC,
   `hostPath` mounts, `hostPID`, security context, and runtime path settings.
   After the collector is emitting cgroup CSV data, run the benchmark entry from
   your chosen runner with the normal `config/user_config.sh` settings.
@@ -716,7 +725,7 @@ selected runner. The framework assumes your cluster operator has already
 reviewed and approved the required Kubernetes permissions.
 
 For the full command-by-command workflow, including what each step does and how
-to verify readiness, see [Kubernetes Operator Runbook](deploy/k8s/README.md#kubernetes-operator-runbook).
+to verify readiness, see [Kubernetes Operator Runbook](../../deploy/k8s/README.md#kubernetes-operator-runbook).
 
 ### Custom Testing
 
@@ -739,52 +748,52 @@ runtime path.
 
 ### Core Documentation
 
-#### [Framework Flow and Data Lifecycle](./docs/en/framework-flow.md)
+#### [Framework Flow and Data Lifecycle](framework-flow.md)
 - Entry command to QPS execution, monitoring, analysis, report generation, and archive.
 - Decoupled file lifecycle: `current/`, `archives/`, and `MEMORY_SHARE_DIR`.
 - Pluggable monitoring, sync-health, per-method attribution, and observer-cost calculation.
 - Optional Prometheus/Grafana flow and its read-only boundaries.
 
-#### [Module Guide](./docs/en/module-guide.md)
+#### [Module Guide](module-guide.md)
 - Responsibilities, inputs, outputs, and extension boundaries for each major module.
 - Configuration, chain adapters, benchmark core, proxy, monitoring, analysis, reports, archive, fake-node, and observability.
 
-#### [Configuration Layer Guide](./config/README.md)
+#### [Configuration Layer Guide](../../config/README.md)
 - User-facing configuration in `config/user_config.sh`.
 - Runtime path registry and generated file locations.
 - Chain template format and environment overrides.
 
-#### [Kubernetes Operator Runbook](./deploy/k8s/README.md)
+#### [Kubernetes Operator Runbook](../../deploy/k8s/README.md)
 - GKE, EKS, and self-managed Kubernetes monitoring deployment.
 - Preflight checks, DaemonSet deployment, and post-deploy validation.
 
-#### [Prometheus / Grafana Observability](./deploy/observability/README.md)
+#### [Prometheus / Grafana Observability](../../deploy/observability/README.md)
 - Optional read-only exporter and local Prometheus/Grafana stack.
 - Runtime artifact paths and dashboard startup/shutdown commands.
 
-#### [GitHub PR Gates and Branch Protection](./docs/en/github-pr-gates.md)
+#### [GitHub PR Gates and Branch Protection](github-pr-gates.md)
 - PR CI, CODEOWNERS, pull request template, and branch protection settings.
 - What GitHub can validate automatically and what maintainers should smoke-test manually.
 
-#### [Contributing](./CONTRIBUTING.md)
+#### [Contributing](../../CONTRIBUTING.md)
 - Local validation commands by change type.
 - Development, review, and public-repository hygiene rules.
 
 #### Chain Extension and Closed-Loop Testing
-- [How to add a chain or RPC method](./docs/en/how-to-add-chain.md)
-- [Local closed-loop testing with fake-node](./docs/en/local-closed-loop-testing.md)
+- [How to add a chain or RPC method](how-to-add-chain.md)
+- [Local closed-loop testing with fake-node](local-closed-loop-testing.md)
 
 Language-specific documentation indexes:
 
-- [English documentation index](./docs/en/README.md)
-- [Chinese documentation index](./docs/zh/README.md)
+- [English documentation index](README.md)
+- [Chinese documentation index](../zh/README.md)
 
 ## ⚙️ Configuration Reference
 
 The required runtime values are listed in
 [Required Configuration](#-required-configuration). For the complete
 configuration layer, defaults, and environment overrides, use
-[Configuration Layer Guide](./config/README.md).
+[Configuration Layer Guide](../../config/README.md).
 
 ### Advanced Configuration
 
@@ -1255,9 +1264,9 @@ bash --version
   support requests.
 - Use GitHub Discussions for installation questions, configuration questions,
   roadmap discussion, and operational experience.
-- Follow [SECURITY.md](SECURITY.md) for vulnerabilities, leaked secrets, private
+- Follow [SECURITY.md](../../SECURITY.md) for vulnerabilities, leaked secrets, private
   RPC endpoints, or sensitive benchmark artifacts.
-- See [SUPPORT.md](SUPPORT.md) for support routing details.
+- See [SUPPORT.md](../../SUPPORT.md) for support routing details.
 
 
 ## 📄 License
@@ -1267,13 +1276,13 @@ This project is dual-licensed:
 ### Open Source License (AGPL 3.0 or later)
 - Commercial and non-commercial use are allowed under AGPL terms
 - If you modify, distribute, or provide network access to the software, follow the AGPL source-disclosure requirements
-- See [LICENSE](LICENSE) for full terms
+- See [LICENSE](../../LICENSE) for full terms
 
 ### Commercial Licensing Option
 - Available for proprietary use cases that need terms different from the AGPL
 - Closed-source integration allowed
 - No AGPL obligations under a separate written commercial agreement
 - Enterprise support available
-- See [COMMERCIAL.md](COMMERCIAL.md) for details
+- See [COMMERCIAL.md](../../COMMERCIAL.md) for details
 
 **Contact:** Open a GitHub Issue with label `commercial-license` for commercial licensing inquiries

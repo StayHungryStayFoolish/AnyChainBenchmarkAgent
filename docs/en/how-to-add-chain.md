@@ -102,7 +102,9 @@ Example:
 }
 ```
 
-Use weights that sum to 100 when possible because they are easier to audit. The framework generates vegeta targets proportionally.
+Enabled weights must be positive integers totaling exactly 100. Chain-template
+and runtime-workload validation rejects any other total before execution. The
+framework generates Vegeta targets proportionally from the validated weights.
 
 ### Mixed Workload Realism
 
@@ -139,10 +141,11 @@ When changing `mixed_weighted`:
 7. Add the fake-node family YAML mapping under `tools/fake-node/configs/`.
 8. Record the method's own fixture and run coverage/runtime probes.
 
-`weight` must be a positive integer. The target generator treats a missing,
-invalid, or zero weight as `1` so a configured method is still exercised during
-mixed-mode smoke and benchmark runs. To disable a method, remove it from
-`mixed_weighted`; do not set `weight` to `0`.
+`weight` must be a positive integer, and all enabled weights must total exactly
+100. The target generator still normalizes a missing, invalid, or zero legacy
+value to `1` defensively, but that is not an acceptance path: template/workload
+validation must reject the configuration before execution. To disable a method,
+remove it from `mixed_weighted`; do not set `weight` to `0`.
 
 Do not add a method only because it is listed in official docs. Add it when the
 framework can build a valid request, record a real response, replay it through

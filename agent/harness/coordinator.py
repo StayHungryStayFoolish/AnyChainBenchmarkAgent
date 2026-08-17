@@ -142,6 +142,7 @@ from .semantic_drafts import (
     reopen_previous_semantic_draft_atom,
     semantic_draft_question_binding,
     semantic_draft_staleness_reasons,
+    validate_semantic_draft_noop_finalization_receipt,
     validate_semantic_plan_draft,
 )
 from .response import (
@@ -2204,32 +2205,80 @@ def _consume_planner_queue(
     if isinstance(semantic_draft, Mapping):
         draft = validate_semantic_plan_draft(semantic_draft)
         question = _semantic_draft_question(draft)
-        state["semantic_plan_draft"] = draft
-        state.setdefault("turn_context", {})["semantic_units"] = [
+        draft_actions = _normalized_action_queue(dict(queue))
+        draft_units = [
             dict(row)
             for row in queue.get("semantic_units") or []
             if isinstance(row, Mapping)
         ]
-        _record_semantic_plan_receipt(
-            state,
-            state["turn_context"]["semantic_units"],
-            [],
-        )
-        if str((state.get("turn_receipt") or {}).get("turn_id") or ""):
-            state["turn_receipt"] = reconcile_admission_coverage(
-                state.get("turn_receipt") or {},
-                [],
+        for index, action in enumerate(draft_actions):
+            action["_source_unit_ids"] = [
+                str(unit.get("unit_id") or "")
+                for unit in draft_units
+                if index in (
+                    unit.get("action_indexes")
+                    if isinstance(unit.get("action_indexes"), list)
+                    else []
+                )
+                and str(unit.get("unit_id") or "")
+            ]
+        settled_ids = {
+            str(item)
+            for item in draft.get("settled_read_only_unit_ids") or ()
+            if str(item)
+        }
+        if draft_actions:
+            invalid_types = [
+                str(action.get("type") or "")
+                for action in draft_actions
+                if (
+                    (spec := ACTION_BY_TYPE.get(
+                        str(action.get("type") or "")
+                    ))
+                    is None
+                    or spec.effect != "read_only"
+                    or spec.lifetime != "turn_local"
+                )
+            ]
+            covered_ids = {
+                str(unit_id)
+                for action in draft_actions
+                for unit_id in action.get("_source_unit_ids") or ()
+                if str(unit_id)
+            }
+            if invalid_types or not settled_ids or covered_ids != settled_ids:
+                raise StateInvariantError(
+                    "semantic draft detour is not an exact turn-local "
+                    "read-only settlement"
+                )
+        elif settled_ids:
+            raise StateInvariantError(
+                "semantic draft declares settled read-only units without "
+                "admitted detour actions"
             )
+        state["semantic_plan_draft"] = draft
+        state.setdefault("turn_context", {})["semantic_units"] = draft_units
         _install_pending_question(
             state,
             question,
             activate_group=False,
         )
-        return _set_turn_phase(
-            state,
-            "compose",
-            "semantic_draft_awaiting_clarification",
-        )
+        if not draft_actions:
+            _record_semantic_plan_receipt(
+                state,
+                state["turn_context"]["semantic_units"],
+                [],
+            )
+            if str((state.get("turn_receipt") or {}).get("turn_id") or ""):
+                state["turn_receipt"] = reconcile_admission_coverage(
+                    state.get("turn_receipt") or {},
+                    [],
+                )
+            return _set_turn_phase(
+                state,
+                "compose",
+                "semantic_draft_awaiting_clarification",
+            )
     existing_draft = dict(state.get("semantic_plan_draft") or {})
     if (
         existing_draft.get("status") == "ready_for_review"
@@ -2274,6 +2323,18 @@ def _consume_planner_queue(
         for row in queue.get("semantic_units") or []
         if isinstance(row, Mapping)
     ]
+    noop_finalization_receipt = dict(
+        queue.get("semantic_draft_noop_finalization_receipt") or {}
+    )
+    if noop_finalization_receipt:
+        state["turn_context"][
+            "semantic_draft_noop_finalization_receipt"
+        ] = noop_finalization_receipt
+    else:
+        state["turn_context"].pop(
+            "semantic_draft_noop_finalization_receipt",
+            None,
+        )
     for index, action in enumerate(actions):
         action["_source_unit_ids"] = [
             str(unit.get("unit_id") or "")
@@ -2419,6 +2480,58 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
     durable_actions = [item for item in actions if not action_is_turn_local(item)]
     draft = dict(state.get("semantic_plan_draft") or {})
     if not _has_meaningful_queue(actions):
+        noop_receipt = dict(
+            (state.get("turn_context") or {}).get(
+                "semantic_draft_noop_finalization_receipt"
+            )
+            or {}
+        )
+        if (
+            not actions
+            and draft.get("status") == "ready_for_review"
+            and noop_receipt
+        ):
+            session_id = str(
+                (state.get("session") or {}).get("id")
+                or state.get("thread_id")
+                or ""
+            )
+            validated_noop = (
+                validate_semantic_draft_noop_finalization_receipt(
+                    noop_receipt,
+                    draft=draft,
+                    session_id=session_id,
+                )
+            )
+            receipt = dict(state.get("turn_receipt") or {})
+            receipt["status"] = "completed"
+            receipt["unresolved_units"] = []
+            state["turn_receipt"] = receipt
+            state.setdefault("audit_events", []).append({
+                "event": "semantic_draft_noop_finalized",
+                **deepcopy(validated_noop),
+            })
+            discard_draft_secret_references(draft)
+            state["semantic_plan_draft"] = {}
+            state["proposed_actions"] = []
+            state["action_errors"] = []
+            if state.get("action_queue"):
+                return _set_turn_phase(
+                    state,
+                    "execute",
+                    "semantic_draft_noop_finalized_queue_preserved",
+                )
+            if state.get("pending_question"):
+                return _set_turn_phase(
+                    state,
+                    "compose",
+                    "semantic_draft_noop_finalized_pending_preserved",
+                )
+            return _set_turn_phase(
+                state,
+                "fallback",
+                "semantic_draft_noop_finalized",
+            )
         if draft.get("status") == "ready_for_review":
             _invalidate_semantic_draft(
                 state,

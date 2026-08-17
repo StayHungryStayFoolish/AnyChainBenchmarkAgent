@@ -45,9 +45,13 @@ def adk_status() -> ADKStatus:
     if is_adk_available():
         reason = "google.adk is importable"
         if sys.version_info < (3, 10):
-            reason = "google.adk is importable, but Python 3.10+ is recommended for ADK runtime features"
+            reason = "google.adk is importable, but Python 3.10+ is recommended for optional Gemini google_search support"
         return ADKStatus(available=True, reason=reason)
     return ADKStatus(
         available=False,
-        reason="google-adk is not installed; install it in an isolated Python 3.10+ environment",
+        reason=(
+            "optional google-adk search extra is not installed; core LangGraph Agent "
+            "runtime is unaffected. Install with scripts/install_agent_deps.sh --yes "
+            "--with-google-search only when Gemini google_search is required"
+        ),
     )

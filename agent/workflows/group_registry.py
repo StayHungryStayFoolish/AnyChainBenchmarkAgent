@@ -42,6 +42,7 @@ class GroupSpec:
     name: str
     owner: str
     fields: tuple[str, ...] = ()
+    config_field_aliases: tuple[str, ...] = ()
     questions: tuple[str, ...] = ()
     sensitive_fields: tuple[str, ...] = ()
     sensitive_questions: tuple[str, ...] = ()
@@ -161,6 +162,7 @@ GROUPS: tuple[GroupSpec, ...] = (
             "ACCOUNTS_VOL_MAX_IOPS",
             "ACCOUNTS_VOL_MAX_THROUGHPUT",
         ),
+        config_field_aliases=("HAS_ACCOUNTS_DEVICE",),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
             "has_accounts_device",
@@ -320,6 +322,10 @@ GROUPS: tuple[GroupSpec, ...] = (
             "NODE_PROMETHEUS_METRICS_URL",
             "NODE_PROCESS_PID",
         ),
+        config_field_aliases=(
+            "SYNC_OBSERVE_STOP_CONDITION",
+            "SYNC_OBSERVE_DURATION_SECONDS",
+        ),
         depends_on=("target_mode", "chain_identity", "endpoint_process"),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
@@ -430,6 +436,23 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
             f"{field}={owners}" for field, owners in sorted(duplicate_fields.items())
         )
         raise RuntimeError(f"duplicate persisted field ownership: {details}")
+
+    config_alias_groups: dict[str, list[str]] = {}
+    for group in registry:
+        for alias in group.config_field_aliases:
+            config_alias_groups.setdefault(alias, []).append(group.name)
+    duplicate_config_aliases = {
+        alias: owners
+        for alias, owners in config_alias_groups.items()
+        if len(owners) > 1
+    }
+    aliases_overlapping_state = sorted(set(config_alias_groups).intersection(field_groups))
+    if duplicate_config_aliases or aliases_overlapping_state:
+        raise RuntimeError(
+            "invalid config field aliases: "
+            f"duplicates={duplicate_config_aliases}, "
+            f"state_fields={aliases_overlapping_state}"
+        )
 
     known = set(names)
     for group in registry:
@@ -601,6 +624,11 @@ GROUP_FIELD_MAP: dict[str, set[str]] = {group.name: set(group.fields) for group 
 FIELD_GROUP: dict[str, str] = {
     field: group.name for group in GROUPS for field in group.fields
 }
+CONFIG_FIELD_ALIAS_GROUP: dict[str, str] = {
+    field: group.name
+    for group in GROUPS
+    for field in group.config_field_aliases
+}
 FIELD_OWNER: dict[str, str] = {
     field: group.owner for group in GROUPS for field in group.fields
 }
@@ -629,6 +657,15 @@ def normalize_group_name(value: object) -> str:
 def group_for_field(field_name: str) -> str:
     field = str(field_name or "").strip()
     return FIELD_GROUP.get(field, "") if field else ""
+
+
+def group_for_config_field(field_name: str) -> str:
+    """Resolve an external config key to its authoritative workflow group."""
+
+    field = str(field_name or "").strip()
+    if not field:
+        return ""
+    return FIELD_GROUP.get(field, "") or CONFIG_FIELD_ALIAS_GROUP.get(field, "")
 
 
 def is_sensitive_question(
@@ -662,6 +699,7 @@ def group_registry_contract_hash() -> str:
             "name": group.name,
             "owner": group.owner,
             "fields": list(group.fields),
+            "config_field_aliases": list(group.config_field_aliases),
             "questions": list(group.questions),
             "sensitive_fields": list(group.sensitive_fields),
             "sensitive_questions": list(group.sensitive_questions),

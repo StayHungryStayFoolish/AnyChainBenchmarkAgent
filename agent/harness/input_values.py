@@ -165,9 +165,14 @@ def extract_json_values(value: Any) -> list[Any]:
             index += 1
             continue
         line_prefix = text[text.rfind("\n", 0, index) + 1 : index].rstrip()
-        if re.fullmatch(
-            r"\s*[A-Za-z_][A-Za-z0-9_.-]*\s*:",
+        labelled_prefix = re.fullmatch(
+            r"\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*:",
             line_prefix,
+        )
+        if (
+            labelled_prefix
+            and labelled_prefix.group(1).casefold()
+            not in {"request", "response"}
         ):
             index += 1
             continue

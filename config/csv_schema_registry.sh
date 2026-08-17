@@ -93,6 +93,17 @@ _CSV_REGISTRY_EXECUTION_LOGICAL=(
     execution_gas_per_sec
     execution_metric_source
     execution_metric_status
+    client_metric_profile
+    client_block_insert_ms_p50
+    client_import_mgas_per_sec_p50
+    client_import_observation_count
+    client_block_tx_count
+    client_block_gas_used
+    client_head_block
+    client_justified_block
+    client_finalized_block
+    client_inserted_blocks_count
+    client_metric_quality
 )
 
 _CSV_REGISTRY_NODE_CPU_LOGICAL=(
@@ -109,6 +120,8 @@ _CSV_REGISTRY_NODE_CPU_LOGICAL=(
     node_top_cores_cpu_pct
     node_cpu_concentration_top1_pct
     node_cpu_concentration_top5_pct
+    node_process_rss_mib
+    node_process_memory_pct
     node_cpu_status
 )
 
@@ -234,6 +247,17 @@ csv_registry_resolve() {
         execution_gas_per_sec)             echo "execution_gas_per_sec" ;;
         execution_metric_source)           echo "execution_metric_source" ;;
         execution_metric_status)           echo "execution_metric_status" ;;
+        client_metric_profile)             echo "client_metric_profile" ;;
+        client_block_insert_ms_p50)         echo "client_block_insert_ms_p50" ;;
+        client_import_mgas_per_sec_p50)     echo "client_import_mgas_per_sec_p50" ;;
+        client_import_observation_count)    echo "client_import_observation_count" ;;
+        client_block_tx_count)              echo "client_block_tx_count" ;;
+        client_block_gas_used)              echo "client_block_gas_used" ;;
+        client_head_block)                  echo "client_head_block" ;;
+        client_justified_block)             echo "client_justified_block" ;;
+        client_finalized_block)             echo "client_finalized_block" ;;
+        client_inserted_blocks_count)       echo "client_inserted_blocks_count" ;;
+        client_metric_quality)              echo "client_metric_quality" ;;
         node_process_pid)                  echo "node_process_pid" ;;
         node_process_cpu_pct)              echo "node_process_cpu_pct" ;;
         node_thread_count)                 echo "node_thread_count" ;;
@@ -247,6 +271,8 @@ csv_registry_resolve() {
         node_top_cores_cpu_pct)            echo "node_top_cores_cpu_pct" ;;
         node_cpu_concentration_top1_pct)   echo "node_cpu_concentration_top1_pct" ;;
         node_cpu_concentration_top5_pct)   echo "node_cpu_concentration_top5_pct" ;;
+        node_process_rss_mib)              echo "node_process_rss_mib" ;;
+        node_process_memory_pct)           echo "node_process_memory_pct" ;;
         node_cpu_status)                   echo "node_cpu_status" ;;
         *)
             echo "csv_registry_resolve: unknown logical field: $logical" >&2

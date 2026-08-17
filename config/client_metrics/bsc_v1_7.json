@@ -1,0 +1,92 @@
+{
+  "profile_id": "bsc_v1_7",
+  "chains": ["bsc"],
+  "upstream": {
+    "repository": "https://github.com/bnb-chain/bsc",
+    "tag": "v1.7.1",
+    "commit": "da35ee13e2fe38efaeab2d6fb27f112332459b50",
+    "metrics_path": "/debug/metrics/prometheus"
+  },
+  "capability": {
+    "display_name": "BSC v1.7.x native import metrics",
+    "report_kpis": [
+      "block_insert_p50",
+      "import_mgas_per_sec_p50",
+      "justified_lag_p50_p90_p99",
+      "finalized_lag_p50_p90_p99",
+      "transactions",
+      "block_gas_used",
+      "block_gas_used_per_sec",
+      "avg_gas_per_tx",
+      "avg_tx_per_block",
+      "TPS"
+    ],
+    "requirements": [
+      {
+        "id": "client_prometheus_endpoint_enabled",
+        "en": "enabled client Prometheus endpoint",
+        "zh": "已启用客户端 Prometheus endpoint"
+      },
+      {
+        "id": "active_block_import",
+        "en": "active block import for import-window KPIs",
+        "zh": "客户端正在导入区块，才能计算导入窗口 KPI"
+      }
+    ],
+    "missing_endpoint": {
+      "workflow_continues": true,
+      "shared_timeline_available": true,
+      "en": "Without the client Prometheus endpoint, sync-observe can continue with the shared sync/resource timeline; BSC client-native KPIs are reported as N/A.",
+      "zh": "没有客户端 Prometheus endpoint 时，sync-observe 仍可以继续采集通用同步/资源时间线；BSC 客户端原生 KPI 会报告为 N/A。"
+    }
+  },
+  "execution_source": "client_import_mgas_per_sec_p50",
+  "execution_source_label": "chain_mgasps{quantile=\"0.5\"}",
+  "fields": {
+    "client_import_mgas_per_sec_p50": {
+      "metric": "chain_mgasps",
+      "labels": {"quantile": "0.5"},
+      "scale": 1.0
+    },
+    "client_import_observation_count": {
+      "metric": "chain_mgasps_count",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_block_insert_ms_p50": {
+      "metric": "chain_inserts",
+      "labels": {"quantile": "0.5"},
+      "scale": 0.000001
+    },
+    "client_inserted_blocks_count": {
+      "metric": "chain_inserts_count",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_block_tx_count": {
+      "metric": "chain_insert_txsize",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_block_gas_used": {
+      "metric": "chain_insert_gasused",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_head_block": {
+      "metric": "chain_head_block",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_justified_block": {
+      "metric": "chain_head_justified",
+      "labels": {},
+      "scale": 1.0
+    },
+    "client_finalized_block": {
+      "metric": "chain_head_finalized",
+      "labels": {},
+      "scale": 1.0
+    }
+  }
+}

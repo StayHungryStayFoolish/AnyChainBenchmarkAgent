@@ -2,7 +2,7 @@
 
 该文件名仅为保持已有文档链接稳定，并不表示 ADK 拥有 Agent runtime。
 
-AnyChain Agent 是基于 LangGraph Harness 的产品级 Agent，用于控制
+AnyChain Agent 是基于 LangGraph Harness 的面向产品的 Agent，用于控制
 blockchain-node-benchmark 引擎。Harness 负责 workflow 状态、group 路由、
 fallback 顺序、校验门禁和执行决策。所有模型 provider 都实现同一个
 `LLMProvider` contract。OpenAI、DeepSeek 和 Vertex Gemini 使用 OpenAI-compatible
@@ -27,6 +27,42 @@ runtime 分为两层依赖：
 `requirements-adk.txt`、`.venv-adk` 和 `--adk-venv` 是迁移期 alias，不表示 ADK
 拥有 runtime；推荐使用 `--agent-venv`。缺少 Google ADK 只能禁用联网检索，不能阻塞
 CLI 启动、provider 认证、plan、validation 或 execution。
+
+## 对外术语与路径契约
+
+用户可见输出、提供给模型的 framework context、doctor action 和 tool schema 必须把
+核心产品称为 `AnyChain Agent`、`Agent runtime` 或 `LangGraph Harness`，不得把核心
+产品称为 `ADK Agent`、`ADK terminal` 或 `ADK runtime`。`ADK` 只能用于：
+
+- 可选 Gemini `google_search` 实现或其可用性；
+- `.venv-adk`、`requirements-adk.txt`、`--adk-venv`、`adk-status` 等保留的兼容名称；
+- 明确标记为历史、已退休实现的说明和 regression test。
+
+产品验收前必须收口以下当前代码表面：
+
+- `agent/terminal/language.py`：启动信息应标记为可选 Gemini search 能力；模型空输出
+  不得描述成由 ADK 拥有响应；
+- `agent/diagnostics/adk_status.py`：可选 package 缺失时必须说明核心 runtime 不受
+  影响，并且只在确实需要 Gemini `google_search` 时建议安装；
+- `agent/diagnostics/doctor.py`：应推荐 AnyChain Agent terminal 和 LangGraph runtime，
+  不得推荐 ADK Agent 或 ADK terminal；
+- `agent/knowledge/framework_context.py`：提供给模型的核心 runtime 必须是 LangGraph
+  Harness；
+- `agent/tools/schema.py`：`include_agent_runtime` 表示核心 Agent runtime，`adk_venv`
+  只是兼容路径，不能描述为重新安装 Google ADK；
+- `agent/knowledge/gap_analyzer.py` 的用户可见 onboarding 输出必须指向真实存在的
+  `config/chain_template.json.bak`，不得输出不存在的
+  `config/chains/chain_template.json.bak`。
+
+`agent/runners/benchmark_pipeline.py`、`agent/validators/` 和
+`scripts/install_deps.sh` 文件头中关于已退休 ADK wrapper 控制权的描述属于内部文档
+技术债，也必须改为确定性的 Harness/tool 边界。`agent/llm/search_grounding.py` 中真实
+可选搜索实现的说明、兼容名称处理和明确标记为历史的 regression test 仍然有效，不能
+机械批量改名。
+
+只有在重命名会增加迁移风险、且对外文本已经准确时，内部函数名或 message key 才可
+暂时保留旧名称。该例外不得用于 terminal 输出、prompt、tool description、doctor
+report 或生成的 onboarding plan 中的旧控制权描述。
 
 ## Architecture Overview
 
@@ -128,14 +164,34 @@ envelope；只读 plan 仍只执行一次 review。
 当原子化后的 turn 仍有精确 DemandAtom 无法解析时，`review_plan` 可以创建一个
 持久但不可执行的 `SemanticPlanDraft`。其中已通过本地校验的 candidate 只是证据，
 不是 admitted action，不能进入 benchmark 配置、group readiness 或
-`action_queue`。coordinator 每次只询问一个绑定 draft revision 与 atom identity
-的问题。最后一个 atom 解决后，Harness 恢复原始 pending contract 和 active
-group，带着 resolution evidence 重新编译完整原始输入，再次执行 coverage、
-whole-plan review 和确定性 admission；本次新 admission 的每个 envelope 都携带
-同一份 finalization receipt。session、schema、registry、pending contract 或
-workflow precondition 发生变化都会使 draft 失效；reset/cancel 不得提交其中的
-candidate。外部执行必须由后续独立 turn 重新授权，不能从 draft finalization
-获得授权。
+`action_queue`。只有独立完整的 consultation unit 可以进入 registry 限定的 detour，
+并且其中每个 action 都必须是 `turn_local/read_only`。该投影 plan 必须重新通过
+不可变 whole-plan review 和正常确定性 admission；被拒绝的父 plan 不能充当执行
+凭证。draft contract v4 记录在同一个 Product Head transaction 中已回答的精确
+unit identity，finalization 会把这些 unit 投影为 context，避免重复回答。mutation、
+navigation、pending answer、durable queue 和 execution action 一律不得部分执行。
+coordinator 每次只询问一个绑定 draft revision 与 atom identity 的问题。最后一个
+atom 解决后，Harness 恢复原始 pending contract 和 active group，带着 resolution
+evidence 重新编译完整原始输入，再次执行 coverage、whole-plan review 和确定性
+admission；本次新 admission 的每个 envelope 都携带同一份 finalization receipt。
+session、schema、registry、pending contract 或 workflow precondition 发生变化都会
+使 draft 失效；reset/cancel 不得提交其中的 candidate。外部执行必须由后续独立
+turn 重新授权，不能从 draft finalization 获得授权。
+
+已解析的 draft 也可以不产生 action，但只能通过独立的 Harness 签发 no-op
+finalization transaction。receipt 必须绑定：没有 frozen candidate 的 ready draft、
+每个 atom 的 background 裁定证据、不可变的零 action plan、每个 source unit 的
+context admission verdict，以及完整 review identity。该事务直接清除 draft，不得
+伪造 `unknown` 或虚拟 no-op action。普通模型空输出没有这份 receipt，仍必须
+fail closed。
+
+active evidence question 不能把任意用户输入重新分类成 structured evidence。
+input shape 只描述传输语法：解析器识别出的 JSON、YAML、curl 等数据块可以保持原子，
+普通自然语言的咨询、导航和配置变更仍以 prose 进入语义路由。具有原文依据的链替换会
+终止该链专属的 Case 2/3 handoff；链 transition authority 必须清空
+`secondary_handoff` 及其 evidence、失效所有下游链依赖状态，然后回到正常 fallback
+顺序。更正 adapter family 时也必须先执行相同的 handoff 清理，再进入替代 family
+workflow；不得增加面向某段对话的取消分支。
 
 持久化 semantic-partition receipt 必须把 `planning_lane` 明确记录为
 `bounded_semantic_value` 或 `hierarchical`。生产者、runtime-event validator、
@@ -394,7 +450,7 @@ flowchart TD
 先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
 生成下游 runtime 产物。
 
-checkpoint state 当前使用 schema version 23。当前版本的新 turn 绝不调用 legacy
+checkpoint state 当前使用 schema version 24。当前版本的新 turn 绝不调用 legacy
 action compiler。version 12 checkpoint 只通过明确的 migration boundary；version 13
 会把 deferred queue 保留语义迁移到 typed pending-question contract；version 14
 初始化 typed response fragments，并持久化为 version 15；version 16 物化显式的
@@ -413,7 +469,9 @@ version 20 draft 若跨越任何 contract authority 变化，也必须先标记�
 receipt；未完成的 version 20 finalization transaction 必须整体 quarantine。
 version 22 增加 durable-state secret-binding registry。version 23 将敏感性纳入
 group/question 签名契约，使用带 salt 的 memory-hard secret verifier，并让进程内
-registry 变更与 Product Head commit 同事务。
+registry 变更与 Product Head commit 同事务。version 24 增加 admission-bound 的
+semantic-draft no-op finalization receipt 及其 replay invariant；该契约不会放宽
+这次精确事务之外的空 plan admission。
 每个已接受的 domain delta 都必须在同一原子 commit 边界内、candidate validation
 之前完成 durable secret ownership reconciliation；替换敏感值时必须撤销旧 binding，
 不能暴露部分更新的 product state。checkpoint 与 durable execution plan 只能保存
@@ -484,6 +542,11 @@ sync-observe workflow。
   metrics；
 - 停止条件：用户停止、固定 duration，或 until synced。
 
+对于规范链名 `bsc`，BSC v1.7.x metrics profile 会沿用同一条 sync-observe 产物
+路径，增加客户端原生导入 MGas/s、区块导入 P50、justified/finalized 落后分位数、
+交易/Gas 汇总、TPS 和样本质量。它不会增加 workflow group，也不会进入 Vegeta
+路径，并且不会被无关的 EVM client 自动继承。
+
 除非用户明确切换回 RPC benchmark，否则该 workflow 不应询问 RPC mode、自定义 RPC
 workload、mixed weights、Vegeta 或 QPS profile。
 
@@ -521,9 +584,10 @@ driver 或开发辅助，不能替代真实 CLI 场景和确定性断言。
 
 `tests/agent_live/run_product_acceptance.py` 是 Phase 8 evidence-admission
 controller，不是 user simulator 或 real-execution provider。它生成 revision-bound
-obligation catalog，并接纳 subordinate provider 生成的 evidence。Phase 8 已经实现，
-但在 retained real-CLI regression、response-driven 双 AI Chaos、全部必需 real
-execution 和最终 product review 分别生成合格证据前，G3-G6 仍未关闭。
+obligation catalog，并接纳 subordinate provider 生成的 evidence。该长期架构文档
+不固化当前 G3-G6 结果；必须针对目标 revision 运行 controller。每个 gate 在对应的
+retained real-CLI regression、response-driven 双 AI Chaos、必需 real execution 和
+product-review evidence 被接纳前都保持 open。
 
 固定 CLI matrix 不足以作为产品验收。按照 `tests/agent_live/README.md` 执行：
 DeepSeek 运行真实 Docker/Linux CLI，Codex 必须读取上一轮实际回复后再决定下一条用户

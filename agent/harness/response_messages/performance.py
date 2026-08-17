@@ -7,6 +7,12 @@ MESSAGES = {
         "arguments": {"error": "string"},
         "kinds": {"warning"},
     },
+    "harness.performance.qps_overrides_applied": {
+        "en": "Applied QPS profile overrides: {details}",
+        "zh": "已应用 QPS profile 覆盖值：{details}",
+        "arguments": {"details": "string"},
+        "kinds": {"message"},
+    },
     "harness.performance.exporter_selected": {
         "en": "Exporter-only observability is selected. Configure the existing Prometheus to scrape `http://<benchmark-host>:9108/metrics`.",
         "zh": "已选择 exporter-only；请让已有 Prometheus 抓取 `http://<benchmark-host>:9108/metrics`。",

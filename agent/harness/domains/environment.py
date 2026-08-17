@@ -30,7 +30,15 @@ from ..transitions import (
 )
 
 from agent.utils.redaction import redact
-from agent.workflows.group_registry import group_for_field, invalidation_targets
+from agent.knowledge.entry_contract import (
+    REAL_NODE_ENDPOINT_FIELDS,
+    SYNC_OBSERVE_FIELDS,
+)
+from agent.workflows.group_registry import (
+    FIELD_OWNER,
+    group_for_field,
+    invalidation_targets,
+)
 
 choice_question = partial(_choice_question, owner="environment")
 manual_question = partial(_manual_question, owner="environment")
@@ -62,7 +70,16 @@ CONFIRMABLE_CONFIG_FIELDS = {
     "CHAIN_MIRROR_URL",
     "RPC_API_KEY",
 }
-PROPOSED_ENDPOINT_FIELDS = {"LOCAL_RPC_URL", "MAINNET_RPC_URL"}
+PROPOSED_ENDPOINT_FIELDS = {
+    field.env
+    for field in (*REAL_NODE_ENDPOINT_FIELDS, *SYNC_OBSERVE_FIELDS)
+    if field.env and field.key != "node_prometheus_metrics_url"
+}
+CONFIRMABLE_CONFIG_FIELDS.update(
+    field.env
+    for field in SYNC_OBSERVE_FIELDS
+    if field.env and field.key == "node_prometheus_metrics_url"
+)
 SPECIAL_CONFIG_FIELDS = {
     "HAS_ACCOUNTS_DEVICE",
     "SYNC_OBSERVE_STOP_CONDITION",
@@ -141,6 +158,12 @@ _CONFIG_ALIASES = {
     "mainnet_rpc_url": "MAINNET_RPC_URL",
     "blockchain_process_names": "BLOCKCHAIN_PROCESS_NAMES",
 }
+_CONFIG_ALIASES.update({
+    alias: field.env
+    for field in (*REAL_NODE_ENDPOINT_FIELDS, *SYNC_OBSERVE_FIELDS)
+    if field.env
+    for alias in (field.key, field.env.lower())
+})
 
 
 def _is_workflow_dimension_key(key: Any) -> bool:
@@ -270,6 +293,7 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
         )
     if action.action_type == "propose_config_values":
         proposal = build_config_proposal(dict(action.arguments))
+        proposal = _without_already_confirmed_config_values(state, proposal)
         # Unknown keys are reviewable only alongside at least one recognized
         # configuration value. Otherwise log lines, HTTP headers, and protocol
         # examples such as ``RuntimeError: ...`` would become configuration
@@ -298,6 +322,37 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
             source=__name__,
         )
     )
+
+
+def _without_already_confirmed_config_values(
+    state: AgentGraphState,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove proposal fields already satisfied by authoritative state.
+
+    Deferred structured proposals can outlive an intervening typed question.
+    The environment owner consumes equal values idempotently while preserving
+    conflicting values and unrelated fields for explicit review.
+    """
+
+    confirmed = state.get("confirmed_config") or {}
+    values = dict(proposal.get("config_values") or {})
+    retained: dict[str, Any] = {}
+    for key, proposed in values.items():
+        current_key = "has_accounts_device" if key == "HAS_ACCOUNTS_DEVICE" else key
+        if current_key not in confirmed:
+            retained[key] = proposed
+            continue
+        _, normalized_current = normalize_proposed_config_value(
+            key,
+            confirmed[current_key],
+        )
+        _, normalized_proposed = normalize_proposed_config_value(key, proposed)
+        if normalized_current != normalized_proposed:
+            retained[key] = proposed
+    normalized = dict(proposal)
+    normalized["config_values"] = retained
+    return normalized
 
 
 def propose_config_assignments_for_review(
@@ -618,12 +673,12 @@ def apply_direct_config_assignments(state: AgentGraphState, config_values: dict[
     """Apply explicit ``KEY=value`` facts and return structured outcome evidence."""
 
     next_state: AgentGraphState = deepcopy(state)
-    outcome = _apply_config_values(next_state, config_values)
+    local_values, delegated = _partition_reviewed_config_values(config_values)
+    outcome = _apply_config_values(next_state, local_values)
     previous_invalidated = set(state.get("invalidated_groups") or [])
     next_invalidated = set(next_state.get("invalidated_groups") or [])
     followups: tuple[dict[str, Any], ...] = ()
-    if outcome["sync_options"]:
-        followups = ({"type": "set_sync_observe_options", **outcome["sync_options"]},)
+    followups = _reviewed_config_followups(delegated, outcome["sync_options"])
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
         invalidated_groups=tuple(sorted(next_invalidated - previous_invalidated)),
@@ -666,9 +721,13 @@ def apply_inferred_config_review(
             completion="unchanged",
         )
 
-    outcome = _apply_config_values(next_state, dict(reviewed.get("config_values") or {}))
+    local_values, delegated = _partition_reviewed_config_values(
+        dict(reviewed.get("config_values") or {})
+    )
+    outcome = _apply_config_values(next_state, local_values)
     accepted_review = {
         "applied": outcome["applied"],
+        "delegated": delegated,
         "endpoint_proposals": outcome["endpoint_proposals"],
         "unmapped_values": dict(reviewed.get("unmapped_values") or {}),
         "source_format": reviewed.get("source_format") or "",
@@ -719,8 +778,7 @@ def apply_inferred_config_review(
             )
         )
     followups: tuple[dict[str, Any], ...] = ()
-    if outcome["sync_options"]:
-        followups = ({"type": "set_sync_observe_options", **outcome["sync_options"]},)
+    followups = _reviewed_config_followups(delegated, outcome["sync_options"])
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
         invalidated_groups=tuple(sorted(set(next_state.get("invalidated_groups") or []) - set(state.get("invalidated_groups") or []))),
@@ -735,6 +793,109 @@ def apply_inferred_config_review(
             "conflicts": conflicts,
         },),
         followup_actions=followups,
+        completion="in_progress",
+    )
+
+
+def _partition_reviewed_config_values(
+    config_values: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Split reviewed fields by their registry owner before state mutation."""
+
+    local: dict[str, Any] = {}
+    delegated: dict[str, dict[str, Any]] = {}
+    for raw_key, value in config_values.items():
+        key, _normalized = normalize_proposed_config_value(
+            str(raw_key or "").strip().upper(),
+            value,
+        )
+        owner = FIELD_OWNER.get(key, "") if key in CONFIRMABLE_CONFIG_FIELDS else ""
+        if owner and owner != "environment":
+            delegated.setdefault(owner, {})[key] = value
+        else:
+            local[key or str(raw_key)] = value
+    return local, delegated
+
+
+def _reviewed_config_followups(
+    delegated: Mapping[str, Mapping[str, Any]],
+    sync_options: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Lower one accepted review into owner-specific internal commits."""
+
+    actions: list[dict[str, Any]] = []
+    action_types = {
+        "chain_rpc": "apply_reviewed_chain_rpc_config",
+        "sync_observe": "apply_reviewed_sync_observe_config",
+    }
+    for owner in ("chain_rpc", "sync_observe"):
+        values = dict(delegated.get(owner) or {})
+        if values:
+            actions.append({
+                "type": action_types[owner],
+                "config_values": values,
+            })
+    if sync_options:
+        actions.append({"type": "set_sync_observe_options", **dict(sync_options)})
+    return tuple(actions)
+
+
+def apply_reviewed_owned_config_values(
+    state: AgentGraphState,
+    action: ActionProposal,
+    *,
+    owner: str,
+) -> HandlerResult:
+    """Commit one reviewed field subset through its authoritative owner."""
+
+    values = dict(action.arguments.get("config_values") or {})
+    if not values or any(FIELD_OWNER.get(str(key).upper(), "") != owner for key in values):
+        return HandlerResult(
+            blocker=FailureDescriptor(
+                code="harness.environment.failure.reviewed_config_owner_mismatch",
+                arguments={"owner": owner},
+                source=__name__,
+            )
+        )
+    next_state: AgentGraphState = deepcopy(state)
+    outcome = _apply_config_values(next_state, values)
+    if outcome["endpoint_proposals"] or outcome["sync_options"]:
+        return HandlerResult(
+            blocker=FailureDescriptor(
+                code="harness.environment.failure.reviewed_config_commit_invalid",
+                arguments={"owner": owner},
+                source=__name__,
+            )
+        )
+    response_fragments: tuple[ResponseFragment, ...] = ()
+    if outcome["applied"]:
+        details = ", ".join(
+            f"{key}={value}"
+            for key, value in sorted(outcome["applied"].items())
+        )
+        response_fragments = (
+            ResponseFragment(
+                kind="message",
+                message_id="harness.environment.inferred_config_applied",
+                arguments={"details": details},
+                source=__name__,
+            ),
+        )
+    return HandlerResult(
+        delta=StateDelta.between(state, next_state),
+        consumed_action_ids=(action.action_id,),
+        invalidated_groups=tuple(
+            sorted(
+                set(next_state.get("invalidated_groups") or [])
+                - set(state.get("invalidated_groups") or [])
+            )
+        ),
+        response_fragments=response_fragments,
+        evidence=({
+            "type": "reviewed_config_owner_commit",
+            "owner": owner,
+            **outcome,
+        },),
         completion="in_progress",
     )
 
@@ -1009,7 +1170,6 @@ def _apply_config_values(
     config_values: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     confirmed = state.setdefault("confirmed_config", {})
-    endpoint_proposals = state.setdefault("endpoint_evidence", {}).setdefault("proposed_values", {})
     applied: dict[str, Any] = {}
     endpoint_saved: dict[str, Any] = {}
     invalid: dict[str, Any] = {}
@@ -1026,6 +1186,9 @@ def _apply_config_values(
                 applied[key] = scalar
                 mark_field_confirmed(state, key)
         elif key in PROPOSED_ENDPOINT_FIELDS:
+            endpoint_proposals = state.setdefault("endpoint_evidence", {}).setdefault(
+                "proposed_values", {}
+            )
             endpoint_proposals[key] = scalar
             endpoint_saved[key] = scalar
         elif key == "HAS_ACCOUNTS_DEVICE":

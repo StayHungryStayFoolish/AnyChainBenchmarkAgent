@@ -36,7 +36,7 @@ onboarding:
 
 Forbidden shortcuts:
 
-- patching one terminal transcript without updating the decision tree or task
+- patching one terminal transcript without updating the group workflow or task
   document;
 - adding local if/else, regex, fuzzy matching, phrase cleanup, or fallback
   behavior to hide a weak Agent workflow;
@@ -58,7 +58,7 @@ and add Harness coverage so it cannot become hidden technical debt. Otherwise,
 do not write the patch.
 
 Passing one transcript is not enough. The proposed fix must preserve the
-decision tree, typed `pending_question` contract, validator sequence, user
+group workflow, typed `pending_question` contract, validator sequence, user
 correction path, and benchmark execution gates across neighboring branches.
 
 For configuration dialogue failures, classification must identify whether the
@@ -93,7 +93,15 @@ question selection, fallback ordering, and iteration. Repository tools own
 deterministic checks, configuration materialization, benchmark execution,
 evidence collection, and artifact-backed analysis.
 
-## Decision Tree And Y/N Contract
+Published terminology is part of this ownership boundary. Terminal messages,
+doctor actions, model-facing framework context, tool schemas, and generated
+onboarding plans must not call the core runtime an ADK Agent/terminal/runtime.
+`ADK` may describe only optional Gemini `google_search`, retained compatibility
+path names, or explicitly historical code. Every generated file path must be
+resolved against the current repository; in particular, the chain-template
+starter is `config/chain_template.json.bak`.
+
+## Group Workflow And Y/N Contract
 
 The complete workflow map and product Harness plan must be present in the
 current reviewed task/design document for the Agent change. Do not make Agent
@@ -106,8 +114,9 @@ Required behavior:
 
 - If there is no pending question, a bare `Y`, `N`, `yes`, or `no` is not a
   valid business decision. Ask what the user wants to confirm.
-- If the pending question is dependency installation, `Y` installs dependencies
-  through the Agent tool and `N` declines installation.
+- If the pending question is dependency installation, `Y` returns the exact
+  external shell command and `N` declines it. The interactive terminal must not
+  execute installation scripts inside the conversation.
 - If the pending question is target mode, `fake-node`, `real-node`, or a
   numbered/manual choice advances that target-mode path.
 - If the pending question is a disk choice, a number selects the listed disk and
@@ -325,51 +334,37 @@ time. The Agent must route the turn to the right group, preserve valid state,
 invalidate affected state, and then return to the next blocking group in the
 default order.
 
-The default order should match user mental model and manual configuration
-order:
+`agent/workflows/group_registry.py::GROUPS` is the single metadata authority.
+Its current default order is:
 
-1. Provider and deployment group: cloud provider, region, zone, machine type,
-   VM vs Kubernetes/container, and platform such as GCE, EC2, GKE, EKS, or
-   self-hosted Kubernetes.
-2. Hardware group: CPU and memory discovery, network inventory, disk inventory,
-   and resource metadata.
-3. Ledger disk group: `LEDGER_DEVICE`, `DATA_VOL_TYPE`, `DATA_VOL_SIZE`,
-   `DATA_VOL_MAX_IOPS`, and `DATA_VOL_MAX_THROUGHPUT`.
-4. Accounts disk group: ask whether a separate accounts/state disk exists; if
-   yes, collect `ACCOUNTS_DEVICE`, `ACCOUNTS_VOL_TYPE`, `ACCOUNTS_VOL_SIZE`,
-   `ACCOUNTS_VOL_MAX_IOPS`, and `ACCOUNTS_VOL_MAX_THROUGHPUT`.
-5. Network group: `NETWORK_INTERFACE`, selected from detected interfaces when
-   there is more than one candidate, and `NETWORK_MAX_BANDWIDTH_GBPS`.
-6. Chain and endpoint group: `BLOCKCHAIN_NODE`, target mode, `LOCAL_RPC_URL`,
-   `MAINNET_RPC_URL` or template sync-health behavior, and
-   `BLOCKCHAIN_PROCESS_NAMES` for real-node monitoring.
-7. Chain auxiliary endpoint group: chain-template-driven optional overrides
-   such as `CHAIN_REST_URL`, `CHAIN_INDEXER_URL`, `CHAIN_SIDECAR_URL`,
-   `CHAIN_EVM_RPC_URL`, `CHAIN_JSON_RPC_URL`, `CHAIN_MIRROR_URL`, and
-   `RPC_API_KEY`.
-8. Workload group: `RPC_MODE`, default workload selection, custom RPC methods,
-   mixed weights, runtime chain template override, endpoint validation,
-   fixtures, and workload validation.
-9. Target sample and fixture group: only the `TARGET_*` values required by the
-   selected chain template, methods, adapter family, and custom RPC schema.
-10. QPS profile group: quick, standard, or intensive profile; explain defaults
-    first; ask whether to keep defaults; if not, collect initial QPS, max QPS,
-    QPS step, duration, and relevant cooldown/warmup fields.
-11. Sync-observe group: only when the user wants to observe node sync/resource
-    behavior without RPC benchmark load. Confirm sync-health/reference
-    behavior, node process identity, optional `NODE_PROMETHEUS_METRICS_URL`,
-    and stop condition. Skip workload and QPS groups while this workflow is
-    active.
-12. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
-    then ports, auto-stop behavior, scrape endpoint guidance, and port checks.
-13. Advanced tuning group: optional account discovery settings, monitoring
-    intervals, disk monitor rate, internal bottleneck thresholds, success-rate
-    threshold, latency threshold, and other `internal_config.sh` values. The
-    Agent must explain these before asking whether the user wants to change
-    them.
-14. Preflight, smoke, and execution approval group: validate config, run
-    preflight, run complete closed-loop smoke, show evidence, and ask for
-    approval before the real benchmark job.
+| Order | Group | Owner | Applicability |
+|---:|---|---|---|
+| 1 | `opening` | `orientation` | session entry and resume |
+| 2 | `target_mode` | `chain_rpc` | all workflows |
+| 3 | `chain_identity` | `chain_rpc` | all workflows |
+| 4 | `provider_deployment` | `environment` | all workflows |
+| 5 | `ledger_disk` | `environment` | all workflows |
+| 6 | `accounts_disk` | `environment` | all workflows |
+| 7 | `network` | `environment` | all workflows |
+| 8 | `endpoint_process` | `chain_rpc` | real-node and sync-observe; also fake-node while Case 1/2 requires live endpoint validation |
+| 9 | `chain_auxiliary_endpoints` | `chain_rpc` | real-node and sync-observe |
+| 10 | `workload_rpc` | `chain_rpc` | RPC benchmark only |
+| 11 | `target_samples_fixtures` | `chain_rpc` | RPC benchmark only |
+| 12 | `qps_profile` | `performance` | RPC benchmark only |
+| 13 | `sync_observe` | `sync_observe` | sync-observe only |
+| 14 | `observability` | `performance` | all workflows |
+| 15 | `advanced_tuning` | `performance` | all workflows |
+| 16 | `preflight_smoke_execution` | `execution` | selected workflow execution gate |
+| 17 | `job_monitoring` | `execution` | explicit job operation; not fallback |
+| 18 | `failure_recovery` | `recovery` | explicit failure recovery; not fallback |
+| 19 | `error_evidence_analysis` | `analysis` | explicit evidence analysis; not fallback |
+| 20 | `report_artifact_analysis` | `analysis` | explicit report analysis; not fallback |
+
+There are exactly 20 groups and eight domain owners. The graph's coordinator
+owns typed control dispatch but is not a ninth domain owner and owns no
+`GroupSpec`. Runtime fallback skips groups whose workflow/target-mode filters
+do not match and never enters the four non-fallback operational/analysis groups
+without an explicit action.
 
 Each group must define:
 

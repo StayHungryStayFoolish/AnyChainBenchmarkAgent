@@ -110,6 +110,9 @@ DISK_MONITOR_RATE="${DISK_MONITOR_RATE:-1}"                       # Disk separat
 # blockchain client's Prometheus endpoint when the client exposes execution
 # gas/MGas metrics. NODE_PROCESS_PID is optional; when empty the monitor uses
 # BLOCKCHAIN_PROCESS_NAMES to locate the node process.
+# BSC v1.7.x exposes its native import profile at /debug/metrics/prometheus
+# when the client is started with --metrics. The profile is selected only when
+# BLOCKCHAIN_NODE=bsc; it is not assumed for every EVM client.
 NODE_PROMETHEUS_METRICS_URL="${NODE_PROMETHEUS_METRICS_URL:-}"     # Example: http://127.0.0.1:6060/debug/metrics/prometheus
 NODE_PROMETHEUS_TIMEOUT_SECONDS="${NODE_PROMETHEUS_TIMEOUT_SECONDS:-2}"
 NODE_PROCESS_PID="${NODE_PROCESS_PID:-}"
