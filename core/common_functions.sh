@@ -181,6 +181,56 @@ get_chain_meta_probe_value() {
     echo "$value"
 }
 
+get_chain_actual_height_value() {
+    local rpc_url="$1"
+    local blockchain_type
+    blockchain_type=$(echo "${BLOCKCHAIN_NODE:-solana}" | tr '[:upper:]' '[:lower:]')
+    local chain_file="${LOCAL_SCRIPT_DIR}/../config/chains/${blockchain_type}.json"
+
+    local configured_height
+    configured_height=$(get_chain_meta_probe_value "local_height_probe" "$rpc_url" 2>/dev/null || true)
+    if [[ "$configured_height" =~ ^[0-9]+$ ]]; then
+        echo "$configured_height"
+        return 0
+    fi
+
+    [[ -f "$chain_file" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local health_method
+    health_method=$(jq -r '._meta.health_probe.method // ._meta.health_probe.rpc_method // empty' "$chain_file" 2>/dev/null || true)
+    if [[ "$health_method" != "eth_syncing" ]]; then
+        return 1
+    fi
+
+    local request_body response value
+    request_body='{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}'
+    response=$(curl -s --max-time 5 -H "Content-Type: application/json" -d "$request_body" "$rpc_url" 2>/dev/null) || return 1
+    value=$(echo "$response" | jq -r 'if (.result | type) == "object" then .result.currentBlock else empty end' 2>/dev/null) || true
+    if [[ "$value" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+        echo $((16#${value#0x}))
+        return 0
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+        return 0
+    fi
+
+    request_body='{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+    response=$(curl -s --max-time 5 -H "Content-Type: application/json" -d "$request_body" "$rpc_url" 2>/dev/null) || return 1
+    value=$(echo "$response" | jq -r '.result // empty' 2>/dev/null) || return 1
+    if [[ "$value" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+        echo $((16#${value#0x}))
+        return 0
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+        return 0
+    fi
+    return 1
+}
+
 read_previous_sync_health_field() {
     local cache_file="$1"
     local field="$2"
@@ -254,6 +304,11 @@ get_node_sync_health() {
             if [[ "$local_block_height" != "N/A" ]]; then
                 lag_value="$local_block_height"
                 block_height_diff="$lag_value"
+                local height_cursor
+                height_cursor=$(get_chain_actual_height_value "$local_rpc_url" 2>/dev/null || true)
+                if [[ "$height_cursor" =~ ^[0-9]+$ ]]; then
+                    local_block_height="$height_cursor"
+                fi
                 sync_status="healthy"
                 if [[ "$lag_value" =~ ^-?[0-9]+$ && $lag_value -gt ${BLOCK_HEIGHT_DIFF_THRESHOLD:-50} ]]; then
                     sync_status="behind"

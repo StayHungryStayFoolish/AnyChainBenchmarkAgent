@@ -1,0 +1,772 @@
+"""R41 contract-authority regressions for Harness actions and Agent tools."""
+
+from __future__ import annotations
+
+import inspect
+import ast
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+
+class ActionContractAuthorityTest(unittest.TestCase):
+    def test_coordinator_does_not_reimplement_question_contracts(self) -> None:
+        import agent.harness.coordinator as coordinator
+
+        source = inspect.getsource(coordinator)
+        for forbidden in (
+            "def _answer_fits_pending(",
+            "def _coerce_answer(",
+            "def _render_question(",
+            "def _match_option(",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertNotIn('"inferred_config_review"', source)
+
+    def test_coordinator_preplanner_only_admits_declared_exact_choices(self) -> None:
+        from agent.harness.coordinator import adjudicate_turn_step
+        from agent.harness.state import new_state
+
+        state = new_state("exact-choice-only", language="en")
+        state["pending_question"] = {
+            "contract_version": 2,
+            "id": "mode",
+            "group": "target_mode",
+            "owner": "chain_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Choose.",
+            "options": [
+                {
+                    "id": "1",
+                    "label": "fake-node",
+                    "value": "fake-node",
+                    "action": {"type": "choose_target_mode"},
+                },
+            ],
+            "manual_input_allowed": False,
+            "accepted_action_types": ["answer_pending", "choose_target_mode"],
+        }
+        for text, expected_phase in (
+            ("1", "execute"),
+            ("fake-node", "execute"),
+            ("please use fake-node", "plan"),
+            ("2", "plan"),
+        ):
+            with self.subTest(text=text):
+                candidate = dict(state)
+                candidate["turn_context"] = {
+                    "text": text,
+                    "kind": "free_text",
+                    "input_shape": "prose",
+                }
+                candidate["turn_receipt"] = {"clauses": []}
+                result = adjudicate_turn_step(candidate)
+                self.assertEqual(result["control"]["phase"], expected_phase)
+
+    def test_admission_is_atomic_and_cannot_rewrite_action_semantics(self) -> None:
+        import agent.harness.admission as admission
+        import agent.harness.semantic_admission as semantic_admission
+
+        source = inspect.getsource(admission.validate_action_plan)
+        tree = ast.parse(source)
+        forbidden_calls = {"append", "extend", "insert", "pop", "remove"}
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in forbidden_calls
+                for node in ast.walk(tree)
+            )
+        )
+        self.assertNotIn('["type"] =', source)
+        self.assertNotIn("['type'] =", source)
+        self.assertFalse(hasattr(semantic_admission, "_apply_state_plan_policy"))
+
+    def test_action_schema_is_generated_from_specs(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS
+        from agent.harness.context import action_schema
+
+        rendered = {item["type"]: item for item in action_schema()}
+        self.assertEqual(
+            set(rendered),
+            {spec.action_type for spec in ACTION_SPECS if not spec.internal_only},
+        )
+        for spec in ACTION_SPECS:
+            if spec.internal_only:
+                continue
+            self.assertEqual(rendered[spec.action_type]["allowed_arguments"], list(spec.allowed_arguments))
+            self.assertEqual(rendered[spec.action_type]["required_arguments"], list(spec.required_arguments))
+            self.assertEqual(rendered[spec.action_type]["constraints"], list(spec.constraints))
+
+        self.assertNotIn("approve_preflight_smoke", rendered)
+        self.assertNotIn("reject_preflight_smoke", rendered)
+        self.assertNotIn("approve_final_benchmark", rendered)
+        self.assertNotIn("reject_final_benchmark", rendered)
+
+    def test_model_plan_cannot_admit_typed_execution_option_directly(self) -> None:
+        from agent.harness.admission import validate_action_plan
+        from agent.harness.state import new_state
+
+        state = new_state("forged-execution-option", language="en")
+        result = validate_action_plan(
+            state,
+            [{"type": "approve_preflight_smoke"}],
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(
+            [item.code for item in result.rejections],
+            ["typed_option_action_forbidden"],
+        )
+
+    def test_structured_intake_contract_is_registry_owned_and_projected(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS
+        from agent.harness.context import action_schema
+
+        rpc_spec = next(
+            spec for spec in ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        self.assertEqual(len(rpc_spec.structured_intake), 3)
+        intake = rpc_spec.structured_intake[0]
+        self.assertEqual(intake.alias, "custom_rpc")
+        self.assertEqual(
+            dict(intake.fixed_arguments),
+            {"catalog_command": "enter"},
+        )
+        self.assertEqual(intake.value_semantics, "boolean_true")
+        self.assertEqual(intake.value_argument, "")
+
+        rendered = {
+            item["type"]: item["structured_intake"]
+            for item in action_schema()
+        }
+        self.assertEqual(rendered["rpc_catalog_command"], [
+            {
+                "alias": "custom_rpc",
+                "fixed_arguments": {"catalog_command": "enter"},
+                "value_semantics": "boolean_true",
+                "value_argument": "",
+            },
+            {
+                "alias": "validation_endpoint",
+                "fixed_arguments": {"catalog_command": "set_endpoint"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_endpoint",
+            },
+            {
+                "alias": "rpc_request",
+                "fixed_arguments": {"catalog_command": "append_evidence"},
+                "value_semantics": "direct_value",
+                "value_argument": "rpc_schema_evidence",
+            },
+        ])
+        self.assertEqual(rendered["choose_adapter_family"], [
+            {
+                "alias": "protocol_family",
+                "fixed_arguments": {},
+                "value_semantics": "direct_value",
+                "value_argument": "adapter_family",
+            },
+            {
+                "alias": "adapter_family",
+                "fixed_arguments": {},
+                "value_semantics": "direct_value",
+                "value_argument": "adapter_family",
+            },
+        ])
+        self.assertTrue(all(
+            not metadata
+            for action_type, metadata in rendered.items()
+            if action_type not in {
+                "choose_adapter_family",
+                "rpc_catalog_command",
+            }
+        ))
+
+    def test_structured_intake_registry_validation_is_centralized(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        rpc_spec = next(
+            spec for spec in action_registry.ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        intake = rpc_spec.structured_intake[0]
+
+        cases = (
+            (
+                "globally unique",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            intake,
+                            replace(intake, alias="CUSTOM_RPC"),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "fixed arguments must be allowed",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(("invented", True),),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake value semantics",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(intake, value_semantics="truthy"),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake fixed argument",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(
+                                    ("catalog_command", "not-a-command"),
+                                ),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake contract",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(
+                                    ("catalog_command", "set_endpoint"),
+                                ),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+        )
+        for error, specs in cases:
+            with self.subTest(error=error):
+                with patch.object(action_registry, "ACTION_SPECS", specs):
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        action_registry.validate_action_registry()
+
+    def test_structured_intake_participates_in_registry_identity(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        rpc_spec = next(
+            spec for spec in action_registry.ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        modified = tuple(
+            replace(
+                spec,
+                structured_intake=(
+                    replace(
+                        rpc_spec.structured_intake[0],
+                        alias="custom_rpc_v2",
+                    ),
+                ),
+            )
+            if spec.action_type == "rpc_catalog_command"
+            else spec
+            for spec in action_registry.ACTION_SPECS
+        )
+        baseline = action_registry.action_registry_contract_hash()
+        with patch.object(action_registry, "ACTION_SPECS", modified):
+            changed = action_registry.action_registry_contract_hash()
+        self.assertNotEqual(baseline, changed)
+
+    def test_action_contract_rejects_missing_and_undeclared_arguments(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        with self.assertRaisesRegex(ValueError, "missing required arguments.*qps_mode"):
+            validate_action_contract({"type": "set_qps_mode", "mutation_explicit": True, "source_evidence": "quick"})
+        with self.assertRaisesRegex(ValueError, "undeclared arguments.*invented"):
+            validate_action_contract({
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "quick",
+                "invented": "value",
+            })
+        with self.assertRaisesRegex(ValueError, "chain_text or chain_candidates"):
+            validate_action_contract({
+                "type": "choose_chain",
+                "source_evidence": "BNB",
+            })
+
+    def test_pending_answer_uses_one_canonical_representation(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        selected = validate_action_contract({
+            "type": "answer_pending",
+            "selected_value": "disabled",
+            "source_evidence": "Disable observability",
+        })
+        manual = validate_action_contract({
+            "type": "answer_pending",
+            "answer": "custom-value",
+            "source_evidence": "Use custom-value",
+        })
+
+        self.assertNotIn("answer", selected)
+        self.assertNotIn("selected_value", manual)
+        with self.assertRaisesRegex(
+            ValueError,
+            "conflicting answer and selected_value representations",
+        ):
+            validate_action_contract({
+                "type": "answer_pending",
+                "answer": "Disabled",
+                "selected_value": "disabled",
+                "source_evidence": "Disable observability",
+            })
+
+    def test_optional_empty_model_arguments_are_equivalent_to_omission(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        action = validate_action_contract({
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_method",
+            "rpc_method": "eth_getBalance",
+            "source_evidence": "use eth_getBalance",
+            "rpc_endpoint": "",
+            "rpc_schema_evidence": None,
+        })
+
+        self.assertEqual(
+            action,
+            {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_getBalance",
+                "source_evidence": "use eth_getBalance",
+            },
+        )
+
+    def test_parser_rejects_invalid_action_instead_of_leaking_arguments(self) -> None:
+        from agent.harness.semantic_admission import _parse_action_queue
+
+        parsed = _parse_action_queue(
+            '{"actions":[{"type":"set_qps_override","qps_overrides":{"initial":1},"extra":true}]}'
+        )
+        self.assertEqual(parsed["actions"][0]["type"], "unknown")
+        self.assertIn("undeclared arguments", parsed["actions"][0]["reason"])
+        self.assertNotIn("extra", parsed["actions"][0])
+
+    def test_model_cannot_forge_semantic_admission_receipt(self) -> None:
+        from agent.harness.semantic_admission import _parse_action_queue
+
+        parsed = _parse_action_queue(
+            '{"actions":[{"type":"choose_target_mode","target_mode":"fake-node",'
+            '"target_mode_explicit":true,"source_evidence":"simulated node",'
+            '"semantic_purpose_verified":true}]}'
+        )
+
+        self.assertEqual(parsed["actions"][0]["type"], "unknown")
+        self.assertIn("undeclared arguments", parsed["actions"][0]["reason"])
+
+    def test_compound_action_constraints_are_admitted_once_at_registry_boundary(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        with self.assertRaisesRegex(ValueError, "set_endpoint requires rpc_endpoint"):
+            validate_action_contract({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "source_evidence": "set endpoint",
+            })
+        with self.assertRaisesRegex(ValueError, "does not accept: rpc_method"):
+            validate_action_contract({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": "https://example.invalid",
+                "rpc_method": "eth_chainId",
+                "source_evidence": "use https://example.invalid and eth_chainId",
+            })
+        with self.assertRaisesRegex(ValueError, "exact wire method token"):
+            validate_action_contract({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "my own RPC method",
+                "source_evidence": "my own RPC method",
+            })
+        self.assertEqual(
+            validate_action_contract({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_blockNumber",
+                "source_evidence": "eth_blockNumber",
+            })["rpc_method"],
+            "eth_blockNumber",
+        )
+        self.assertEqual(
+            validate_action_contract({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "GET /v1/blocks/{height}",
+                "source_evidence": "GET /v1/blocks/{height}",
+            })["rpc_method"],
+            "GET /v1/blocks/{height}",
+        )
+        with self.assertRaisesRegex(ValueError, "must total 100"):
+            validate_action_contract({
+                "type": "rpc_workload_command",
+                "workload_scope": "mixed_replace",
+                "rpc_weights": {"eth_chainId": 70},
+            })
+        with self.assertRaisesRegex(ValueError, "duration stop condition requires"):
+            validate_action_contract({
+                "type": "set_sync_observe_options",
+                "sync_observe_stop_condition": "duration",
+            })
+
+    def test_nested_arguments_are_rejected_by_current_action_contract(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        with self.assertRaisesRegex(ValueError, "arguments.v1 is retired"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "arguments": {"topic": "current_config"},
+            })
+
+    def test_sync_observe_metric_consultation_is_a_registered_read_only_topic(self) -> None:
+        from agent.harness.action_registry import (
+            ACTION_BY_TYPE,
+            CONSULTATION_TOPIC_PURPOSES,
+            validate_action_contract,
+        )
+        from agent.harness.context import action_schema
+
+        action = validate_action_contract({
+            "type": "answer_opening_question",
+            "topic": "sync_observe_metrics",
+            "subject": "bsc",
+            "source_evidence": "What native metrics does BSC sync-observe report?",
+        })
+
+        self.assertEqual(action["topic"], "sync_observe_metrics")
+        self.assertEqual(action["subject"], "bsc")
+        self.assertIn("sync_observe_metrics", CONSULTATION_TOPIC_PURPOSES)
+        self.assertEqual(ACTION_BY_TYPE["answer_opening_question"].effect, "read_only")
+        consultation = next(
+            item
+            for item in action_schema()
+            if item["type"] == "answer_opening_question"
+        )
+        self.assertIn(
+            "sync_observe_metrics",
+            consultation["topic_subject_policies"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "exact supported chain scalar"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "sync_observe_metrics",
+                "subject": "MGas/s",
+                "source_evidence": "Should MGas/s be N/A?",
+            })
+
+        with self.assertRaisesRegex(ValueError, "exact supported chain scalar"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "sync_observe_metrics",
+                "subject": "Ethereum Geth node",
+                "source_evidence": "Does this apply to an Ethereum Geth node?",
+            })
+
+    def test_config_explanation_requires_bound_subject(self) -> None:
+        from agent.harness.action_registry import (
+            CONSULTATION_TOPIC_PURPOSES,
+            CONSULTATION_TOPIC_ROUTE_GROUPS,
+            CONSULTATION_TOPIC_SUBJECT_POLICIES,
+            validate_action_contract,
+        )
+
+        self.assertIn(
+            "mutable workflow state",
+            CONSULTATION_TOPIC_SUBJECT_POLICIES["config_explanation"],
+        )
+        self.assertIn(
+            "host environment",
+            CONSULTATION_TOPIC_PURPOSES["environment_readiness"],
+        )
+        self.assertNotIn(
+            "sync_observe",
+            CONSULTATION_TOPIC_ROUTE_GROUPS["environment_readiness"],
+        )
+        self.assertEqual(
+            CONSULTATION_TOPIC_ROUTE_GROUPS["sync_observe_metrics"],
+            frozenset({"sync_observe"}),
+        )
+        self.assertEqual(
+            CONSULTATION_TOPIC_ROUTE_GROUPS["sync_observe_behavior"],
+            frozenset({"sync_observe"}),
+        )
+        with self.assertRaisesRegex(ValueError, "exact bound subject"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "topic": "config_explanation",
+                "source_evidence": "What does this stop option mean?",
+            })
+
+        action = validate_action_contract({
+            "type": "answer_opening_question",
+            "topic": "config_explanation",
+            "subject": "sync_observe_stop_condition",
+            "source_evidence": "Can I keep observing until I stop it?",
+        })
+        self.assertEqual(action["subject"], "sync_observe_stop_condition")
+
+    def test_mode_switch_and_config_proposal_publish_full_workflow_scope(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        mode = ACTION_BY_TYPE["choose_target_mode"]
+        proposal = ACTION_BY_TYPE["propose_config_values"]
+
+        self.assertIn("non_mutation_scope", mode.semantic_support_relations)
+        self.assertIn("preserves compatible cross-mode configuration", mode.purpose)
+        self.assertIn("invalidates mode-incompatible", mode.purpose)
+        self.assertIn("endpoint_process", proposal.compiler_groups)
+        self.assertIn("sync_observe", proposal.compiler_groups)
+        self.assertEqual(proposal.target_groups_strategy, "config_values")
+
+    def test_config_proposal_targets_only_groups_present_in_the_transaction(self) -> None:
+        from agent.harness.queue import action_target_groups
+
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {"CLOUD_REGION": "us-1"},
+            }),
+            {"provider_deployment"},
+        )
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {
+                    "NODE_PROMETHEUS_METRICS_URL": "http://node:6060/debug/metrics/prometheus",
+                    "SYNC_OBSERVE_STOP_CONDITION": "until_stopped",
+                },
+            }),
+            {"sync_observe"},
+        )
+        self.assertEqual(
+            action_target_groups({
+                "type": "propose_config_values",
+                "config_values": {
+                    "HAS_ACCOUNTS_DEVICE": False,
+                    "CHAIN_EVM_RPC_URL": "http://node:8545",
+                },
+            }),
+            {"accounts_disk", "chain_auxiliary_endpoints"},
+        )
+
+    def test_production_prompts_defer_routing_and_fields_to_typed_schemas(
+        self,
+    ) -> None:
+        import agent.harness.context as context
+        from agent.harness.hierarchical_planner import (
+            _stage_a_prompt,
+            _stage_b_prompt,
+        )
+
+        self.assertFalse(hasattr(context, "build_action_resolver_prompt"))
+        stage_a = _stage_a_prompt()
+        stage_b = _stage_b_prompt("performance")
+        self.assertIn(
+            "structured_candidates describe terminal syntax only",
+            stage_a,
+        )
+        self.assertIn("declarative assignment of a registered runtime field", stage_a)
+        self.assertIn("registered transition's compatibility and invalidation effects", stage_a)
+        self.assertIn("do not classify intent", stage_a)
+        self.assertIn("do not guess, omit, or repair a route", stage_a)
+        self.assertIn("Follow owner_action_schema exactly", stage_b)
+        self.assertIn(
+            "emit source_evidence only when that action declares it",
+            stage_b,
+        )
+        self.assertNotIn("Always include source_evidence", stage_b)
+        self.assertNotIn("confidence:'low'|'medium'|'high'", stage_b)
+
+    def test_whole_plan_admission_cannot_reassign_context_ownership(self) -> None:
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt("")
+
+        self.assertIn("immutable disposition=context", prompt)
+        self.assertIn("never reinterpret it as complete or support", prompt)
+        self.assertIn("never invent an owner", prompt)
+
+    def test_whole_plan_admission_has_one_response_authority(self) -> None:
+        from agent.harness.semantic_admission import (
+            _semantic_fulfillment_prompt,
+            _whole_plan_fulfillment_policy,
+        )
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt(_whole_plan_fulfillment_policy())
+
+        self.assertIn("action_verdicts", prompt)
+        self.assertIn("unit_verdicts", prompt)
+        self.assertNotIn("{reviews:[", prompt)
+        self.assertNotIn("{unit_reviews:[", prompt)
+        self.assertNotIn("{context_reviews:[", prompt)
+        self.assertNotIn("For unit_reviews", prompt)
+        self.assertNotIn("For context_reviews", prompt)
+        self.assertIn("{reviews:[", _semantic_fulfillment_prompt())
+
+    def test_pending_semantic_policy_preserves_contrastive_option_selection(
+        self,
+    ) -> None:
+        from agent.harness.semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
+
+        self.assertIn(
+            "select only the affirmed option",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+        self.assertIn(
+            "never an answer selecting a rejected option",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+        self.assertIn(
+            "one pending selection",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+
+    def test_all_semantic_authorities_share_framed_request_policy(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_a_admission_prompt,
+            _stage_a_prompt,
+        )
+        from agent.harness.semantic_admission import _semantic_fulfillment_prompt
+        from agent.harness.semantic_policy import FRAMED_REQUEST_SEMANTIC_POLICY
+
+        prompts = (
+            _stage_a_prompt(),
+            _stage_a_admission_prompt(),
+            _semantic_fulfillment_prompt(),
+        )
+        for prompt in prompts:
+            self.assertEqual(prompt.count(FRAMED_REQUEST_SEMANTIC_POLICY), 1)
+            self.assertIn(
+                "only frames whether the same present request can proceed",
+                prompt,
+            )
+            self.assertIn(
+                "separately asks for information, explanation, comparison",
+                prompt,
+            )
+        self.assertNotIn(
+            "A present answer, question, selection",
+            prompts[-1],
+        )
+
+
+    def test_r36_turn_local_lifetime_contract_is_preserved(self) -> None:
+        from agent.harness.action_registry import action_is_turn_local
+
+        for action_type in (
+            "greeting",
+            "answer_opening_question",
+            "request_evidence_analysis",
+            "analyze_evidence",
+            "analyze_report",
+        ):
+            self.assertTrue(action_is_turn_local({"type": action_type}), action_type)
+        self.assertTrue(action_is_turn_local({"type": "inspect_failure"}))
+        self.assertFalse(action_is_turn_local({"type": "choose_target_mode"}))
+
+    def test_retired_custom_rpc_action_has_no_registered_runtime_authority(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        self.assertNotIn("start_custom_rpc", ACTION_BY_TYPE)
+
+    def test_custom_rpc_domains_do_not_execute_retired_omnibus_action(self) -> None:
+        domain_files = (
+            Path(__file__).resolve().parents[1] / "agent/harness/domains/chain_rpc.py",
+            Path(__file__).resolve().parents[1] / "agent/harness/domains/chain_rpc_questions.py",
+            Path(__file__).resolve().parents[1] / "agent/harness/domains/rpc_endpoint.py",
+            Path(__file__).resolve().parents[1] / "agent/harness/domains/rpc_workload.py",
+        )
+        for path in domain_files:
+            self.assertNotIn("start_custom_rpc", path.read_text(encoding="utf-8"), path.name)
+
+
+class ToolContractAuthorityTest(unittest.TestCase):
+    def test_one_tool_registry_generates_schema_and_dispatch_handlers(self) -> None:
+        import agent.tools.executor as executor
+        from agent.tools.schema import TOOL_SPECS, tool_schema
+
+        rendered = {item["function"]["name"]: item["function"] for item in tool_schema()["tools"]}
+        self.assertEqual(set(rendered), {spec.name for spec in TOOL_SPECS})
+        for spec in TOOL_SPECS:
+            self.assertEqual(rendered[spec.name]["parameters"]["properties"], spec.properties)
+            self.assertEqual(rendered[spec.name]["parameters"]["required"], list(spec.required))
+            self.assertTrue(callable(executor.TOOL_OPERATION_BY_NAME[spec.name].handler))
+
+    def test_dispatch_uses_registered_handler_and_rejects_contract_drift(self) -> None:
+        import agent.tools.executor as executor
+
+        handler = Mock(return_value={"status": "ok"})
+        bound = executor.TOOL_OPERATION_BY_NAME["discover_environment"].bind(handler)
+        with patch.dict(executor.TOOL_OPERATION_BY_NAME, {"discover_environment": bound}):
+            self.assertEqual(executor.execute_tool("discover_environment"), {"status": "ok"})
+            handler.assert_called_once_with({})
+        with self.assertRaisesRegex(ValueError, "undeclared arguments.*extra"):
+            executor.execute_tool("discover_environment", {"extra": True})
+        with self.assertRaisesRegex(ValueError, "missing required arguments.*request"):
+            executor.execute_tool("generate_plan", {})
+
+    def test_public_tool_api_remains_available(self) -> None:
+        from agent.tools.executor import execute_tool, load_arguments
+        from agent.tools.schema import tool_schema
+
+        self.assertTrue(callable(execute_tool))
+        self.assertEqual(load_arguments('{"approved": true}'), {"approved": True})
+        self.assertIn("tools", tool_schema())
+
+
+if __name__ == "__main__":
+    unittest.main()

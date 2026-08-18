@@ -5,24 +5,33 @@
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](COMMERCIAL.md)
 [![Benchmark Python 3.8+](https://img.shields.io/badge/benchmark_python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![ADK Python 3.10+](https://img.shields.io/badge/adk_python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Agent Python 3.10+](https://img.shields.io/badge/agent_python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 A production-oriented benchmark framework for blockchain node QPS, latency,
-bottleneck, sync-health, and per-RPC-method analysis, with an ADK-based Agent
-control plane.
+bottleneck, sync-health, and per-RPC-method analysis, with a LangGraph
+Harness-based Agent control plane.
 
 The benchmark execution plane remains deterministic: Vegeta, RPC proxy,
 monitoring collectors, fake-node, report generation, and archiving are still the
 source of truth. The intended human-facing entrypoint is `./bin/anychain-agent`.
-The Agent must use Google ADK for natural-language understanding, typed intent,
-specialized sub-agent delegation, and tool orchestration. Model output may draft
-structured requests, plans, and explanations, but deterministic tools and
-validators own execution gates.
+The product workflow is owned by the LangGraph Harness: it holds checkpointed
+state, routes typed intents to configuration groups, validates every gate, and
+selects the next blocking question. Every model provider implements the same
+Harness contract, while its transport remains provider-specific: OpenAI,
+DeepSeek, and Vertex Gemini use OpenAI-compatible calls; Gemini API-key mode
+uses native `generateContent`; Claude API-key mode uses Anthropic Messages; and
+Vertex Claude uses `rawPredict`. Google ADK is used for exactly one optional
+capability: Gemini `google_search` grounding for unknown-chain/protocol,
+custom-RPC schema, and sync-observe client research (see
+`agent/llm/search_grounding.py`). It never owns a second benchmark wizard or
+conversation loop.
 
-The benchmark engine is the stable execution layer. The Agent routes
-natural-language requests through Google ADK and uses deterministic tools,
-validators, preflight checks, smoke tests, and approval gates before execution.
+The benchmark engine is the stable execution layer. The Agent uses the
+configured LLM for semantic interpretation and evidence-bounded consultation
+or analysis through typed Harness plans. Model output is never an execution
+authority: deterministic tools, validators, preflight checks, smoke tests, and
+approval gates own execution.
 
 ## Contents
 
@@ -49,12 +58,12 @@ Preview the generated benchmark report before running the framework:
 #### Agent Intelligence
 
 - Turn natural-language benchmark goals into structured, validated plans through
-  Google ADK, not terminal keyword matching.
+  the LangGraph Harness, not terminal keyword matching.
 - Detect the local environment and ask only for missing values it cannot safely
   infer.
 - Guide missing configuration through Agent checklists instead of expecting
   users to understand every benchmark variable up front.
-- Use ADK multi-agent orchestration with deterministic tool and validator gates.
+- Use a LangGraph Harness workflow with deterministic tool and validator gates.
 - Score plan risk, run preflight, and require explicit approval before real
   benchmark execution.
 - Run long benchmarks in detached/background mode after user approval, so tests
@@ -72,8 +81,18 @@ Preview the generated benchmark report before running the framework:
 - Generates single or weighted mixed RPC workloads from `config/chains/*.json`.
 - Supports custom RPC methods through `rpc_methods`, `param_formats`, optional
   `param_spec`, REST path bindings, and fake-node fixtures.
+- Validates custom RPC methods and existing-family chain onboarding with live
+  endpoint probes, request/response evidence, fixture recording, and smoke
+  before treating them as supported.
 - Records per-method status, success/failure counts, and P50/P90/P99 latency.
 - Monitors CPU, memory, disk, network, cgroup, sync health, and monitor overhead.
+- Provides `sync-observe` mode for node catch-up observation without RPC load,
+  proxy traffic, Vegeta, or QPS ramp. Reports include block-height progress,
+  MGas/s when client metrics expose it, node process CPU/thread hotspots, disk
+  latency/iowait context, and network throughput. For BSC v1.7.x, the native
+  profile also reports block-insert P50, justified/finalized lag percentiles,
+  transactions, gas/block, gas/second, gas/transaction, TX/block, TPS, and
+  sample quality from the BSC Prometheus endpoint.
 - Produces HTML reports and archives every run.
 - Provides optional Prometheus/Grafana telemetry through a read-only exporter.
 - Exposes JSON CLI tools, an OpenAI-compatible tool schema, and a stable
@@ -84,9 +103,9 @@ Preview the generated benchmark report before running the framework:
 ```text
 prompt or request
   -> AnyChain terminal shell for stable I/O only
-  -> ADK root coordinator
-  -> typed intent path
-  -> specialized sub-agent delegation
+  -> LangGraph Harness checkpointed workflow
+  -> typed LLM intent resolver
+  -> group workflow and fallback path
   -> deterministic tool and validator gates
   -> read-only discovery
   -> benchmark plan
@@ -101,6 +120,9 @@ The Agent is intentionally bounded:
 - It answers framework questions from local docs and live repository state.
 - It reads chain/RPC/fake-node capabilities from current files, not model memory.
 - It produces onboarding plans for unsupported chains or RPC methods.
+- It treats provider docs, web research, and user samples as evidence, not
+  support approval. Endpoint validation, fixture recording, and smoke still
+  decide whether a new chain or custom method is usable.
 - It runs only allowlisted benchmark commands after approval.
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
@@ -119,12 +141,29 @@ cd AnyChainBenchmarkAgent
 
 ### 2. Install The Agent Runtime
 
-Install the isolated ADK terminal runtime first. This does not install ADK into
-the Python environment used by production blockchain nodes:
+Install the isolated LangGraph terminal runtime first. The compatibility paths
+remain `requirements-adk.txt` and `.venv-adk`, but the default install does not
+contain or require Google ADK and does not modify the Python environment used
+by production blockchain nodes:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes
 ```
+
+Gemini `google_search` grounding is a separate optional extra:
+
+```bash
+bash scripts/install_agent_deps.sh --yes --with-google-search
+```
+
+DeepSeek, OpenAI, Claude, and non-search Gemini sessions must start and run
+without that extra. Use `--agent-venv` for the preferred environment option;
+`--adk-venv` remains a compatibility alias.
+
+Startup reports the optional ADK search capability separately. A
+`google-adk is not installed` or `Web research: unavailable` message is
+informational unless the session specifically requires Gemini
+`google_search`; it is not a failure of the core LangGraph Agent runtime.
 
 If you skip this step and start the interactive Agent anyway, the launcher
 checks the required terminal dependency before entering the REPL. When
@@ -135,16 +174,18 @@ are baseline Agent terminal requirements.
 
 If your host does not provide `python3.11`, use any Python 3.10+ interpreter.
 The benchmark engine still supports older Python for non-Agent automation, but
-the Agent requires a Python 3.10+ ADK runtime environment for model-backed
-sessions. The product launcher uses its own terminal workflow and does not ask
-users to run `adk run` directly.
+the Agent requires a Python 3.10+ runtime environment for model-backed
+sessions. The product launcher uses its own LangGraph terminal workflow and
+does not ask users to run `adk run` directly.
 
-Do not start by installing benchmark-engine dependencies manually. In the
-normal Agent flow, users install the Agent runtime once, configure the LLM, then
-let the Agent inspect benchmark dependencies and ask for approval before it
-calls `scripts/install_deps.sh --yes` through the confirmation-gated
-`install_dependencies` tool. Direct `scripts/install_deps.sh` usage is kept for
-CI, Docker images, and non-Agent automation.
+Do not install benchmark-engine dependencies before the Agent has inspected the
+host. In the normal interactive flow, users install the Agent runtime once,
+configure the LLM, and let startup diagnostics identify missing benchmark
+dependencies. The terminal asks for consent and, after `Y`, prints the exact
+`scripts/install_deps.sh --yes` command to run in the current shell; it does not
+execute installation scripts inside the conversation. The programmatic
+`install_dependencies` tool remains approval-gated for controlled platform
+integrations, CI, Docker images, and non-interactive automation.
 
 ### 3. Configure The Agent
 
@@ -169,9 +210,10 @@ commands validate the Agent, and what an assistant must not bypass. Real API
 keys, ADC settings, Vertex settings, and other local provider choices should go
 into `config/agent_config.local.sh`, which is gitignored.
 
-For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
-editing files. For user-only setup, `AGENTS.md` plus this README is usually
-enough to get started.
+For code changes, the assistant must also read `AI_CODING_GUIDE.md`,
+`docs/en/adk-agent-architecture.md`, and
+`docs/en/agent-handoff-product-verification.md` before editing files. For
+user-only setup, `AGENTS.md` plus this README is usually enough to get started.
 
 #### Option B: Manual Setup
 
@@ -181,9 +223,9 @@ If you prefer to configure the project yourself, start with:
 config/agent_config.sh
 ```
 
-Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
-credentials, context compaction, and optional enterprise Knowledge Base
-integration. Every variable has an inline comment.
+Use it to configure the Agent itself: LLM provider, model, authentication,
+optional enterprise Knowledge Base integration, and notification settings.
+Every variable has an inline comment.
 
 Write real secrets and local provider choices to:
 
@@ -201,7 +243,7 @@ service-account modes work for Gemini or `claude` through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="api_key"                   # api_key | google_adc | attached_service_account | service_account_impersonation | service_account_file
 GEMINI_API_KEY=""                         # or GOOGLE_API_KEY, required for Gemini API-key mode
 ANTHROPIC_API_KEY=""                      # required for `claude` API-key mode
@@ -212,6 +254,10 @@ GOOGLE_CLOUD_LOCATION="global"           # Vertex AI location/region
 GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # required for service_account_impersonation
 GOOGLE_APPLICATION_CREDENTIALS=""         # required only for service_account_file
 ```
+
+Model IDs and regional availability are provider-controlled. Select a model
+available for the chosen auth path and verify it with
+`python3 -m agent.cli llm-config` before starting a model-backed session.
 
 Choose one authentication path:
 
@@ -228,22 +274,31 @@ Choose one authentication path:
   `google_adc`, `attached_service_account`, `service_account_impersonation`, or
   `service_account_file`.
 
-Web research is provider-limited. ADK `google_search` is enabled only when the
-Agent is running with a Gemini-family model and valid Gemini/Google
-authentication. `claude` on Vertex, DeepSeek, OpenAI, and `claude` API-key modes
+Web research is provider-limited. ADK `google_search` can be enabled only when
+the optional `--with-google-search` extra is installed and the Agent is running
+with a Gemini-family model and valid Gemini/Google authentication. `claude` on
+Vertex, DeepSeek, OpenAI, and `claude` API-key modes
 do not enable ADK `google_search`; in those modes the Agent uses repository
 facts and optional enterprise KB evidence, or asks you to provide official docs
 and request/response samples.
 
 Google Cloud CLI is needed only for local ADC workflows such as
 `LLM_AUTH_MODE=google_adc`, or when a host must create ADC before
-service-account impersonation. The Agent can detect whether `gcloud` and the
-local ADC file are present through `doctor`; after explicit approval it can
-install Google Cloud CLI with:
+service-account impersonation. The complete structured doctor report detects
+whether `gcloud` and the local ADC file are present:
+
+```bash
+python3 -m agent.cli doctor
+```
+
+Install Google Cloud CLI explicitly when the report says it is required:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes --with-gcloud
 ```
+
+Add `--with-google-search` only when this environment also needs Gemini web
+research.
 
 After `gcloud` is available, create local ADC credentials when that auth mode
 is used:
@@ -262,8 +317,8 @@ bash <(curl -sSL https://storage.googleapis.com/cloud-samples-data/adc/setup_adc
 ```
 
 That flow authorizes the environment and writes Application Default Credentials,
-usually under `~/.config/gcloud/application_default_credentials.json`. The
-Agent's `doctor` step should verify that ADC is present before using
+usually under `~/.config/gcloud/application_default_credentials.json`. Run
+`python3 -m agent.cli doctor` to verify that ADC is present before using
 `LLM_AUTH_MODE=google_adc`.
 
 On GCE/GKE/Cloud Run with an attached service account, `gcloud` is not required
@@ -278,8 +333,10 @@ config/user_config.sh
 ```
 
 You normally do not need to understand or edit all benchmark variables up
-front. Start the Agent, run `doctor`, describe what you want to test, and let
-the Agent tell you which required values are missing.
+front. The interactive terminal runs read-only diagnostics automatically at
+startup. Describe what you want to test, and let the Agent tell you which
+required values are missing. Use `doctor` in the session when you need to
+rerun the checks or troubleshoot the environment.
 
 When the Agent submits a job, it writes:
 
@@ -293,7 +350,7 @@ runs. Do not edit it by hand; it exists so reports and analysis can prove which
 values were used.
 
 Agent-launched jobs default to `.agent/jobs`. Low-level
-`python3 agent/cli.py submit` uses the same location unless `--jobs-dir` is
+`python3 -m agent.cli submit` uses the same location unless `--jobs-dir` is
 provided.
 
 ### 4. Validate The Agent Configuration
@@ -302,8 +359,8 @@ Validate the Agent and LLM configuration before starting an interactive
 session:
 
 ```bash
-python3 agent/cli.py adk-status
-python3 agent/cli.py llm-config
+python3 -m agent.cli adk-status
+python3 -m agent.cli llm-config
 ```
 
 You can leave benchmark details such as chain, RPC URL, disk, and machine
@@ -314,9 +371,10 @@ required values before a real run.
 
 ### 5. Start The Agent
 
-Start the Agent. This command opens the AnyChain product terminal. Google ADK
-owns natural-language understanding and orchestration, while the terminal owns
-stable input/output and startup checks:
+Start the Agent. This command opens the AnyChain product terminal. The
+LangGraph Harness owns workflow state, group routing, validation, and execution
+approval; Google ADK is only used for the optional Gemini `google_search`
+grounding capability:
 
 ```bash
 ./bin/anychain-agent
@@ -324,12 +382,13 @@ stable input/output and startup checks:
 
 Then talk to it from the `User>` prompt. The Agent replies as `Agent>`, keeps
 the response language aligned with the user's input, stores job/session
-artifacts under `.agent`, and asks for explicit approval before installing
-dependencies, running smoke, or launching a benchmark job.
+artifacts under `.agent`, asks for consent before providing dependency-install
+commands, and requires explicit approval before smoke or benchmark execution.
 
 ```text
 User> doctor
-Agent> ...summarizes dependencies and asks before installing anything...
+Agent> ...reruns the read-only summary and, when dependencies are missing, asks
+       before showing the external installation command...
 
 User> I want to benchmark a Solana node.
 Agent> ...asks whether this is a fake-node closed-loop test or a real node...
@@ -341,13 +400,20 @@ Agent> ...confirms host, disk, network, RPC mode, workload, and optional
 User> Use mixed workload with getSlot 70% and getBlockHeight 30%.
 Agent> ...generates a benchmark plan, runs preflight, then asks before smoke
        and again before launching the benchmark...
+
+User> Observe my BSC node while it is syncing. Do not send RPC benchmark load.
+Agent> ...routes to sync-observe, confirms sync-health reference, node process,
+       optional metrics endpoint, disk/network metadata, and stop condition...
 ```
 
-Use a readiness check first on a new host. The Agent has a read-only doctor tool
-for cloud/deployment detection, dependencies, LLM/Vertex configuration,
-Knowledge Base configuration, and current framework capability coverage.
-If benchmark dependencies are missing, the Agent should explain the planned
-changes and ask for explicit approval before installing them.
+The Agent automatically runs a read-only startup check for cloud/deployment
+detection, dependencies, and current framework capability coverage, so
+`doctor` does not need to be the first input on a new host. Use `doctor` to
+rerun the check. For the complete structured LLM/Vertex, Knowledge Base, and
+authentication details, use `python3 -m agent.cli doctor`.
+If benchmark dependencies are missing, the interactive Agent explains the
+requirement and asks for consent before showing the external shell command. It
+does not run that installer inside the conversation.
 
 Real benchmark execution still uses confirmation-gated tools and must pass
 preflight and smoke before launch. The model output is never executed directly.
@@ -459,16 +525,22 @@ are:
 - `openai`: OpenAI API key.
 - `deepseek`: DeepSeek API key through the OpenAI-compatible endpoint.
 
+ADK `google_search` is enabled only when the optional search extra is installed,
+the Gemini-family model and Gemini/Google authentication are valid, and the ADK
+tool is usable. Its scope is unknown-chain/protocol, custom-RPC schema, and
+sync-observe client research. Search evidence does not replace endpoint probes,
+fixture recording, template validation, or fake-node smoke.
+
 Validate the config without calling a model:
 
 ```bash
-python3 agent/cli.py llm-config
+python3 -m agent.cli llm-config
 ```
 
 Run a real provider smoke only after credentials are configured:
 
 ```bash
-python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
+python3 -m agent.cli llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
 ## Integrations And Operations
@@ -478,12 +550,12 @@ python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
 The project can be embedded into enterprise Agent platforms in several ways:
 
 - **Terminal mode**: run `./bin/anychain-agent` in a controlled shell session.
-- **Programmatic mode**: call `python3 agent/cli.py` subcommands and exchange
+- **Programmatic mode**: call `python3 -m agent.cli` subcommands and exchange
   JSON for `doctor`, `plan`, `preflight`, `submit`, `status`, `analyze`,
   `artifact-qa`, and `capabilities`.
-- **Tool-schema mode**: call `python3 agent/cli.py tool-schema` to export an
+- **Tool-schema mode**: call `python3 -m agent.cli tool-schema` to export an
   OpenAI-compatible function-tool schema for enterprise Agent orchestrators.
-- **Tool-call mode**: call `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+- **Tool-call mode**: call `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`
   when a platform wants one stable command to execute a named Agent tool.
 
 For enterprise use, configure `config/agent_config.sh` once in the runtime
@@ -508,16 +580,16 @@ For a generic HTTP KB/RAG service, configure `AGENT_KNOWLEDGE_PROVIDER=http`.
 Validate the adapter with:
 
 ```bash
-python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
+python3 -m agent.cli knowledge-smoke --query "solana rpc methods" --chain solana
 ```
 
 Enterprise Agent platforms can inspect and call the tool catalog directly:
 
 ```bash
-python3 agent/cli.py --help
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py tool-call --name draft_request \
+python3 -m agent.cli --help
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli tool-call --name draft_request \
   --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true,"qps_max":1,"source_prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}'
 ```
 
@@ -525,9 +597,10 @@ For deterministic CI that does not require a conversational terminal, use the
 JSON control-plane commands:
 
 ```bash
-python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
-python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+python3 -m agent.cli plan --request /tmp/request.json --output /tmp/plan.json --dry-run
+python3 -m agent.cli preflight --plan /tmp/plan.json
+python3 -m agent.cli tool-call --name run_fake_node_smoke_benchmark \
+  --arguments '{"plan_file":"/tmp/plan.json","approved":true}'
 ```
 
 ### Reports And Artifacts
@@ -555,10 +628,10 @@ For low-level CLI job commands, job state defaults to `.agent/jobs` unless
 Agent job helpers:
 
 ```bash
-python3 agent/cli.py jobs
-python3 agent/cli.py resume --job-id <job_id>
-python3 agent/cli.py logs --job-id <job_id>
-python3 agent/cli.py diagnose-artifacts --artifact-index <agent-output-dir>/jobs/<job_id>/artifact_index.json
+python3 -m agent.cli jobs
+python3 -m agent.cli resume --job-id <job_id>
+python3 -m agent.cli logs --job-id <job_id>
+python3 -m agent.cli diagnose-artifacts --artifact-index <agent-output-dir>/jobs/<job_id>/artifact_index.json
 ```
 
 `diagnose-artifacts` applies deterministic bottleneck rules to available CSVs:
@@ -597,7 +670,7 @@ Grafana and only need this framework to expose a scrape endpoint.
 Use the Agent to inspect gaps before editing templates:
 
 ```bash
-python3 agent/cli.py gap-analysis \
+python3 -m agent.cli gap-analysis \
   --chain solana \
   --method getBalance \
   --method customMethod
@@ -606,7 +679,7 @@ python3 agent/cli.py gap-analysis \
 Generate a plugin-style onboarding package:
 
 ```bash
-python3 agent/cli.py onboarding-plan \
+python3 -m agent.cli onboarding-plan \
   --chain foochain \
   --adapter-family jsonrpc \
   --method foo_getBalance \
@@ -616,7 +689,7 @@ python3 agent/cli.py onboarding-plan \
 Generate a conservative chain template draft for human review:
 
 ```bash
-python3 agent/cli.py draft-chain-template \
+python3 -m agent.cli draft-chain-template \
   --chain foochain \
   --adapter-family jsonrpc \
   --method foo_getBalance \
@@ -626,6 +699,32 @@ python3 agent/cli.py draft-chain-template \
 
 The draft is marked `needs_review`; it is not automatically installed into
 `config/chains`.
+
+### Custom RPC And Existing-Family Chains
+
+Existing chains can use custom RPC methods when the request shape is expressible
+by `param_formats`, `_meta.rest_paths`, or `param_spec`. The Agent must validate
+the user-provided endpoint and method payload before execution. User-provided
+request/response samples help draft the workload, but they are not trusted until
+the same method succeeds against a reachable endpoint and the resulting fixture
+passes fake-node smoke.
+
+Parameter wire shape and parameter meaning are separate gates. Zero-parameter
+methods keep explicit empty params. Positional/object methods preserve list
+order or object keys and confirm each parameter's index/name, JSON wire type,
+blockchain semantic type or encoding, meaning, required/optional status, and
+example. `single_replace` uses one validated method; `mixed_replace` removes
+template defaults; `mixed_add` retains them. Active mixed weights are positive
+integers totaling exactly 100, and all changes stay in a job-local override.
+
+For a new chain that appears to belong to an existing adapter family, a chain
+template is the starting point, not the proof of support. The onboarding flow
+must still classify the protocol, validate at least one safe method against a
+reachable endpoint, define request params and workload weights, record fixtures,
+and pass preflight plus fake-node smoke. EVM-compatible endpoints such as Flow
+EVM can usually follow the JSON-RPC family path. API products that share a
+provider but not the protocol, such as a Greenfield billing REST API, must not
+be treated as BSC/EVM JSON-RPC without validation.
 
 For unsupported chains, the Agent returns an onboarding plan instead of editing
 code automatically. The usual path is:
@@ -650,8 +749,10 @@ smoke.
 - [AI Assistant Operator Guide](AGENTS.md)
 - [Configuration Guide](config/README.md)
 - [Agent Control Plane](agent/README.md)
-- [ADK Agent Architecture](docs/en/adk-agent-architecture.md)
+- [Agent Architecture](docs/en/adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](docs/en/anychain-agent-ai-work-gate.md)
+- [Agent CLI Verification Guide](docs/en/agent-cli-verification-guide.md)
+- [External AI Handoff and Product Verification](docs/en/agent-handoff-product-verification.md)
 - [Full Framework Reference](docs/en/framework-reference.md)
 - [Framework Flow and Data Lifecycle](docs/en/framework-flow.md)
 - [Module Guide](docs/en/module-guide.md)

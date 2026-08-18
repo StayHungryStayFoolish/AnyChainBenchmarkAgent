@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from agent.utils.redaction import redact
-except ImportError:  # pragma: no cover - legacy script execution path
-    from utils.redaction import redact
+from agent.utils.redaction import redact
 
 
 def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None) -> str:
@@ -58,16 +55,6 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
             lines.append(f"- {item}")
     else:
         lines.append("- none")
-
-    questions = safe_plan.get("required_questions", [])
-    if questions:
-        lines.extend(["", "## Required Questions", ""])
-        for question in questions:
-            lines.append(f"- [{question.get('severity')}] {question.get('id')}: {question.get('prompt')}")
-            if question.get("candidates"):
-                lines.append(f"  candidates: {', '.join(_format_candidate(item) for item in question['candidates'])}")
-            if question.get("missing"):
-                lines.append(f"  missing: {', '.join(question['missing'])}")
 
     checklist = safe_plan.get("configuration_checklist", {})
     if checklist:
@@ -136,25 +123,8 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
         "",
         "## Stop / Rollback",
         "",
-        "- Use `python3 agent/cli.py status --job-id <job_id>` to inspect a submitted job.",
+        "- Use `python3 -m agent.cli status --job-id <job_id>` to inspect a submitted job.",
         "- Use the benchmark framework cleanup path for any active benchmark process.",
     ])
 
     return "\n".join(lines) + "\n"
-
-
-def _format_candidate(item: Any) -> str:
-    if not isinstance(item, dict):
-        return str(item)
-    name = str(item.get("name", "") or "<unknown>")
-    details = []
-    for key, label in (
-        ("size", "size"),
-        ("mountpoint", "mount"),
-        ("fstype", "fs"),
-        ("label", "label"),
-    ):
-        value = item.get(key)
-        if value:
-            details.append(f"{label}={value}")
-    return f"{name} ({', '.join(details)})" if details else name

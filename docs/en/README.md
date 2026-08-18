@@ -1,8 +1,11 @@
 # English Documentation
 
+- [AI Assistant Operator Guide](../../AGENTS.md)
 - [Framework Flow and Data Lifecycle](framework-flow.md)
-- [AnyChain ADK Agent Architecture](adk-agent-architecture.md)
+- [AnyChain Agent Architecture](adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](anychain-agent-ai-work-gate.md)
+- [Agent CLI Verification Guide](agent-cli-verification-guide.md)
+- [External AI Handoff and Product Verification](agent-handoff-product-verification.md)
 - [Module Guide](module-guide.md)
 - [Full Framework Reference](framework-reference.md)
 - [How to Add a Chain or RPC Method](how-to-add-chain.md)
@@ -11,9 +14,10 @@
 - [GitHub PR Gates and Branch Protection](github-pr-gates.md)
 - [GitHub PR Workflow](github-pr-workflow.md)
 
-The English and Chinese docs intentionally keep the same long-lived content
-areas. Temporary task plans, debugging transcripts, and one-off implementation
-plans should not be committed as public docs.
+The English and Chinese docs intentionally keep the same long-lived user-facing
+content areas. AI-facing gate documents may be English-only when they are meant
+for coding agents and maintainers. Temporary task plans, debugging transcripts,
+and one-off implementation plans should not be committed as public docs.
 
 Related docs:
 

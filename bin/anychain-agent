@@ -5,6 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "$REPO_ROOT"
+
+# The dependency installer places vegeta in $HOME/bin by default. Keep the
+# Agent runtime PATH aligned with the benchmark runtime without editing user
+# shell profiles.
+export PATH="$HOME/bin:$PATH"
+
 if [[ -f "$REPO_ROOT/config/agent_config.sh" ]]; then
   # Load persistent Agent defaults. Environment variables set by the caller
   # still win because agent_config.sh uses ${VAR:-default} assignments.
@@ -37,40 +43,47 @@ for arg in "$@"; do
   fi
 done
 
-has_prompt_toolkit() {
+has_agent_runtime() {
   "$AGENT_PYTHON" - <<'PY' >/dev/null 2>&1
+import langgraph
+import langgraph.checkpoint.sqlite
+import openai
 import prompt_toolkit
 PY
 }
 
-bootstrap_agent_terminal_deps() {
+bootstrap_agent_runtime() {
   if [[ ! -x "$REPO_ROOT/scripts/install_agent_deps.sh" ]]; then
-    echo "Agent terminal dependency is missing: prompt-toolkit." >&2
+    echo "Agent runtime dependencies are missing or incomplete." >&2
     echo "Installer was not found: scripts/install_agent_deps.sh" >&2
     exit 1
   fi
 
-  echo "Agent terminal dependency is missing: prompt-toolkit." >&2
-  echo "It is required for reliable Ctrl+C and Chinese/wide-character input editing." >&2
+  echo "Agent runtime dependencies are missing or incomplete." >&2
+  echo "LangGraph, the provider client, and prompt-toolkit are required." >&2
   printf "Install Agent dependencies into the isolated environment now? [Y/n] " >&2
   read -r answer
   case "${answer:-Y}" in
     y|Y|yes|YES|Yes|"")
       bash "$REPO_ROOT/scripts/install_agent_deps.sh" --yes
-      if [[ -x "$REPO_ROOT/.venv-adk/bin/python" ]]; then
+      if [[ -x "$REPO_ROOT/.venv-adk/bin/python" ]] && is_usable_python "$REPO_ROOT/.venv-adk/bin/python"; then
         AGENT_PYTHON="$REPO_ROOT/.venv-adk/bin/python"
+      else
+        echo "Agent dependency install did not produce a usable Python 3.10+ runtime." >&2
+        echo "Run: bash scripts/install_agent_deps.sh --yes --python-bin /path/to/python3.10+" >&2
+        exit 1
       fi
       ;;
     *)
-      echo "Cannot start interactive AnyChain Agent without prompt-toolkit." >&2
+      echo "Cannot start interactive AnyChain Agent without its core runtime." >&2
       echo "Run: bash scripts/install_agent_deps.sh --yes" >&2
       exit 1
       ;;
   esac
 }
 
-if [[ "$uses_scripted_prompt" == "0" ]] && ! has_prompt_toolkit; then
-  bootstrap_agent_terminal_deps
+if [[ "$uses_scripted_prompt" == "0" ]] && ! has_agent_runtime; then
+  bootstrap_agent_runtime
 fi
 
-exec "$AGENT_PYTHON" agent/terminal/repl.py "$@"
+exec "$AGENT_PYTHON" -m agent.terminal.repl "$@"

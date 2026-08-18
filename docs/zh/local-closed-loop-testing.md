@@ -112,6 +112,9 @@ python3 tools/fake-node/runtime_probe.py --help
 
 如果新增、删除或调整 mixed-mode RPC method 权重，先完成下面验证，再跑完整 benchmark：
 
+`weight` 必须是正整数。缺失、非法或为 0 的权重都会被归一化为 `1`；如果不希望某个
+method 出现在生成的 Vegeta targets 中，需要从 `mixed_weighted` 中移除。
+
 ```bash
 # 1. 确认 chain template 可以构造所有 mixed targets。
 python3 tests/test_chain_adapters.py

@@ -1,10 +1,10 @@
-"""Chain template validation wrappers for ADK tools."""
+"""Chain template validation wrappers for deterministic Agent tools."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from planners.chain_template_requirements import inspect_chain_template
+from agent.planners.chain_template_requirements import inspect_chain_template
 
 
 def validate_chain_template(chain: str) -> dict[str, Any]:

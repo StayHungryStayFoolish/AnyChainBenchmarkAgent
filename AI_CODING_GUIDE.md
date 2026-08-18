@@ -38,7 +38,40 @@ Before coding:
 If the request is ambiguous in a way that could change the implementation,
 ask or state the assumption explicitly. Silent guesses create expensive rework.
 
-## 3. Keep It Simple
+## 3. Design Gate Before Code
+
+Do not repair complex framework behavior with ad hoc patches.
+
+Before changing code for architecture, runtime behavior, workflow automation,
+file lifecycle, monitoring, or public configuration:
+
+- Identify the authoritative task/design document for the change.
+- If no document exists, create one before editing code.
+- If the document exists but is incomplete, contradictory, or outdated, update
+  and review it before editing code.
+- Record the root cause, files in scope, files explicitly out of scope,
+  success criteria, verification commands, and rollback/cleanup expectations.
+- Confirm the proposed change solves the root problem rather than hiding the
+  symptom with a local workaround.
+- If an observed failure exposes a missing or incorrect design constraint,
+  update the task/design document first. The document must name the proper fix,
+  why local patch code would be wrong, and how the fix avoids new technical
+  debt.
+
+Do not use "temporary" code paths, fallback brains, compatibility wrappers,
+phrase patches, duplicated state, or local special cases to make one failing
+scenario pass unless the design document explicitly permits that tradeoff.
+
+Do not treat a passing test or transcript as sufficient when the fix is a local
+patch around an architectural gap. A fix is acceptable only when the design,
+state model, validation path, and cleanup expectations remain coherent after
+the change.
+
+For trivial single-file fixes, the design gate can be a short written plan in
+the work log. For multi-file or complex workflow changes, it must be a project
+document.
+
+## 4. Keep It Simple
 
 Write the smallest solution that fully solves the current problem.
 
@@ -53,7 +86,7 @@ Avoid:
 Duplication is often cheaper than the wrong abstraction. Abstract only when the
 second or third real use case makes the shape obvious.
 
-## 4. Make Surgical Changes
+## 5. Make Surgical Changes
 
 Keep diffs narrow and intentional.
 
@@ -65,7 +98,7 @@ Keep diffs narrow and intentional.
 
 Every changed line should have a clear reason connected to the request.
 
-## 5. Verify Behavior
+## 6. Verify Behavior
 
 Code that has not been verified is only a guess.
 
@@ -85,7 +118,7 @@ When adding behavior:
 
 If tests were already failing before your change, report that clearly.
 
-## 6. Work Toward a Clear Goal
+## 7. Work Toward a Clear Goal
 
 Turn vague tasks into verifiable outcomes.
 
@@ -101,7 +134,7 @@ Examples:
 For multi-step work, outline the steps before making broad changes. Update the
 plan as facts change.
 
-## 7. Debug by Investigating
+## 8. Debug by Investigating
 
 Do not guess at fixes.
 
@@ -115,7 +148,7 @@ When something fails:
 
 If stuck, report what was tried, what was observed, and what remains uncertain.
 
-## 8. Be Careful With Dependencies
+## 9. Be Careful With Dependencies
 
 Do not add packages casually.
 
@@ -130,7 +163,7 @@ Before adding a dependency, check:
 When adding a dependency, explain why it is needed and why simpler options are
 not enough.
 
-## 9. Communicate Precisely
+## 10. Communicate Precisely
 
 Keep communication useful and specific.
 
@@ -143,7 +176,7 @@ Keep communication useful and specific.
 Avoid vague claims like "should work" when a concrete verification result can be
 provided.
 
-## 10. Watch for Common Failure Modes
+## 11. Watch for Common Failure Modes
 
 Stop and reconsider if you notice any of these patterns:
 

@@ -120,9 +120,7 @@ show_status() {
     
     # Check RPC connection
     echo "🔗 RPC Connection Test:"
-    if curl -s -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
-        "$LOCAL_RPC_URL" >/dev/null 2>&1; then
+    if get_block_height "$LOCAL_RPC_URL" >/dev/null 2>&1; then
         echo "✅ Local RPC: $LOCAL_RPC_URL"
     else
         echo "❌ Local RPC: $LOCAL_RPC_URL (Connection failed)"
@@ -273,9 +271,7 @@ pre_check() {
     fi
     
     # Check RPC connection
-    if ! curl -s -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
-        "$LOCAL_RPC_URL" >/dev/null 2>&1; then
+    if ! get_block_height "$LOCAL_RPC_URL" >/dev/null 2>&1; then
         echo "❌ Error: Cannot connect to RPC endpoint: $LOCAL_RPC_URL"
         return 1
     fi

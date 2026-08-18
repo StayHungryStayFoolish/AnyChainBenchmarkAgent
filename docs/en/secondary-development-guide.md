@@ -36,9 +36,10 @@ Agent-launched benchmark:
 
 ```text
 user prompt
--> ADK root coordinator
--> typed intent path
--> specialized sub-agent
+-> terminal I/O shell
+-> LangGraph Harness typed intent path
+-> group workflow and checkpoint state
+-> optional Gemini google_search grounding function at its three scoped call sites
 -> deterministic tool and validator gates
 -> benchmark plan
 -> preflight and risk checks
@@ -86,11 +87,9 @@ Development locations:
 - `agent/knowledge/base.py`: provider contract.
 - `agent/knowledge/http_provider.py`: generic HTTP adapter.
 - `agent/knowledge/loader.py`: provider selection.
-- `agent/adk_app/instructions.py`: how ADK should ground KB evidence and avoid
-  unsupported claims.
-- `agent/adk_app/tools/read_only.py`: ADK read-only tools that expose KB search
-  and local capability evidence.
-- `agent/cli.py`: smoke commands and integration entrypoints.
+- `agent/tools/executor.py`: exposes the `knowledge_search` tool that queries
+  the configured KB provider and local capability evidence.
+- `agent.cli` (implemented in `agent/cli.py`): smoke commands and integration entrypoints; invoke it with `python3 -m agent.cli`.
 
 Expected contract:
 
@@ -112,7 +111,7 @@ POST /workload/suggest
 Validation:
 
 ```bash
-python3 agent/cli.py knowledge-smoke
+python3 -m agent.cli knowledge-smoke
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -130,23 +129,29 @@ an internal Agent platform instead of only as a terminal chat.
 
 Development locations:
 
-- `agent/cli.py`: JSON CLI entrypoint.
+- `agent.cli` (implemented in `agent/cli.py`): JSON CLI entrypoint; invoke it with `python3 -m agent.cli`.
 - `agent/tools/schema.py`: OpenAI-compatible tool catalog.
 - `agent/tools/executor.py`: stable named tool execution.
 - `config/agent_config.sh`: LLM, Google auth, and optional KB defaults.
 - `agent/runners/job_manager.py`: job status, artifact index, and detached run
   lifecycle.
-- `agent/adk_app/instructions.py`: root ADK instruction.
-- `agent/adk_app/tools/`: ADK function-tool wrappers.
-- `agent/adk_app/evals/`: no-key ADK package and tool-contract checks.
+- `agent/llm/search_grounding.py`: the sole `google-adk` consumer (optional
+  Gemini `google_search` grounding); all other tool wrappers are retired.
+
+The platform's core integration depends on the LangGraph runtime in
+`requirements-adk.txt`; that filename is a compatibility alias and does not
+install Google ADK. Add `--with-google-search` to
+`scripts/install_agent_deps.sh` only when the platform explicitly needs Gemini
+search grounding. DeepSeek/OpenAI/Claude integrations must not import or require
+`google.adk`.
 
 Supported integration modes:
 
 - Human terminal: `./bin/anychain-agent`
-- JSON CLI: `python3 agent/cli.py <command>`
-- Tool schema export: `python3 agent/cli.py tool-schema`
+- JSON CLI: `python3 -m agent.cli <command>`
+- Tool schema export: `python3 -m agent.cli tool-schema`
 - Named tool call:
-  `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+  `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`
 
 Typical platform tools:
 
@@ -179,9 +184,9 @@ Boundaries:
 Validation:
 
 ```bash
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py tool-call --name discover_environment
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli tool-call --name discover_environment
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -239,7 +244,8 @@ Closed-loop check:
 ```
 
 Then ask the Agent to create a fake-node smoke benchmark for the new chain,
-run preflight, run the mock job, and analyze the generated archive.
+run preflight, run an isolated fake-node smoke job, and analyze the generated
+archive.
 
 PR expectations:
 
@@ -258,7 +264,7 @@ Development locations:
 - `tools/chain_adapters/base.py`
 - `tools/fake-node/handlers/<family>.go`
 - `tools/fake-node/configs/<family>.yaml`
-- `tools/fake-node/main.go` if the handler registry needs an entry
+- `tools/fake-node/fake_node.go` if the handler registry needs an entry
 - `config/chains/<chain>.json`
 - `docs/en/how-to-add-chain.md`
 - `docs/zh/how-to-add-chain.md`
@@ -306,6 +312,18 @@ Development locations:
 
 For simple methods, use `param_formats`. For positional params, object params,
 REST path params, query params, or request bodies, use `param_spec`.
+
+Do not infer parameter semantics from JSON syntax alone. Preserve explicit
+empty params for zero-parameter methods. For positional and object methods,
+preserve list order or object keys and confirm each parameter's index/name,
+JSON wire type, blockchain semantic type or encoding, meaning,
+required/optional status, and example. Probe the confirmed wire request against
+a reachable validation endpoint before catalog admission.
+
+Runtime workload scope is job-local: `single_replace` selects one validated
+method, `mixed_replace` drops template defaults, and `mixed_add` retains them.
+All active mixed weights are positive integers totaling exactly 100. None of
+these choices may mutate `config/chains/<chain>.json`.
 
 Example three-argument method:
 
@@ -360,7 +378,7 @@ Development locations:
 Rules:
 
 - `mixed_weighted` is the source of weighted mixed-mode generation.
-- Weights should sum to 100 for readability.
+- Every enabled weight must be a positive integer, and the total must equal exactly 100.
 - Sync-health RPC methods should not be counted as workload methods.
 - Per-method report charts should only describe benchmark workload traffic.
 

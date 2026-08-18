@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
-from .base import ChainAdapter, register, _vegeta_get, _vegeta_post_json, _try_int, _b64
+from .base import ChainAdapter, register, _vegeta_get, _vegeta_post_json, _try_int, _b64, load_chain_template
 from .param_spec import apply_rest_param_spec, build_jsonrpc_params, get_param_spec
 from .rest import _is_fake_node_url
 from .url_overrides import first_url, resolve_param
@@ -44,8 +44,7 @@ class BitcoinJsonRpcAdapter(ChainAdapter):
 
     def _load_chain(self, chain_name: str) -> dict:
         if chain_name not in self._chain_cache:
-            with open(_CHAINS_DIR / f"{chain_name}.json") as f:
-                self._chain_cache[chain_name] = json.load(f)
+            self._chain_cache[chain_name] = load_chain_template(chain_name)
         return self._chain_cache[chain_name]
 
     def _auth_header(self) -> Optional[str]:

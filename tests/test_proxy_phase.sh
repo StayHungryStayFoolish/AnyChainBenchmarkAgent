@@ -20,6 +20,7 @@ trap 'cleanup' EXIT
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SCRIPT_DIR="$REPO_ROOT"
 export BLOCKCHAIN_NODE="solana"
+export ACTIVE_CHAIN_TEMPLATE_FILE="$REPO_ROOT/config/chains/solana.json"
 export PROXY_LISTEN_PORT="18545"
 
 WORK_DIR="$(mktemp -d -t bnb-proxy-itest-XXXX)"
@@ -27,7 +28,7 @@ export LOGS_DIR="$WORK_DIR/logs"
 mkdir -p "$LOGS_DIR"
 
 FAKE_PORT="19101"
-FAKE_BIN="/tmp/fake-node-v2"
+FAKE_BIN="${FAKE_NODE_BIN:-$WORK_DIR/fake-node-v2}"
 FAKE_LOG="$WORK_DIR/fake-node.log"
 FAKE_PID=""
 RPC_METHOD="getBalance"
@@ -59,7 +60,15 @@ fail() {
 
 echo "=== Step 1: start fake-node v2 on :$FAKE_PORT ==="
 if [[ ! -x "$FAKE_BIN" ]]; then
-    fail "fake-node v2 binary not found at $FAKE_BIN"
+    if ! command -v go >/dev/null 2>&1; then
+        fail "fake-node binary is unavailable and Go is not installed"
+    fi
+    if ! (
+        cd "$REPO_ROOT/tools/fake-node"
+        go build -o "$FAKE_BIN" .
+    ); then
+        fail "could not build fake-node from the tracked source"
+    fi
 fi
 "$FAKE_BIN" -chain=solana -port="$FAKE_PORT" >"$FAKE_LOG" 2>&1 &
 FAKE_PID=$!

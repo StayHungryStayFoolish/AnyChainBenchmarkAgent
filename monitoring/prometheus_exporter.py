@@ -181,6 +181,103 @@ def collect_proxy_method_metrics(proxy_csv: Path, allowed_methods: set[str], max
     return metrics
 
 
+def read_latest_csv_row(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            rows = csv.DictReader(fh)
+            latest: dict[str, Any] = {}
+            for row in rows:
+                if row:
+                    latest = dict(row)
+            return latest
+    except OSError:
+        return {}
+
+
+def emit_latest_csv_metrics(builder: PrometheusBuilder, latest_row: dict[str, Any], labels: dict[str, Any]) -> None:
+    if not latest_row:
+        return
+
+    for field, metric, help_text in (
+        ("cpu_iowait", "cpu_iowait_percent", "CPU iowait percent from performance_latest.csv."),
+        ("execution_mgas_per_sec", "execution_mgas_per_sec", "Node execution throughput in million gas per second when exposed by client metrics."),
+        ("execution_gas_per_sec", "execution_gas_per_sec", "Node execution throughput in gas per second when exposed by client metrics."),
+        ("node_process_cpu_pct", "node_process_cpu_percent", "Observed blockchain node process CPU percent."),
+        ("node_thread_count", "node_thread_count", "Observed blockchain node thread count."),
+        ("node_hottest_thread_cpu_pct", "node_hottest_thread_cpu_percent", "CPU percent of the hottest observed node thread."),
+        ("node_hottest_thread_core", "node_hottest_thread_core", "CPU core id running the hottest observed node thread."),
+        ("node_hottest_core_cpu_pct", "node_hottest_core_cpu_percent", "CPU percent of the hottest core used by the node process."),
+        ("node_cpu_concentration_top1_pct", "node_cpu_concentration_top1_percent", "Node CPU concentration in the hottest thread/core."),
+        ("node_cpu_concentration_top5_pct", "node_cpu_concentration_top5_percent", "Node CPU concentration across the top five threads/cores."),
+        ("node_process_rss_mib", "node_process_rss_mebibytes", "Observed blockchain node process resident memory in MiB."),
+        ("node_process_memory_pct", "node_process_memory_percent", "Observed blockchain node process resident memory as a percentage of host memory."),
+        ("local_block_height", "local_block_height", "Local node block height from performance_latest.csv."),
+        ("mainnet_block_height", "mainnet_block_height", "Reference/mainnet block height from performance_latest.csv."),
+        ("block_height_diff", "block_height_diff_csv", "Reference minus local block height difference from performance_latest.csv."),
+        ("freshness_gap_seconds", "sync_freshness_gap_seconds_csv", "Local progress freshness gap from performance_latest.csv."),
+    ):
+        builder.gauge(metric, help_text, latest_row.get(field), labels)
+
+    execution_labels = {
+        **labels,
+        "source": latest_row.get("execution_metric_source", "unknown"),
+        "status": latest_row.get("execution_metric_status", "unknown"),
+    }
+    builder.gauge(
+        "execution_metric_available",
+        "Whether node execution/MGas metrics were available in the latest CSV row.",
+        1 if to_float(latest_row.get("execution_mgas_per_sec")) is not None or to_float(latest_row.get("execution_gas_per_sec")) is not None else 0,
+        execution_labels,
+    )
+
+    client_labels = {
+        **labels,
+        "client_profile": latest_row.get("client_metric_profile", "none"),
+        "quality": latest_row.get("client_metric_quality", "unavailable"),
+    }
+    for field, metric, help_text in (
+        ("client_block_insert_ms_p50", "client_block_insert_milliseconds_p50", "Client-native block insertion duration P50 in milliseconds."),
+        ("client_import_mgas_per_sec_p50", "client_import_mgas_per_sec_p50", "Client-native imported-block execution throughput P50 in million gas per second."),
+        ("client_block_tx_count", "client_block_transactions", "Transactions in the latest client-native imported-block sample."),
+        ("client_block_gas_used", "client_block_gas_used", "Gas used by the latest client-native imported-block sample."),
+        ("client_head_block", "client_head_block", "Client-native imported head block height."),
+        ("client_justified_block", "client_justified_block", "Client-native justified block height."),
+        ("client_finalized_block", "client_finalized_block", "Client-native finalized block height."),
+    ):
+        builder.gauge(metric, help_text, latest_row.get(field), client_labels)
+    builder.gauge(
+        "client_import_observation_count",
+        "Client-native execution observations represented by the latest resetting summary scrape.",
+        latest_row.get("client_import_observation_count"),
+        client_labels,
+    )
+    builder.counter(
+        "client_inserted_blocks_total",
+        "Client-native inserted-block observations represented by the latest summary.",
+        latest_row.get("client_inserted_blocks_count"),
+        client_labels,
+    )
+    builder.gauge(
+        "client_metric_profile_available",
+        "Whether a client-native metric profile produced at least partial data in the latest CSV row.",
+        1 if str(latest_row.get("client_metric_quality") or "").lower() in {"complete", "partial"} else 0,
+        client_labels,
+    )
+
+    node_labels = {
+        **labels,
+        "status": latest_row.get("node_cpu_status", "unknown"),
+        "pid": latest_row.get("node_process_pid", ""),
+        "hottest_thread": latest_row.get("node_hottest_thread_name", ""),
+    }
+    builder.gauge(
+        "node_cpu_attribution_available",
+        "Whether node process/thread CPU attribution was available in the latest CSV row.",
+        1 if to_float(latest_row.get("node_process_cpu_pct")) is not None else 0,
+        node_labels,
+    )
+
+
 def build_metrics(
     memory_dir: Path,
     logs_dir: Path,
@@ -200,10 +297,12 @@ def build_metrics(
     sync_cache = read_json(memory_dir / "block_height_monitor_cache.json")
     bottleneck = read_json(memory_dir / "bottleneck_status.json")
     qps_status = read_json(memory_dir / "qps_status.json")
+    latest_csv = read_latest_csv_row(logs_dir / "performance_latest.csv")
 
     builder.gauge("exporter_up", "Exporter scrape succeeded.", 1, labels)
     builder.gauge("artifact_latest_metrics_present", "Whether latest_metrics.json is readable.", 1 if latest else 0, labels)
     builder.gauge("artifact_sync_cache_present", "Whether block_height_monitor_cache.json is readable.", 1 if sync_cache else 0, labels)
+    builder.gauge("artifact_performance_csv_present", "Whether performance_latest.csv is readable.", 1 if latest_csv else 0, labels)
 
     for field, metric, help_text in (
         ("cpu_usage", "cpu_usage_percent", "CPU usage percent from latest metrics."),
@@ -230,11 +329,15 @@ def build_metrics(
         sync_labels,
     )
     for field, metric, help_text in (
+        ("local_block_height", "local_block_height", "Local node block height from sync cache."),
+        ("mainnet_block_height", "mainnet_block_height", "Reference/mainnet block height from sync cache."),
         ("block_height_diff", "block_height_diff", "Target minus local block height difference."),
         ("lag_value", "sync_lag_value", "Reported sync lag value."),
         ("freshness_gap_seconds", "sync_freshness_gap_seconds", "Local progress freshness gap in seconds."),
     ):
         builder.gauge(metric, help_text, sync_cache.get(field), sync_labels)
+
+    emit_latest_csv_metrics(builder, latest_csv, labels)
 
     detected = str(bottleneck.get("bottleneck_detected", "false")).lower() == "true"
     bottleneck_types = bottleneck.get("bottleneck_types") if isinstance(bottleneck.get("bottleneck_types"), list) else []

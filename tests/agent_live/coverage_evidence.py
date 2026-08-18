@@ -1,0 +1,6293 @@
+"""Tamper-evident artifacts for compiled-graph and real PTY evidence."""
+
+from __future__ import annotations
+
+import csv
+import base64
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import time
+import urllib.parse
+import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+from tests.agent_live.coverage_events import state_diff_between
+from agent.harness.runtime_identity import repository_revision
+from agent.runners.artifact_ownership import (
+    ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    derive_artifact_owner_roots,
+    required_artifact_owner,
+    validate_owned_artifact_path,
+)
+
+from agent.harness.control_receipts import (
+    validate_persisted_domain_control_receipt,
+)
+from agent.runners.execution_scenarios import (
+    EXECUTION_SCENARIOS,
+    scenario_by_id,
+    workflow_type_from_plan,
+)
+from agent.runners.plan_projection import validate_execution_plan_projection
+from agent.runners.runtime_env_projection import validate_runtime_env_projection
+from agent.harness.secret_refs import (
+    redact_secret_references,
+    secret_references_in_value,
+)
+from agent.utils.redaction import redact, secret_values
+from tests.agent_live.real_execution_host_attestation import (
+    validate_host_attestation_file,
+)
+from tests.agent_live.export_approved_plan import validate_approved_plan_artifact
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ARTIFACT_SCHEMA_VERSION = 4
+CLI_ARTIFACT_SCHEMA_VERSION = 6
+REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 4
+TURN_OBSERVATION_SCHEMA_VERSION = 2
+PTY_DIAGNOSTIC_SCHEMA_VERSION = 2
+PTY_AUTHORITY_SCHEMA_VERSION = 2
+PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION = 1
+SENSITIVE_INPUT_MARKER = "***SENSITIVE_INPUT***"
+PTY_DIAGNOSTIC_STATUSES = {
+    "failed_attempt": frozenset({
+        "verification_pending", "verification_error", "postcondition_failed",
+    }),
+    "interruption": frozenset({"interrupted"}),
+}
+
+
+@dataclass(frozen=True)
+class _PtyBundleAuthorityView(Mapping[str, Any]):
+    """Authority receipt proven to be a member of one committed shard bundle."""
+
+    receipt: Mapping[str, Any]
+    bundle_digest: str
+    artifact_id: str
+    artifact_hash: str
+
+    def __getitem__(self, key: str) -> Any:
+        return self.receipt[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.receipt)
+
+    def __len__(self) -> int:
+        return len(self.receipt)
+
+
+@dataclass(frozen=True)
+class G5RuntimeContract:
+    schema_version: int
+    contract_id: str
+    chain_id: str
+    image_digest: str
+    image_reference: str
+    rpc_url: str
+    metrics_url: str
+    compose_service: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+G5_RUNTIME_CONTRACT = G5RuntimeContract(
+    schema_version=1,
+    contract_id="phase-e-g5-local-geth-v1",
+    chain_id="0x539",
+    image_digest="sha256:746d19134a870e0c83760eee5897696678b0e57c1f73e3392254fcd8426e5782",
+    image_reference="ethereum/client-go@sha256:746d19134a870e0c83760eee5897696678b0e57c1f73e3392254fcd8426e5782",
+    rpc_url="http://geth-dev:8545",
+    metrics_url="http://geth-dev:6060/debug/metrics/prometheus",
+    compose_service="geth-dev",
+)
+
+
+@dataclass(frozen=True)
+class G5ScenarioAdmission:
+    sequence_index: int
+    predecessor_scenario_id: str = ""
+    endpoint_env_var: str = ""
+
+
+G5_SCENARIO_ADMISSION = {
+    "rpc_fake_node_smoke": G5ScenarioAdmission(sequence_index=1),
+    "rpc_real_node_smoke": G5ScenarioAdmission(
+        sequence_index=2,
+        predecessor_scenario_id="rpc_fake_node_smoke",
+        endpoint_env_var="LOCAL_RPC_URL",
+    ),
+    "rpc_real_node_final": G5ScenarioAdmission(
+        sequence_index=3,
+        predecessor_scenario_id="rpc_real_node_smoke",
+        endpoint_env_var="LOCAL_RPC_URL",
+    ),
+    "sync_observe_bounded": G5ScenarioAdmission(
+        sequence_index=4,
+        predecessor_scenario_id="rpc_real_node_final",
+        endpoint_env_var="SYNC_OBSERVE_RPC_URL",
+    ),
+}
+
+
+def g5_scenario_admission(scenario_id: str) -> G5ScenarioAdmission:
+    try:
+        return G5_SCENARIO_ADMISSION[scenario_id]
+    except KeyError as exc:
+        raise ValueError(f"scenario has no G5 admission contract: {scenario_id}") from exc
+EXECUTION_EVIDENCE_CLASSES = frozenset(
+    {"deterministic", "real_cli", "dynamic_dual_ai", "real_execution"}
+)
+COMPILED_GRAPH_RUNNER = "tests.agent_live.graph_turn.invoke_product_graph_turn"
+PTY_REAL_CLI_RUNNER = "tests.agent_live.pty.real_cli"
+PTY_DYNAMIC_DUAL_AI_RUNNER = "tests.agent_live.pty.dynamic_dual_ai"
+REAL_EXECUTION_RUNNER = "tests.agent_live.real_execution.integration"
+
+
+@dataclass(frozen=True)
+class PtyCliTurnRecord:
+    """One observed PTY turn, including state and transcript fingerprints."""
+
+    session_id: str
+    turn_index: int
+    previous_agent_response: str
+    user_message: str
+    agent_response: str
+    provider: str
+    model: str
+    before_fingerprint: str
+    after_fingerprint: str
+    transcript_hash: str
+    previous_response_received_at_ns: int
+    user_message_submitted_at_ns: int
+    agent_response_received_at_ns: int
+
+
+@dataclass(frozen=True)
+class RuntimeTurnEvent:
+    """One product-process event read from ``ANYCHAIN_AGENT_TURN_EVENT_FILE``."""
+
+    schema_version: int
+    event_type: str
+    thread_id: str
+    session_purpose: str
+    before_fingerprint: str
+    after_fingerprint: str
+    turn_index: int
+    active_group: str
+    pending_question_id: str
+    action_queue_types: tuple[str, ...]
+    observation: str = ""
+    pending_contract: Mapping[str, Any] = field(default_factory=dict)
+    revision: Mapping[str, str] = field(default_factory=dict)
+    admitted_action_types: tuple[str, ...] = ()
+    admitted_action_targets: tuple[Mapping[str, str], ...] = ()
+    admitted_action_provenance: tuple[Mapping[str, Any], ...] = ()
+    turn_receipt_summary: Mapping[str, Any] = field(default_factory=dict)
+    pending_transition: Mapping[str, Any] = field(default_factory=dict)
+    render_manifest: Mapping[str, Any] = field(default_factory=dict)
+    execution_receipt_summary: Mapping[str, Any] = field(default_factory=dict)
+    control_receipts: tuple[Mapping[str, Any], ...] = ()
+    state_diff_hashes: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    material_state_diff_hashes: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
+    after_value_hashes: Mapping[str, str] = field(default_factory=dict)
+    next_result: Mapping[str, Any] = field(default_factory=dict)
+    runtime_event_id: str = ""
+    runtime_event_sequence: int | None = None
+    runtime_event_payload_hash: str = ""
+    terminal_event_id: str = ""
+    transaction_id: str = ""
+    terminal_outcome: str = ""
+    render_hash: str = ""
+    base_revision: int | None = None
+    base_checkpoint_thread_id: str = ""
+    base_checkpoint_id: str = ""
+    product_revision: int | None = None
+    product_checkpoint_thread_id: str = ""
+    product_checkpoint_id: str = ""
+    product_authority_id: str = ""
+    physical_thread_id: str = ""
+    attempt_checkpoint_id: str = ""
+
+
+@dataclass(frozen=True)
+class VerifiedPostcondition:
+    """Facts independently checked after a PTY turn.
+
+    The PTY transport cannot produce this record. A Linux/Docker integration
+    must inspect the committed checkpoint or resulting job artifacts and name
+    the verifier it used.
+    """
+
+    verifier_id: str
+    passed: bool
+    observed_coverage_ids: tuple[str, ...]
+    admitted_typed_actions: tuple[str, ...]
+    state_diff: Mapping[str, Any]
+    next_question_or_result: Mapping[str, Any]
+    details: Mapping[str, Any]
+    job_artifacts: tuple[Mapping[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class TurnObservation:
+    """Revision-bound observed turn shared by PTY coverage consumers."""
+
+    seed: int
+    revision: Mapping[str, str]
+    target_edge_key: str
+    target_contract_hash: str
+    target_variant_hash: str
+    prior_agent_response: str
+    simulator_decision: Mapping[str, Any]
+    exact_user_turn: str
+    provider: str
+    model: str
+    before_turn_index: int
+    after_turn_index: int
+    before_state_fingerprint: str
+    after_state_fingerprint: str
+    pending_contract: Mapping[str, Any]
+    runtime_events: tuple[RuntimeTurnEvent, ...]
+    verified_postcondition: VerifiedPostcondition
+    continuation_turns: tuple[PtyCliTurnRecord, ...] = ()
+    continuation_simulator_decisions: tuple[Mapping[str, Any], ...] = ()
+    schema_version: int = TURN_OBSERVATION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class DynamicTurnSelection:
+    """Auditable response-driven decision made by the Codex user simulator."""
+
+    persona: str
+    goal: str
+    selected_message: str
+    rationale: str
+    target_coverage_ids: tuple[str, ...]
+    selected_at_ns: int
+    simulator: str = "codex"
+    selection_mode: str = "response_driven"
+
+
+@dataclass(frozen=True)
+class PtyDiagnosticRecord:
+    """Non-qualifying diagnostic for one completed PTY boundary.
+
+    Diagnostics are intentionally separate from coverage evidence.  A failed
+    attempt may contain the just-completed turn; an interruption may contain
+    only the last boundary that was fully observed before transport failed.
+    """
+
+    diagnostic_kind: str
+    verification_status: str
+    target_id: str
+    target_edge_key: str
+    revision: Mapping[str, str]
+    session_id: str
+    reason: str
+    last_complete_response: str
+    input_baseline_event: RuntimeTurnEvent
+    last_complete_event: RuntimeTurnEvent
+    completed_turn: PtyCliTurnRecord | None = None
+    dynamic_selection: DynamicTurnSelection | None = None
+    verified_postcondition: VerifiedPostcondition | None = None
+    schema_version: int = PTY_DIAGNOSTIC_SCHEMA_VERSION
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def content_hash(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _pty_authority_event_bindings(
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if artifact.get("artifact_type") == "pty_cli_turn":
+        observation = artifact.get("turn_observation") or {}
+        events = (
+            observation.get("runtime_events") or ()
+            if isinstance(observation, Mapping)
+            else ()
+        )
+    elif artifact.get("artifact_type") == "pty_diagnostic":
+        boundary = artifact.get("last_complete_boundary") or {}
+        events = (
+            (
+                boundary.get("input_baseline_event"),
+                boundary.get("runtime_event"),
+            )
+            if isinstance(boundary, Mapping)
+            else ()
+        )
+    else:
+        raise ValueError("PTY authority requires a CLI or diagnostic artifact")
+    bindings = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise ValueError("PTY authority source has an invalid runtime event")
+        bindings.append({
+            "runtime_event_id": str(event.get("runtime_event_id") or ""),
+            "runtime_event_payload_hash": str(
+                event.get("runtime_event_payload_hash") or ""
+            ),
+            "terminal_event_id": str(event.get("terminal_event_id") or ""),
+            "turn_index": int(event.get("turn_index") or 0),
+            "before_fingerprint": str(event.get("before_fingerprint") or ""),
+            "after_fingerprint": str(event.get("after_fingerprint") or ""),
+        })
+    return bindings
+
+
+@dataclass(frozen=True)
+class PtyAuthoritySigner:
+    """Controller-held signer. Never serialize or pass this object to a worker."""
+
+    private_key: Ed25519PrivateKey
+    public_key_b64: str
+    trust_root_id: str
+
+
+def create_pty_authority_signer() -> PtyAuthoritySigner:
+    private_key = Ed25519PrivateKey.generate()
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    public_key_b64 = base64.b64encode(public_bytes).decode("ascii")
+    return PtyAuthoritySigner(
+        private_key=private_key,
+        public_key_b64=public_key_b64,
+        trust_root_id=content_hash({"ed25519_public_key": public_key_b64}),
+    )
+
+
+def export_pty_authority_private_key(
+    signer: PtyAuthoritySigner,
+) -> bytes:
+    """Serialize a signer only for an inherited controller-only pipe."""
+
+    return signer.private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def import_pty_authority_private_key(
+    private_bytes: bytes,
+    *,
+    expected_public_key_b64: str,
+) -> PtyAuthoritySigner:
+    """Rebuild a signer from controller-private bytes received over a pipe."""
+
+    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    public_key_b64 = base64.b64encode(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    if public_key_b64 != expected_public_key_b64:
+        raise ValueError("controller private key differs from frozen trust root")
+    return PtyAuthoritySigner(
+        private_key=private_key,
+        public_key_b64=public_key_b64,
+        trust_root_id=content_hash({"ed25519_public_key": public_key_b64}),
+    )
+
+
+def sign_controller_payload(
+    signer: PtyAuthoritySigner,
+    payload: Mapping[str, Any],
+) -> str:
+    return base64.b64encode(
+        signer.private_key.sign(canonical_json(payload).encode("utf-8"))
+    ).decode("ascii")
+
+
+def verify_controller_payload_signature(
+    payload: Mapping[str, Any],
+    *,
+    signature_b64: str,
+    trusted_public_key_b64: str,
+) -> bool:
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(trusted_public_key_b64, validate=True)
+        )
+        public_key.verify(
+            base64.b64decode(signature_b64, validate=True),
+            canonical_json(payload).encode("utf-8"),
+        )
+    except (InvalidSignature, TypeError, ValueError):
+        return False
+    return True
+
+
+def _pty_authority_unsigned_payload(
+    artifact: Mapping[str, Any],
+    *,
+    trust_root_id: str,
+    controller_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact_type = str(artifact.get("artifact_type") or "")
+    identity_field = (
+        "evidence_id"
+        if artifact_type == "pty_cli_turn"
+        else "diagnostic_id"
+    )
+    body = {
+        "schema_version": PTY_AUTHORITY_SCHEMA_VERSION,
+        "signature_algorithm": "ed25519",
+        "trust_root_id": str(trust_root_id),
+        "artifact_type": artifact_type,
+        "artifact_id": str(artifact.get(identity_field) or ""),
+        "artifact_hash": str(artifact.get("artifact_hash") or ""),
+        "target_edge_key": str(artifact.get("edge_key") or artifact.get(
+            "target_edge_key"
+        ) or ""),
+        "revision": dict(artifact.get("revision") or {}),
+        "runtime_event_bindings": _pty_authority_event_bindings(artifact),
+        "controller_context": dict(controller_context or {}),
+    }
+    if (
+        not body["artifact_id"]
+        or not body["artifact_hash"]
+        or not body["target_edge_key"]
+        or not body["runtime_event_bindings"]
+        or not body["trust_root_id"]
+    ):
+        raise ValueError("PTY authority identity is incomplete")
+    return body
+
+
+def build_pty_authority_receipt(
+    artifact: Mapping[str, Any],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sign an already validated candidate from the controller boundary."""
+
+    body = _pty_authority_unsigned_payload(
+        artifact,
+        trust_root_id=signer.trust_root_id,
+        controller_context=controller_context,
+    )
+    signature = signer.private_key.sign(canonical_json(body).encode("utf-8"))
+    receipt = {
+        **body,
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+    receipt["authority_hash"] = content_hash(receipt)
+    return receipt
+
+
+def validate_pty_authority_receipt(
+    artifact: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    *,
+    trusted_public_key_b64: str,
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate a receipt signature without granting shard qualification."""
+
+    raw = dict(authority)
+    observed_hash = str(raw.pop("authority_hash", "") or "")
+    signature_b64 = str(raw.pop("signature", "") or "")
+    if (
+        authority.get("schema_version") != PTY_AUTHORITY_SCHEMA_VERSION
+        or content_hash({**raw, "signature": signature_b64}) != observed_hash
+    ):
+        return False, "PTY authority receipt hash is invalid"
+    try:
+        expected = _pty_authority_unsigned_payload(
+            artifact,
+            trust_root_id=content_hash({
+                "ed25519_public_key": trusted_public_key_b64,
+            }),
+            controller_context=expected_controller_context,
+        )
+        if raw != expected:
+            return False, "PTY artifact differs from its signed authority receipt"
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(trusted_public_key_b64, validate=True)
+        )
+        public_key.verify(
+            base64.b64decode(signature_b64, validate=True),
+            canonical_json(raw).encode("utf-8"),
+        )
+    except (InvalidSignature, TypeError, ValueError) as exc:
+        return False, f"PTY authority source is invalid: {exc}"
+    return True, ""
+
+
+def _pty_authority_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "authority.json"
+
+
+def _pty_pair_commit_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "COMMIT.json"
+
+
+def _pty_admitted_artifact_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "artifact.json"
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic PTY admission requires renameat2")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(
+                f"PTY admission bundle already exists: {destination}"
+            )
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def _load_pty_admitted_bundle(
+    artifact_path: str | Path,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    candidate = Path(artifact_path)
+    bundle = candidate.with_suffix(".admitted")
+    artifact_file = _pty_admitted_artifact_path(candidate)
+    authority_file = _pty_authority_path(candidate)
+    commit_file = _pty_pair_commit_path(candidate)
+    if (
+        bundle.is_symlink()
+        or not bundle.is_dir()
+        or bundle.stat().st_mode & 0o222
+        or {entry.name for entry in bundle.iterdir()}
+        != {"artifact.json", "authority.json", "COMMIT.json"}
+    ):
+        raise ValueError("PTY artifact has no admitted bundle")
+    if any(
+        item.is_symlink()
+        or not item.is_file()
+        or item.stat().st_mode & 0o222
+        for item in (artifact_file, authority_file, commit_file)
+    ):
+        raise ValueError("PTY admitted bundle must be immutable")
+    try:
+        artifact_bytes = artifact_file.read_bytes()
+        authority_bytes = authority_file.read_bytes()
+        commit_bytes = commit_file.read_bytes()
+        artifact = json.loads(artifact_bytes)
+        authority = json.loads(authority_bytes)
+        commit = json.loads(commit_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("PTY admitted bundle is incomplete") from exc
+    if not all(isinstance(item, dict) for item in (artifact, authority, commit)):
+        raise ValueError("PTY admitted bundle contains a non-object")
+    expected_commit = {
+        "schema_version": 1,
+        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+    }
+    if commit != expected_commit:
+        raise ValueError("PTY admitted bundle commit marker is stale")
+    bundle_digest = content_hash({
+        **expected_commit,
+        "commit_sha256": hashlib.sha256(commit_bytes).hexdigest(),
+    })
+    return artifact, authority, bundle_digest
+
+
+def load_pty_authority_receipt(artifact_path: str | Path) -> dict[str, Any]:
+    _artifact, authority, _digest = _load_pty_admitted_bundle(artifact_path)
+    return authority
+
+
+def load_pty_admitted_artifact(artifact_path: str | Path) -> dict[str, Any]:
+    artifact, _authority, _digest = _load_pty_admitted_bundle(artifact_path)
+    return artifact
+
+
+def pty_admitted_bundle_digest(artifact_path: str | Path) -> str:
+    _artifact, _authority, digest = _load_pty_admitted_bundle(artifact_path)
+    return digest
+
+
+def _pty_staging_paths(artifact_path: Path) -> tuple[Path, ...]:
+    return tuple(
+        artifact_path.parent.glob(f"{artifact_path.stem}.admitted.tmp.*")
+    )
+
+
+def _remove_pty_directory(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        for root, directories, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            root_path.chmod(0o700)
+            for name in directories:
+                child = root_path / name
+                if not child.is_symlink():
+                    child.chmod(0o700)
+            for name in files:
+                child = root_path / name
+                if not child.is_symlink():
+                    child.chmod(0o600)
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def recover_pty_artifact_pair(
+    artifact_path: str | Path,
+    *,
+    expected_artifact: Mapping[str, Any] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Remove abandoned staging and recognize one completed commit point."""
+
+    path = Path(artifact_path)
+    bundle_path = path.with_suffix(".admitted")
+    with _pty_artifact_bundle_lock(bundle_path):
+        return _recover_pty_artifact_pair_unlocked(
+            path,
+            expected_artifact=expected_artifact,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def _recover_pty_artifact_pair_unlocked(
+    path: Path,
+    *,
+    expected_artifact: Mapping[str, Any] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    for staging in _pty_staging_paths(path):
+        _remove_pty_directory(staging)
+    bundle_path = path.with_suffix(".admitted")
+    if not bundle_path.exists():
+        _fsync_directory(path.parent)
+        return None
+    artifact, authority, _digest = _load_pty_admitted_bundle(path)
+    if expected_artifact is not None and artifact != dict(expected_artifact):
+        raise FileExistsError(
+            f"PTY admission bundle belongs to another artifact: {bundle_path}"
+        )
+    if signer is not None:
+        valid, reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=signer.public_key_b64,
+            expected_controller_context=controller_context,
+        )
+        if not valid:
+            raise ValueError(
+                f"PTY admitted bundle has invalid controller authority: {reason}"
+            )
+    _fsync_directory(bundle_path)
+    _fsync_directory(bundle_path.parent)
+    return bundle_path
+
+
+def _write_pty_artifact_pair(
+    artifact: Mapping[str, Any],
+    artifact_path: Path,
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    """Publish an artifact and controller receipt as one recoverable pair."""
+
+    authority = build_pty_authority_receipt(
+        artifact,
+        signer=signer,
+        controller_context=controller_context,
+    )
+    bundle_path = artifact_path.with_suffix(".admitted")
+    staging = artifact_path.with_suffix(
+        f".admitted.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    artifact_bytes = (
+        json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    published = False
+    try:
+        staging.mkdir(mode=0o700)
+        admitted_artifact = staging / "artifact.json"
+        admitted_authority = staging / "authority.json"
+        admitted_commit = staging / "COMMIT.json"
+        admitted_artifact.write_bytes(artifact_bytes)
+        admitted_authority.write_text(
+            json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        commit = {
+            "schema_version": 1,
+            "artifact_sha256": hashlib.sha256(
+                admitted_artifact.read_bytes()
+            ).hexdigest(),
+            "authority_sha256": hashlib.sha256(
+                admitted_authority.read_bytes()
+            ).hexdigest(),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+        }
+        admitted_commit.write_text(
+            json.dumps(commit, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        for path in (admitted_artifact, admitted_authority, admitted_commit):
+            path.chmod(0o400)
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+        _fsync_directory(staging)
+        staging.chmod(0o500)
+        _rename_directory_noreplace(staging, bundle_path)
+        published = True
+        _fsync_directory(bundle_path)
+        _fsync_directory(bundle_path.parent)
+    except Exception:
+        if published:
+            raise RuntimeError(
+                "PTY artifact pair durability is uncertain; "
+                "retry reconciliation is required"
+            )
+        if staging.exists():
+            _remove_pty_directory(staging)
+            _fsync_directory(staging.parent)
+        raise
+    return bundle_path
+
+
+def admit_pty_artifact_pair(
+    artifact_path: str | Path,
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    path = Path(artifact_path)
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(artifact, dict):
+        raise ValueError("PTY artifact candidate is not an object")
+    with _pty_artifact_bundle_lock(path.with_suffix(".admitted")):
+        recovered = _recover_pty_artifact_pair_unlocked(
+            path,
+            expected_artifact=artifact,
+            signer=signer,
+            controller_context=controller_context,
+        )
+        if recovered is not None:
+            return recovered
+        return _write_pty_artifact_pair(
+            artifact,
+            path,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def remove_pty_artifact_pair(artifact_path: str | Path) -> None:
+    path = Path(artifact_path)
+    path.with_suffix(".json.tmp").unlink(missing_ok=True)
+    rollback_pty_artifact_admission(path)
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
+
+
+def rollback_pty_artifact_admission(artifact_path: str | Path) -> None:
+    """Remove publication state while preserving the unsigned candidate."""
+
+    path = Path(artifact_path)
+    bundle_path = path.with_suffix(".admitted")
+    with _pty_artifact_bundle_lock(bundle_path):
+        for staging in _pty_staging_paths(path):
+            _remove_pty_directory(staging)
+        _remove_pty_directory(bundle_path)
+        _fsync_directory(path.parent)
+
+
+def _json_file_bytes(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(dict(value), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _pty_artifact_bundle_staging_paths(bundle_path: Path) -> tuple[Path, ...]:
+    return tuple(bundle_path.parent.glob(f"{bundle_path.name}.tmp.*"))
+
+
+def _pty_artifact_bundle_recovery_marker(bundle_path: Path) -> Path:
+    return bundle_path.with_name(f".{bundle_path.name}.recovery-required")
+
+
+def _create_pty_artifact_bundle_recovery_marker(bundle_path: Path) -> Path:
+    """Persist the fail-closed gate before the publication commit point."""
+
+    marker = _pty_artifact_bundle_recovery_marker(bundle_path)
+    descriptor = os.open(
+        marker,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o400,
+    )
+    try:
+        payload = _json_file_bytes({
+            "schema_version": 1,
+            "bundle_path": bundle_path.name,
+            "created_at_ns": time.time_ns(),
+        })
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(marker.parent)
+    return marker
+
+
+def _clear_pty_artifact_bundle_recovery_marker(bundle_path: Path) -> None:
+    """Durably move recovery state from required to clear.
+
+    Directory entry removal is not committed until its parent fsync succeeds.
+    If that commit fails, restore the required marker before reporting failure.
+    A failed restore is surfaced explicitly; it is never treated as a clear
+    state.
+    """
+
+    marker = _pty_artifact_bundle_recovery_marker(bundle_path)
+    if not marker.exists():
+        return
+    marker.unlink()
+    try:
+        _fsync_directory(marker.parent)
+    except Exception as clear_error:
+        try:
+            _create_pty_artifact_bundle_recovery_marker(bundle_path)
+        except Exception as restore_error:
+            raise RuntimeError(
+                "PTY artifact bundle recovery marker clear failed and "
+                "required-state restoration failed"
+            ) from restore_error
+        raise RuntimeError(
+            "PTY artifact bundle recovery marker clear was not durable; "
+            "recovery remains required"
+        ) from clear_error
+
+
+def _pty_artifact_bundle_item_name(
+    index: int,
+    artifact: Mapping[str, Any],
+) -> str:
+    artifact_id = str(
+        artifact.get("evidence_id") or artifact.get("diagnostic_id") or ""
+    )
+    if not _is_sha256(artifact_id):
+        raise ValueError("PTY bundle artifact identity is incomplete")
+    return f"{index:04d}-{artifact_id}"
+
+
+def _pty_artifact_bundle_unsigned_commit(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    trust_root_id: str,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    item_list = [dict(item) for item in items]
+    if not item_list:
+        raise ValueError("PTY artifact bundle requires at least one item")
+    return {
+        "schema_version": PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION,
+        "bundle_type": "pty_artifact_authority_shard",
+        "signature_algorithm": "ed25519",
+        "trust_root_id": trust_root_id,
+        "controller_context": dict(controller_context or {}),
+        "items": item_list,
+    }
+
+
+def _build_pty_artifact_bundle_commit(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    unsigned = _pty_artifact_bundle_unsigned_commit(
+        items,
+        trust_root_id=signer.trust_root_id,
+        controller_context=controller_context,
+    )
+    commit = {
+        **unsigned,
+        "signature": sign_controller_payload(signer, unsigned),
+    }
+    commit["commit_hash"] = content_hash(commit)
+    return commit
+
+
+def _validate_pty_artifact_bundle_commit(
+    commit: Mapping[str, Any],
+    *,
+    trusted_public_key_b64: str,
+    expected_controller_context: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    raw = dict(commit)
+    observed_hash = str(raw.pop("commit_hash", "") or "")
+    signature = str(raw.pop("signature", "") or "")
+    if (
+        commit.get("schema_version") != PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION
+        or content_hash({**raw, "signature": signature}) != observed_hash
+    ):
+        return False, "PTY artifact bundle commit hash is invalid"
+    expected_trust_root = content_hash({
+        "ed25519_public_key": trusted_public_key_b64,
+    })
+    if str(raw.get("trust_root_id") or "") != expected_trust_root:
+        return False, "PTY artifact bundle uses another trust root"
+    if dict(raw.get("controller_context") or {}) != dict(
+        expected_controller_context or {}
+    ):
+        return False, "PTY artifact bundle controller context differs"
+    if not verify_controller_payload_signature(
+        raw,
+        signature_b64=signature,
+        trusted_public_key_b64=trusted_public_key_b64,
+    ):
+        return False, "PTY artifact bundle commit signature is invalid"
+    return True, ""
+
+
+def _stage_pty_artifact_bundle_item(
+    items_path: Path,
+    *,
+    index: int,
+    artifact: Mapping[str, Any],
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Write and sync one non-qualifying shard inside top-level staging."""
+
+    item_name = _pty_artifact_bundle_item_name(index, artifact)
+    item_path = items_path / item_name
+    item_path.mkdir(mode=0o700)
+    artifact_bytes = _json_file_bytes(artifact)
+    authority = build_pty_authority_receipt(
+        artifact,
+        signer=signer,
+        controller_context=controller_context,
+    )
+    authority_bytes = _json_file_bytes(authority)
+    artifact_path = item_path / "artifact.json"
+    authority_path = item_path / "authority.json"
+    commit_path = item_path / "COMMIT.json"
+    artifact_path.write_bytes(artifact_bytes)
+    authority_path.write_bytes(authority_bytes)
+    item_commit = {
+        "schema_version": 1,
+        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+    }
+    commit_bytes = _json_file_bytes(item_commit)
+    commit_path.write_bytes(commit_bytes)
+    for path in (artifact_path, authority_path, commit_path):
+        path.chmod(0o400)
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(item_path)
+    item_path.chmod(0o500)
+    _fsync_directory(item_path)
+    _fsync_directory(items_path)
+    return {
+        "index": index,
+        "item_name": item_name,
+        "artifact_id": str(
+            artifact.get("evidence_id") or artifact.get("diagnostic_id") or ""
+        ),
+        "artifact_hash": str(artifact.get("artifact_hash") or ""),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+        "item_commit_sha256": hashlib.sha256(commit_bytes).hexdigest(),
+    }
+
+
+def _read_pty_artifact_bundle(
+    bundle_path: Path,
+    *,
+    allow_recovery_marker: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    if (
+        not allow_recovery_marker
+        and _pty_artifact_bundle_recovery_marker(bundle_path).exists()
+    ):
+        raise ValueError(
+            "PTY artifact bundle requires durability reconciliation"
+        )
+    if bundle_path.is_symlink() or not bundle_path.is_dir():
+        raise ValueError("PTY artifact bundle is not committed")
+    if bundle_path.stat().st_mode & 0o222:
+        raise ValueError("PTY artifact bundle must be immutable")
+    root_names = {entry.name for entry in bundle_path.iterdir()}
+    if root_names != {"items", "COMMIT.json"}:
+        raise ValueError("PTY artifact bundle root layout is invalid")
+    items_path = bundle_path / "items"
+    commit_path = bundle_path / "COMMIT.json"
+    if (
+        items_path.is_symlink()
+        or not items_path.is_dir()
+        or commit_path.is_symlink()
+        or items_path.stat().st_mode & 0o222
+        or commit_path.stat().st_mode & 0o222
+    ):
+        raise ValueError("PTY artifact bundle contains an invalid path")
+    try:
+        commit_bytes = commit_path.read_bytes()
+        commit = json.loads(commit_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("PTY artifact bundle commit is incomplete") from exc
+    if not isinstance(commit, dict) or not isinstance(commit.get("items"), list):
+        raise ValueError("PTY artifact bundle commit is invalid")
+    declared_items = commit["items"]
+    declared_names = [
+        str(item.get("item_name") or "")
+        for item in declared_items
+        if isinstance(item, Mapping)
+    ]
+    observed_names = sorted(entry.name for entry in items_path.iterdir())
+    if (
+        len(declared_names) != len(declared_items)
+        or declared_names != observed_names
+        or len(set(declared_names)) != len(declared_names)
+    ):
+        raise ValueError("PTY artifact bundle membership differs from its commit")
+    loaded_items: list[dict[str, Any]] = []
+    for expected_index, (item_manifest, item_name) in enumerate(
+        zip(declared_items, declared_names, strict=True)
+    ):
+        item_path = items_path / item_name
+        if (
+            not isinstance(item_manifest, Mapping)
+            or item_manifest.get("index") != expected_index
+            or item_name != _pty_artifact_bundle_item_name(
+                expected_index,
+                {"evidence_id": item_manifest.get("artifact_id")},
+            )
+            or item_path.is_symlink()
+            or not item_path.is_dir()
+            or item_path.stat().st_mode & 0o222
+            or {entry.name for entry in item_path.iterdir()}
+            != {"artifact.json", "authority.json", "COMMIT.json"}
+        ):
+            raise ValueError("PTY artifact bundle item layout is invalid")
+        if any(
+            (item_path / name).stat().st_mode & 0o222
+            for name in ("artifact.json", "authority.json", "COMMIT.json")
+        ):
+            raise ValueError("PTY artifact bundle item must be immutable")
+        try:
+            artifact_bytes = (item_path / "artifact.json").read_bytes()
+            authority_bytes = (item_path / "authority.json").read_bytes()
+            item_commit_bytes = (item_path / "COMMIT.json").read_bytes()
+            artifact = json.loads(artifact_bytes)
+            authority = json.loads(authority_bytes)
+            item_commit = json.loads(item_commit_bytes)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("PTY artifact bundle item is incomplete") from exc
+        if not all(
+            isinstance(value, dict)
+            for value in (artifact, authority, item_commit)
+        ):
+            raise ValueError("PTY artifact bundle item contains a non-object")
+        expected_item_commit = {
+            "schema_version": 1,
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+        }
+        expected_manifest = {
+            "index": expected_index,
+            "item_name": item_name,
+            "artifact_id": str(
+                artifact.get("evidence_id")
+                or artifact.get("diagnostic_id")
+                or ""
+            ),
+            "artifact_hash": str(artifact.get("artifact_hash") or ""),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+            "item_commit_sha256": hashlib.sha256(
+                item_commit_bytes
+            ).hexdigest(),
+        }
+        if (
+            item_commit != expected_item_commit
+            or dict(item_manifest) != expected_manifest
+        ):
+            raise ValueError("PTY artifact bundle item commit is stale")
+        loaded_items.append({
+            "artifact": artifact,
+            "authority": authority,
+            "commit": item_commit,
+        })
+    digest = hashlib.sha256(commit_bytes).hexdigest()
+    for item in loaded_items:
+        artifact = item["artifact"]
+        item["authority"] = _PtyBundleAuthorityView(
+            receipt=deepcopy(item["authority"]),
+            bundle_digest=digest,
+            artifact_id=str(
+                artifact.get("evidence_id")
+                or artifact.get("diagnostic_id")
+                or ""
+            ),
+            artifact_hash=str(artifact.get("artifact_hash") or ""),
+        )
+    return loaded_items, commit, digest
+
+
+def load_pty_artifact_bundle(
+    bundle_path: str | Path,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load structurally committed shards without granting qualification."""
+
+    items, _commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    return items, digest
+
+
+def load_validated_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    trusted_public_key_b64: str,
+    expected_digest: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Return one validated immutable snapshot eligible for qualification."""
+
+    items, commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    if expected_digest and digest != expected_digest:
+        raise ValueError("PTY artifact bundle digest differs")
+    valid, reason = _validate_pty_artifact_bundle_commit(
+        commit,
+        trusted_public_key_b64=trusted_public_key_b64,
+        expected_controller_context=expected_controller_context,
+    )
+    if not valid:
+        raise ValueError(reason)
+    for item in items:
+        valid, reason = validate_pty_authority_receipt(
+            item["artifact"],
+            item["authority"],
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not valid:
+            raise ValueError(reason)
+    return items, digest
+
+
+def validate_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    trusted_public_key_b64: str,
+    expected_digest: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate membership, all item authorities, and the bundle commit."""
+
+    try:
+        load_validated_pty_artifact_bundle(
+            bundle_path,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_digest=expected_digest,
+            expected_controller_context=expected_controller_context,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def pty_artifact_bundle_digest(bundle_path: str | Path) -> str:
+    _items, _commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    return digest
+
+
+def recover_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    expected_artifacts: Iterable[Mapping[str, Any]] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Clean abandoned staging or recognize the one published commit point."""
+
+    path = Path(bundle_path)
+    with _pty_artifact_bundle_lock(path):
+        return _recover_pty_artifact_bundle_unlocked(
+            path,
+            expected_artifacts=expected_artifacts,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def _recover_pty_artifact_bundle_unlocked(
+    path: Path,
+    *,
+    expected_artifacts: Iterable[Mapping[str, Any]] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    for staging in _pty_artifact_bundle_staging_paths(path):
+        _remove_pty_directory(staging)
+    if not path.exists():
+        _clear_pty_artifact_bundle_recovery_marker(path)
+        _fsync_directory(path.parent)
+        return None
+    _fsync_directory(path)
+    _fsync_directory(path.parent)
+    items, commit, _digest = _read_pty_artifact_bundle(
+        path,
+        allow_recovery_marker=True,
+    )
+    artifacts = [item["artifact"] for item in items]
+    if expected_artifacts is not None and artifacts != [
+        dict(artifact) for artifact in expected_artifacts
+    ]:
+        raise FileExistsError(
+            f"PTY artifact bundle belongs to other candidates: {path}"
+        )
+    if signer is not None:
+        valid, reason = _validate_pty_artifact_bundle_commit(
+            commit,
+            trusted_public_key_b64=signer.public_key_b64,
+            expected_controller_context=controller_context,
+        )
+        if not valid:
+            raise ValueError(
+                f"PTY artifact bundle has invalid controller authority: {reason}"
+            )
+        for item in items:
+            valid, reason = validate_pty_authority_receipt(
+                item["artifact"],
+                item["authority"],
+                trusted_public_key_b64=signer.public_key_b64,
+                expected_controller_context=controller_context,
+            )
+            if not valid:
+                raise ValueError(
+                    "PTY artifact bundle has invalid item authority: "
+                    f"{reason}"
+                )
+    _clear_pty_artifact_bundle_recovery_marker(path)
+    return path
+
+
+@contextmanager
+def _pty_artifact_bundle_lock(bundle_path: Path):
+    """Serialize recovery and publication for one shard-level bundle."""
+
+    lock_path = bundle_path.with_name(f".{bundle_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def admit_pty_artifact_bundle(
+    bundle_path: str | Path,
+    artifact_paths: Iterable[str | Path],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    """Atomically publish multiple unsigned PTY candidates as one shard bundle."""
+
+    path = Path(bundle_path)
+    candidates = [Path(candidate) for candidate in artifact_paths]
+    if not candidates:
+        raise ValueError("PTY artifact bundle requires at least one candidate")
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("PTY artifact bundle candidate paths must be unique")
+    artifacts = []
+    for candidate in candidates:
+        artifact = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(artifact, dict):
+            raise ValueError("PTY artifact bundle candidate is not an object")
+        artifacts.append(artifact)
+    artifact_ids = [
+        str(artifact.get("evidence_id") or artifact.get("diagnostic_id") or "")
+        for artifact in artifacts
+    ]
+    if any(not artifact_id for artifact_id in artifact_ids):
+        raise ValueError("PTY artifact bundle candidate identity is incomplete")
+    if len(set(artifact_ids)) != len(artifact_ids):
+        raise ValueError("PTY artifact bundle candidate identities must be unique")
+    with _pty_artifact_bundle_lock(path):
+        if _pty_artifact_bundle_recovery_marker(path).exists():
+            raise RuntimeError(
+                "PTY artifact bundle requires explicit durability recovery"
+            )
+        recovered = _recover_pty_artifact_bundle_unlocked(
+            path,
+            expected_artifacts=artifacts,
+            signer=signer,
+            controller_context=controller_context,
+        )
+        if recovered is not None:
+            return recovered
+        staging = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        )
+        published = False
+        try:
+            staging.mkdir(mode=0o700)
+            items_path = staging / "items"
+            items_path.mkdir(mode=0o700)
+            item_manifests = [
+                _stage_pty_artifact_bundle_item(
+                    items_path,
+                    index=index,
+                    artifact=artifact,
+                    signer=signer,
+                    controller_context=controller_context,
+                )
+                for index, artifact in enumerate(artifacts)
+            ]
+            _fsync_directory(items_path)
+            items_path.chmod(0o500)
+            _fsync_directory(items_path)
+            commit = _build_pty_artifact_bundle_commit(
+                item_manifests,
+                signer=signer,
+                controller_context=controller_context,
+            )
+            commit_path = staging / "COMMIT.json"
+            commit_path.write_bytes(_json_file_bytes(commit))
+            commit_path.chmod(0o400)
+            with commit_path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            _fsync_directory(staging)
+            staging.chmod(0o500)
+            _fsync_directory(staging)
+            _create_pty_artifact_bundle_recovery_marker(path)
+            _rename_directory_noreplace(staging, path)
+            published = True
+            _fsync_directory(path)
+            _fsync_directory(path.parent)
+            _clear_pty_artifact_bundle_recovery_marker(path)
+        except Exception:
+            if published:
+                raise RuntimeError(
+                    "PTY artifact bundle durability is uncertain; "
+                    "retry reconciliation is required"
+                )
+            if staging.exists():
+                _remove_pty_directory(staging)
+                _fsync_directory(staging.parent)
+            _clear_pty_artifact_bundle_recovery_marker(path)
+            raise
+        return path
+
+
+def rollback_pty_artifact_bundle(bundle_path: str | Path) -> None:
+    """Remove bundle publication state while preserving unsigned candidates."""
+
+    path = Path(bundle_path)
+    with _pty_artifact_bundle_lock(path):
+        for staging in _pty_artifact_bundle_staging_paths(path):
+            _remove_pty_directory(staging)
+        _remove_pty_directory(path)
+        _clear_pty_artifact_bundle_recovery_marker(path)
+        _fsync_directory(path.parent)
+
+
+def remove_pty_artifact_bundle(
+    bundle_path: str | Path,
+    artifact_paths: Iterable[str | Path] = (),
+) -> None:
+    """Remove committed/staging state and the explicitly supplied candidates."""
+
+    rollback_pty_artifact_bundle(bundle_path)
+    candidate_parents: set[Path] = set()
+    for candidate_value in artifact_paths:
+        candidate = Path(candidate_value)
+        candidate.with_suffix(".json.tmp").unlink(missing_ok=True)
+        candidate.unlink(missing_ok=True)
+        candidate_parents.add(candidate.parent)
+    for parent in candidate_parents:
+        _fsync_directory(parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _project_sensitive_turn_values(
+    value: Any,
+    protected_values: tuple[str, ...],
+    marker: str,
+) -> Any:
+    """Project exact tainted values without rewriting unrelated substrings."""
+
+    if isinstance(value, Mapping):
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            projected_key = _project_sensitive_turn_values(
+                key,
+                protected_values,
+                marker,
+            )
+            if projected_key in projected:
+                raise ValueError(
+                    "sensitive-value projection creates a mapping key collision"
+                )
+            projected[projected_key] = _project_sensitive_turn_values(
+                item,
+                protected_values,
+                marker,
+            )
+        return projected
+    if isinstance(value, list):
+        return [
+            _project_sensitive_turn_values(item, protected_values, marker)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _project_sensitive_turn_values(item, protected_values, marker)
+            for item in value
+        )
+    if isinstance(value, str):
+        return marker if value in protected_values else value
+    return value
+
+
+def _project_tainted_free_text(
+    value: Any,
+    protected_values: tuple[str, ...],
+) -> Any:
+    """Replace a tainted free-text leaf as a unit, never edit identifiers."""
+
+    if isinstance(value, Mapping):
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            projected_key = _project_tainted_free_text(key, protected_values)
+            if projected_key in projected:
+                raise ValueError(
+                    "tainted-text projection creates a mapping key collision"
+                )
+            projected[projected_key] = _project_tainted_free_text(
+                item,
+                protected_values,
+            )
+        return projected
+    if isinstance(value, list):
+        return [
+            _project_tainted_free_text(item, protected_values)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _project_tainted_free_text(item, protected_values)
+            for item in value
+        )
+    if isinstance(value, str) and any(
+        protected and protected in value
+        for protected in protected_values
+    ):
+        return SENSITIVE_INPUT_MARKER
+    return value
+
+
+def _contains_tainted_free_text(
+    value: Any,
+    protected_values: tuple[str, ...],
+) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _contains_tainted_free_text(candidate, protected_values)
+            for key, item in value.items()
+            for candidate in (key, item)
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_tainted_free_text(item, protected_values)
+            for item in value
+        )
+    return isinstance(value, str) and any(
+        protected and protected in value
+        for protected in protected_values
+    )
+
+
+def _evidence_projection(value: Any) -> Any:
+    """Remove raw secrets and non-owning secret capabilities from evidence."""
+
+    return redact_secret_references(redact(value))
+
+
+def _contains_owning_secret_reference(value: Any) -> bool:
+    """Reject process-local secret capabilities at persisted boundaries."""
+
+    return bool(secret_references_in_value(value))
+
+
+def _sensitive_event_hash(*, identity: Mapping[str, Any]) -> str:
+    """Bind a sensitive event without deriving a verifier from secret bytes."""
+
+    return content_hash({
+        "classification": "sensitive-input",
+        "identity": dict(identity),
+    })
+
+
+def _pending_contract_is_sensitive(question: Mapping[str, Any]) -> bool:
+    return bool(
+        question.get("sensitive_input")
+        or question.get("secret_reentry_binding")
+    )
+
+
+def pty_transcript_hash(
+    *,
+    session_id: str,
+    turn_index: int,
+    previous_agent_response: str,
+    user_message: str,
+    agent_response: str,
+) -> str:
+    """Fingerprint the exact transcript context represented by one PTY turn."""
+
+    return content_hash({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "previous_agent_response": previous_agent_response,
+        "user_message": user_message,
+        "agent_response": agent_response,
+    })
+
+
+def build_evidence_artifact(
+    *,
+    edge: Mapping[str, Any],
+    evidence_class: str,
+    scenario_id: str,
+    runner_type: str,
+    revision: Mapping[str, str],
+    input_value: Any,
+    seed_state: Mapping[str, Any],
+    before_state: Mapping[str, Any],
+    after_state: Mapping[str, Any],
+    events: Iterable[Mapping[str, Any]],
+    exit_status: int,
+    outcome: str,
+    error: str = "",
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    admitted: bool | None = None,
+) -> dict[str, Any]:
+    if evidence_class != "deterministic":
+        raise ValueError(
+            "compiled-graph evidence only supports deterministic turns; "
+            "use build_pty_cli_evidence_artifact for real_cli or dynamic_dual_ai"
+        )
+    _require_lane(edge, evidence_class)
+    required_text = {
+        "edge_key": edge.get("edge_key"),
+        "contract_hash": edge.get("contract_hash"),
+        "runtime_variant_hash": edge.get("contract_variant_hash"),
+        "scenario_id": scenario_id,
+        "runner_type": runner_type,
+        "revision.commit": revision.get("commit"),
+        "revision.worktree_hash": revision.get("worktree_hash"),
+    }
+    missing = sorted(name for name, value in required_text.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(f"missing evidence identity: {', '.join(missing)}")
+    if runner_type != COMPILED_GRAPH_RUNNER:
+        raise ValueError(f"deterministic turn evidence requires {COMPILED_GRAPH_RUNNER}")
+    if outcome not in {"passed", "failed"}:
+        raise ValueError(f"invalid evidence outcome: {outcome}")
+    if (outcome == "passed") != (int(exit_status) == 0):
+        raise ValueError("outcome and exit status disagree")
+    if outcome == "failed" and not str(error or "").strip():
+        raise ValueError("failed artifact requires an error")
+
+    raw_seed = deepcopy(dict(seed_state))
+    raw_before = deepcopy(dict(before_state))
+    raw_after = deepcopy(dict(after_state))
+    if raw_before.get("last_user_input") != input_value:
+        raise ValueError("input does not match the compiled-graph invocation state")
+    raw_question = deepcopy(dict(raw_before.get("pending_question") or {}))
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and _pending_contract_is_sensitive(raw_question)
+    )
+    if sensitive_manual_input:
+        safe_input = SENSITIVE_INPUT_MARKER
+        protected_values = tuple(dict.fromkeys((
+            str(input_value),
+            _normalize_scalar(input_value),
+        )))
+        evidence_seed = _project_sensitive_turn_values(
+            raw_seed,
+            protected_values,
+            safe_input,
+        )
+        evidence_before = _project_sensitive_turn_values(
+            raw_before,
+            protected_values,
+            safe_input,
+        )
+        evidence_after = _project_sensitive_turn_values(
+            raw_after,
+            protected_values,
+            safe_input,
+        )
+    else:
+        safe_input = redact(deepcopy(input_value))
+        evidence_seed = raw_seed
+        evidence_before = raw_before
+        evidence_after = raw_after
+    source_input_hash = (
+        _sensitive_event_hash(identity={
+            "edge_key": str(edge.get("edge_key") or ""),
+            "scenario_id": str(scenario_id),
+            "question_id": str(raw_question.get("id") or ""),
+        })
+        if sensitive_manual_input
+        else content_hash(_evidence_projection(safe_input))
+    )
+    seed = _evidence_projection(evidence_seed)
+    before = _evidence_projection(evidence_before)
+    after = _evidence_projection(evidence_after)
+    question = deepcopy(dict(before.get("pending_question") or {}))
+    raw_response = deepcopy(list(raw_after.get("visible_response") or []))
+    raw_next_question = deepcopy(dict(raw_after.get("pending_question") or {}))
+    state_diff = state_diff_between(before, after)
+    response = deepcopy(list(after.get("visible_response") or []))
+    next_question = deepcopy(dict(after.get("pending_question") or {}))
+    source_boundary_hashes = {
+        "before_hash": content_hash(before),
+        "input_hash": source_input_hash,
+        "question_hash": content_hash(question),
+        "after_hash": content_hash(after),
+        "state_diff_hash": content_hash(_evidence_projection(state_diff)),
+        "response_hash": content_hash(_evidence_projection(raw_response)),
+        "next_question_hash": content_hash(
+            _evidence_projection(raw_next_question)
+        ),
+    }
+    event_trace = []
+    for event in events:
+        safe_event = (
+            _project_sensitive_turn_values(
+                deepcopy(dict(event)),
+                protected_values,
+                safe_input,
+            )
+            if sensitive_manual_input
+            else deepcopy(dict(event))
+        )
+        safe_details = _evidence_projection(
+            _project_tainted_free_text(
+                dict(safe_event.get("details") or {}),
+                protected_values if sensitive_manual_input else (),
+            )
+        )
+        for key in set(safe_details) & set(source_boundary_hashes):
+            safe_details[key] = source_boundary_hashes[key]
+        safe_event["details"] = safe_details
+        event_trace.append(redact_secret_references(safe_event))
+    returned = _has_event(event_trace, "compiled_graph_turn_returned", edge)
+    raised = _has_event(event_trace, "compiled_graph_turn_raised", edge)
+    if outcome == "passed" and not returned:
+        raise ValueError("passed artifact has no compiled graph return")
+    if outcome == "failed" and not (returned or raised):
+        raise ValueError("failed artifact has no compiled graph observation")
+    if any(
+        str(event.get("event_type") or "") in {"edge_executed", "edge_execution_failed"}
+        for event in event_trace
+    ):
+        raise ValueError("runner-declared edge outcome events are forbidden")
+
+    admitted_action = _action_admission(
+        edge,
+        question,
+        safe_input,
+        admitted=(returned if admitted is None else bool(admitted)),
+    )
+    turn_evidence = {
+        "compiled_graph_helper": COMPILED_GRAPH_RUNNER,
+        "seed": seed,
+        "before": before,
+        "input": safe_input,
+        "admitted_action": admitted_action,
+        "runtime_actions": {
+            "proposed": deepcopy(list(after.get("proposed_actions") or [])),
+            "queued": deepcopy(list(after.get("action_queue") or [])),
+            "completed": deepcopy(list(after.get("completed_actions") or [])),
+            "applied_action_ids": deepcopy(list(after.get("applied_action_ids") or [])),
+        },
+        "state_diff": state_diff,
+        "after": after,
+        "question": question,
+        "next_question": next_question,
+        "response": response,
+        "turn_context": deepcopy(dict(after.get("turn_context") or {})),
+    }
+    payload: dict[str, Any] = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "edge_key": str(edge.get("edge_key") or ""),
+        "contract_hash": str(edge.get("contract_hash") or ""),
+        "runtime_variant_hash": str(edge.get("contract_variant_hash") or ""),
+        "evidence_class": evidence_class,
+        "scenario_id": str(scenario_id),
+        "runner_type": str(runner_type),
+        "revision": {
+            "commit": str(revision.get("commit") or ""),
+            "worktree_hash": str(revision.get("worktree_hash") or ""),
+        },
+        "input_hash": content_hash(safe_input),
+        "source_input_hash": source_input_hash,
+        "source_boundary_hashes": source_boundary_hashes,
+        "seed_state_hash": content_hash(seed),
+        "before_state_hash": content_hash(before),
+        "after_state_hash": content_hash(after),
+        "turn_evidence": turn_evidence,
+        "turn_evidence_hash": content_hash(turn_evidence),
+        "event_trace": event_trace,
+        "event_trace_hash": content_hash(event_trace),
+        "exit_status": int(exit_status),
+        "outcome": str(outcome),
+        "error": str(_evidence_projection(
+            _project_tainted_free_text(
+                error or "",
+                protected_values if sensitive_manual_input else (),
+            )
+        )),
+        "content_redacted": True,
+        "started_at": started_at or _utc_timestamp(),
+        "finished_at": finished_at or _utc_timestamp(),
+    }
+    if sensitive_manual_input and _contains_tainted_free_text(
+        {
+            "input": payload["turn_evidence"]["input"],
+            "response": payload["turn_evidence"]["response"],
+            "state_diff": payload["turn_evidence"]["state_diff"],
+            "turn_context": payload["turn_evidence"]["turn_context"],
+            "event_details": [
+                item.get("details") for item in payload["event_trace"]
+            ],
+            "error": payload["error"],
+        },
+        protected_values,
+    ):
+        raise ValueError("sensitive deterministic evidence retains tainted text")
+    payload["evidence_id"] = content_hash(payload)
+    payload["artifact_hash"] = content_hash(payload)
+    return payload
+
+
+def write_evidence_artifact(artifact: Mapping[str, Any], directory: str | Path) -> Path:
+    """Persist a worker candidate; only the controller may admit PTY evidence."""
+
+    target_dir = Path(directory)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{artifact['evidence_id']}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
+
+
+def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]:
+    """Build a redacted, tamper-evident record that can never satisfy a lane.
+
+    The caller writes a ``verification_pending`` failed-attempt record before
+    invoking the postcondition verifier.  It removes that record after a pass
+    or replaces it with ``postcondition_failed`` details after a failure.
+    """
+
+    if record.diagnostic_kind not in {"failed_attempt", "interruption"}:
+        raise ValueError("PTY diagnostic kind is invalid")
+    if record.verification_status not in PTY_DIAGNOSTIC_STATUSES[record.diagnostic_kind]:
+        raise ValueError("PTY diagnostic verification status is invalid")
+    required = {
+        "target_id": record.target_id,
+        "target_edge_key": record.target_edge_key,
+        "revision.commit": record.revision.get("commit"),
+        "revision.worktree_hash": record.revision.get("worktree_hash"),
+        "session_id": record.session_id,
+        "reason": record.reason,
+        "last_complete_response": record.last_complete_response,
+    }
+    missing = sorted(name for name, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(f"PTY diagnostic identity is missing: {', '.join(missing)}")
+    _validate_runtime_event(record.input_baseline_event)
+    _validate_runtime_event(record.last_complete_event)
+    if dict(record.last_complete_event.revision) != dict(record.revision):
+        raise ValueError("PTY diagnostic runtime revision mismatch")
+    if dict(record.input_baseline_event.revision) != dict(record.revision):
+        raise ValueError("PTY diagnostic input-baseline revision mismatch")
+    if record.last_complete_event.thread_id != record.session_id:
+        raise ValueError("PTY diagnostic runtime event belongs to another session")
+    if record.input_baseline_event.thread_id != record.session_id:
+        raise ValueError("PTY diagnostic input baseline belongs to another session")
+    if record.diagnostic_kind == "failed_attempt" and record.completed_turn is None:
+        raise ValueError("failed-attempt diagnostic requires a completed turn")
+    if record.dynamic_selection is not None and record.completed_turn is None:
+        raise ValueError("PTY diagnostic selection requires a completed turn")
+    if record.completed_turn is not None:
+        _validate_pty_turn_record(record.completed_turn)
+        if record.completed_turn.session_id != record.session_id:
+            raise ValueError("PTY diagnostic turn belongs to another session")
+        if (
+            record.input_baseline_event.after_fingerprint
+            != record.completed_turn.before_fingerprint
+            or record.last_complete_event.before_fingerprint
+            != record.input_baseline_event.after_fingerprint
+            or record.last_complete_event.after_fingerprint
+            != record.completed_turn.after_fingerprint
+            or record.input_baseline_event.turn_index + 1
+            != record.completed_turn.turn_index
+            or record.last_complete_event.turn_index
+            != record.completed_turn.turn_index
+        ):
+            raise ValueError(
+                "PTY diagnostic input, turn, and committed boundary are not adjacent"
+            )
+    if record.dynamic_selection is not None:
+        _validate_dynamic_selection(record.completed_turn, record.dynamic_selection)  # type: ignore[arg-type]
+        if record.target_edge_key not in set(
+            record.dynamic_selection.target_coverage_ids
+        ):
+            raise ValueError(
+                "PTY diagnostic target is not bound to the dynamic selection"
+            )
+    elif record.completed_turn is not None:
+        raise ValueError("PTY diagnostic completed turn has no dynamic selection")
+    if record.verification_status == "postcondition_failed":
+        if record.verified_postcondition is None or record.verified_postcondition.passed:
+            raise ValueError("postcondition-failed diagnostic requires a failed verification")
+    elif record.verified_postcondition is not None:
+        raise ValueError("PTY diagnostic carries a postcondition before verification failed")
+
+    sensitive_input = _pending_contract_is_sensitive(
+        record.input_baseline_event.pending_contract
+    )
+    protected_values = (
+        (record.completed_turn.user_message,)
+        if (
+            sensitive_input
+            and record.completed_turn is not None
+            and record.completed_turn.user_message
+        )
+        else ()
+    )
+    safe_response = str(redact(_project_tainted_free_text(
+        record.last_complete_response,
+        protected_values,
+    )))
+    safe_baseline_event = _project_runtime_event_payload(
+        record.input_baseline_event,
+        protected_values=protected_values,
+    )
+    safe_event = _project_runtime_event_payload(
+        record.last_complete_event,
+        protected_values=protected_values,
+    )
+    safe_turn = (
+        _redacted_pty_turn_payload(
+            record.completed_turn,
+            sensitive_input=sensitive_input,
+            protected_values=protected_values,
+        )
+        if record.completed_turn is not None
+        else None
+    )
+    safe_selection = (
+        _redacted_dynamic_selection_payload(
+            record.dynamic_selection,
+            sensitive_input=sensitive_input,
+            protected_values=protected_values,
+        )
+        if record.dynamic_selection is not None
+        else None
+    )
+    safe_postcondition = (
+        _redacted_verified_postcondition_payload(
+            record.verified_postcondition,
+            protected_values=protected_values,
+        )
+        if record.verified_postcondition is not None
+        else None
+    )
+    body: dict[str, Any] = {
+        "artifact_type": "pty_diagnostic",
+        "schema_version": record.schema_version,
+        "diagnostic_kind": record.diagnostic_kind,
+        "verification_status": record.verification_status,
+        "qualifying_evidence": False,
+        "target_id": record.target_id,
+        "target_edge_key": record.target_edge_key,
+        "revision": dict(record.revision),
+        "session_id": record.session_id,
+        "reason": str(redact(_project_tainted_free_text(
+            record.reason,
+            protected_values,
+        ))),
+        "last_complete_boundary": {
+            "input_sensitive": sensitive_input,
+            "input_baseline_event": safe_baseline_event,
+            "input_baseline_event_hash": content_hash(safe_baseline_event),
+            "agent_response": safe_response,
+            "agent_response_hash": content_hash(safe_response),
+            "runtime_event": safe_event,
+            "runtime_event_hash": content_hash(safe_event),
+            "completed_turn": safe_turn,
+            "completed_turn_hash": content_hash(safe_turn) if safe_turn is not None else "",
+            "dynamic_selection": safe_selection,
+            "dynamic_selection_hash": (
+                content_hash(safe_selection) if safe_selection is not None else ""
+            ),
+            "verified_postcondition": safe_postcondition,
+            "verified_postcondition_hash": (
+                content_hash(safe_postcondition) if safe_postcondition is not None else ""
+            ),
+        },
+        "content_redacted": True,
+        "created_at": _utc_timestamp(),
+    }
+    if sensitive_input and _contains_tainted_free_text(
+        {
+            "reason": body["reason"],
+            "last_complete_boundary": body["last_complete_boundary"],
+        },
+        protected_values,
+    ):
+        raise ValueError("sensitive PTY diagnostic retains tainted free text")
+    if _contains_owning_secret_reference(body):
+        raise ValueError("PTY diagnostic retains an owning secret capability")
+    body["diagnostic_id"] = content_hash(body)
+    body["artifact_hash"] = content_hash(body)
+    return body
+
+
+def write_pty_diagnostic_artifact(
+    artifact: Mapping[str, Any],
+    directory: str | Path,
+) -> Path:
+    """Persist a worker diagnostic candidate outside qualifying evidence lanes."""
+
+    target_dir = Path(directory)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{artifact['diagnostic_id']}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
+
+
+def validate_pty_diagnostic_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Any] | None = None,
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+    expected_target_edge_key: str = "",
+    _candidate_only: bool = False,
+) -> tuple[bool, str]:
+    """Validate diagnostics while keeping them ineligible for pass evidence."""
+
+    if artifact.get("artifact_type") != "pty_diagnostic":
+        return False, "artifact is not a PTY diagnostic"
+    if artifact.get("schema_version") != PTY_DIAGNOSTIC_SCHEMA_VERSION:
+        return False, "unsupported PTY diagnostic schema"
+    if artifact.get("qualifying_evidence") is not False:
+        return False, "PTY diagnostic must not qualify as evidence"
+    if not _candidate_only:
+        if authority is None or not trusted_public_key_b64:
+            return False, "PTY diagnostic requires controller authority"
+        authority_valid, authority_reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not authority_valid:
+            return False, authority_reason
+    if (
+        expected_target_edge_key
+        and str(artifact.get("target_edge_key") or "")
+        != str(expected_target_edge_key)
+    ):
+        return False, "PTY diagnostic target differs from scheduled authority"
+    kind = str(artifact.get("diagnostic_kind") or "")
+    status = str(artifact.get("verification_status") or "")
+    if kind not in PTY_DIAGNOSTIC_STATUSES or status not in PTY_DIAGNOSTIC_STATUSES[kind]:
+        return False, "PTY diagnostic kind or status is invalid"
+    required_text = (
+        "target_id", "target_edge_key", "session_id", "reason", "created_at",
+        "diagnostic_id", "artifact_hash",
+    )
+    if any(not str(artifact.get(name) or "").strip() for name in required_text):
+        return False, "PTY diagnostic identity is incomplete"
+    revision = artifact.get("revision")
+    if not isinstance(revision, Mapping):
+        return False, "PTY diagnostic revision is invalid"
+    if not str(revision.get("commit") or "").strip() or not _is_sha256(
+        str(revision.get("worktree_hash") or "")
+    ):
+        return False, "PTY diagnostic revision identity is invalid"
+    boundary = artifact.get("last_complete_boundary")
+    if not isinstance(boundary, Mapping):
+        return False, "PTY diagnostic has no complete boundary"
+    if not isinstance(boundary.get("input_sensitive"), bool):
+        return False, "PTY diagnostic has no input sensitivity classification"
+    response = boundary.get("agent_response")
+    baseline_event = boundary.get("input_baseline_event")
+    event = boundary.get("runtime_event")
+    if (
+        not isinstance(response, str)
+        or not response.strip()
+        or not isinstance(baseline_event, Mapping)
+        or not isinstance(event, Mapping)
+    ):
+        return False, "PTY diagnostic complete boundary is invalid"
+    if content_hash(baseline_event) != str(
+        boundary.get("input_baseline_event_hash") or ""
+    ):
+        return False, "PTY diagnostic input-baseline hash mismatch"
+    if content_hash(response) != str(boundary.get("agent_response_hash") or ""):
+        return False, "PTY diagnostic response hash mismatch"
+    if content_hash(event) != str(boundary.get("runtime_event_hash") or ""):
+        return False, "PTY diagnostic runtime-event hash mismatch"
+    try:
+        baseline_event_values = dict(baseline_event)
+        runtime_event_values = dict(event)
+        for values in (baseline_event_values, runtime_event_values):
+            values["action_queue_types"] = tuple(
+                values.get("action_queue_types") or ()
+            )
+            values["admitted_action_types"] = tuple(
+                values.get("admitted_action_types") or ()
+            )
+            values["admitted_action_targets"] = tuple(
+                dict(item) for item in values.get("admitted_action_targets") or ()
+            )
+            values["admitted_action_provenance"] = tuple(
+                dict(item)
+                for item in values.get("admitted_action_provenance") or ()
+            )
+            values["control_receipts"] = tuple(
+                dict(item) for item in values.get("control_receipts") or ()
+            )
+        input_baseline_event = RuntimeTurnEvent(**baseline_event_values)
+        runtime_event = RuntimeTurnEvent(**runtime_event_values)
+        if (
+            input_baseline_event.schema_version != 6
+            or runtime_event.schema_version != 6
+        ):
+            return False, "PTY diagnostic contains a legacy runtime boundary"
+        if (
+            not _runtime_event_payload_hash_is_valid(input_baseline_event)
+            or not _runtime_event_payload_hash_is_valid(runtime_event)
+        ):
+            return False, "PTY diagnostic runtime payload hash is invalid"
+        _validate_runtime_event(input_baseline_event)
+        _validate_runtime_event(runtime_event)
+    except (TypeError, ValueError) as exc:
+        return False, f"PTY diagnostic runtime event is invalid: {exc}"
+    if runtime_event.thread_id != str(artifact.get("session_id") or ""):
+        return False, "PTY diagnostic runtime event belongs to another session"
+    if input_baseline_event.thread_id != str(artifact.get("session_id") or ""):
+        return False, "PTY diagnostic input baseline belongs to another session"
+    if dict(runtime_event.revision) != dict(revision):
+        return False, "PTY diagnostic runtime revision mismatch"
+    if dict(input_baseline_event.revision) != dict(revision):
+        return False, "PTY diagnostic input-baseline revision mismatch"
+    if boundary.get("input_sensitive") is not _pending_contract_is_sensitive(
+        input_baseline_event.pending_contract
+    ):
+        return False, "PTY diagnostic input sensitivity is not provenance-derived"
+    completed_turn = boundary.get("completed_turn")
+    if kind == "failed_attempt" and not isinstance(completed_turn, Mapping):
+        return False, "failed-attempt diagnostic has no completed turn"
+    for value_name, hash_name in (
+        ("completed_turn", "completed_turn_hash"),
+        ("dynamic_selection", "dynamic_selection_hash"),
+        ("verified_postcondition", "verified_postcondition_hash"),
+    ):
+        value = boundary.get(value_name)
+        observed_hash = str(boundary.get(hash_name) or "")
+        if value is None:
+            if observed_hash:
+                return False, f"PTY diagnostic {value_name} hash is unexpected"
+        elif content_hash(value) != observed_hash:
+            return False, f"PTY diagnostic {value_name} hash mismatch"
+    typed_turn: PtyCliTurnRecord | None = None
+    if isinstance(completed_turn, Mapping):
+        try:
+            turn_values = dict(completed_turn)
+            for derived in (
+                "previous_response_hash", "user_message_hash", "agent_response_hash",
+            ):
+                turn_values.pop(derived, None)
+            typed_turn = PtyCliTurnRecord(**turn_values)
+            _validate_pty_turn_record(typed_turn)
+        except (TypeError, ValueError) as exc:
+            return False, f"PTY diagnostic completed turn is invalid: {exc}"
+        if typed_turn.session_id != str(artifact.get("session_id") or ""):
+            return False, "PTY diagnostic completed turn belongs to another session"
+        if typed_turn.turn_index != runtime_event.turn_index:
+            return False, "PTY diagnostic turn and runtime boundary disagree"
+        if (
+            input_baseline_event.after_fingerprint
+            != typed_turn.before_fingerprint
+            or runtime_event.before_fingerprint
+            != input_baseline_event.after_fingerprint
+            or runtime_event.after_fingerprint
+            != typed_turn.after_fingerprint
+            or input_baseline_event.turn_index + 1 != typed_turn.turn_index
+        ):
+            return False, "PTY diagnostic input boundary is not adjacent"
+        if typed_turn.agent_response != response:
+            return False, "PTY diagnostic response and completed turn disagree"
+    raw_selection = boundary.get("dynamic_selection")
+    if raw_selection is not None:
+        if typed_turn is None or not isinstance(raw_selection, Mapping):
+            return False, "PTY diagnostic dynamic selection has no completed turn"
+        try:
+            selection_values = dict(raw_selection)
+            selection_values["target_coverage_ids"] = tuple(
+                selection_values.get("target_coverage_ids") or ()
+            )
+            _validate_dynamic_selection(
+                typed_turn,
+                DynamicTurnSelection(**selection_values),
+            )
+            if str(artifact.get("target_edge_key") or "") not in set(
+                selection_values["target_coverage_ids"]
+            ):
+                return False, "PTY diagnostic target is not selection-bound"
+        except (TypeError, ValueError) as exc:
+            return False, f"PTY diagnostic dynamic selection is invalid: {exc}"
+    if status == "postcondition_failed":
+        postcondition = boundary.get("verified_postcondition")
+        if not isinstance(postcondition, Mapping) or postcondition.get("passed") is not False:
+            return False, "failed diagnostic has no failed postcondition"
+    elif boundary.get("verified_postcondition") is not None:
+        return False, "PTY diagnostic has an unexpected postcondition"
+    if artifact.get("content_redacted") is not True:
+        return False, "PTY diagnostic does not declare redaction"
+    if _contains_owning_secret_reference(artifact):
+        return False, "PTY diagnostic contains an owning secret capability"
+    unsigned = dict(artifact)
+    artifact_hash = str(unsigned.pop("artifact_hash", ""))
+    if content_hash(unsigned) != artifact_hash:
+        return False, "PTY diagnostic artifact hash mismatch"
+    identity = dict(unsigned)
+    diagnostic_id = str(identity.pop("diagnostic_id", ""))
+    if content_hash(identity) != diagnostic_id:
+        return False, "PTY diagnostic id mismatch"
+    return True, ""
+
+
+def validate_pty_diagnostic_candidate(
+    artifact: Mapping[str, Any],
+    *,
+    expected_target_edge_key: str,
+) -> tuple[bool, str]:
+    """Validate an unsigned worker candidate before controller admission."""
+
+    return validate_pty_diagnostic_artifact(
+        artifact,
+        expected_target_edge_key=expected_target_edge_key,
+        _candidate_only=True,
+    )
+
+
+def _runtime_event_payload(event: RuntimeTurnEvent) -> dict[str, Any]:
+    payload = asdict(event)
+    payload["action_queue_types"] = list(event.action_queue_types)
+    payload["admitted_action_types"] = list(event.admitted_action_types)
+    payload["admitted_action_targets"] = [dict(item) for item in event.admitted_action_targets]
+    payload["admitted_action_provenance"] = [
+        dict(item) for item in event.admitted_action_provenance
+    ]
+    payload["control_receipts"] = [
+        dict(item) for item in event.control_receipts
+    ]
+    return payload
+
+
+def _project_runtime_event_payload(
+    event: RuntimeTurnEvent,
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Return one validated immutable product event for retained evidence.
+
+    Product runtime events contain hashes and non-secret identifiers rather
+    than submitted free text. Treating arbitrary matching substrings as taint
+    corrupts those identities and the receipts bound to them. The unused
+    ``protected_values`` parameter remains part of the caller contract because
+    transcript and postcondition projections still use it independently.
+    """
+
+    del protected_values
+    validate_runtime_turn_event(event)
+    payload = _runtime_event_payload(event)
+    if not _runtime_event_evidence_safe(payload):
+        raise ValueError(
+            "validated runtime event contains raw secret-bearing content"
+        )
+    return payload
+
+
+def _runtime_event_evidence_safe(value: Any) -> bool:
+    """Reject secret material while allowing already-hashed sensitive facts."""
+
+    if secret_references_in_value(value):
+        return False
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            projected = redact({key: item})
+            if projected != {key: item} and not _hash_only_projection(item):
+                return False
+            if not _runtime_event_evidence_safe(item):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_runtime_event_evidence_safe(item) for item in value)
+    if isinstance(value, str):
+        return not secret_values(value) and redact(value) == value
+    return True
+
+
+def _hash_only_projection(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return all(_hash_only_projection(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_hash_only_projection(item) for item in value)
+    return value in {"", None} or (
+        isinstance(value, str) and _is_sha256(value)
+    )
+
+
+def _runtime_event_payload_hash_is_valid(
+    event: RuntimeTurnEvent,
+) -> bool:
+    if event.schema_version < 5:
+        return False
+    payload = _runtime_event_payload(event)
+    expected = str(payload.pop("runtime_event_payload_hash", "") or "")
+    return _is_sha256(expected) and content_hash(payload) == expected
+
+
+def _redacted_pty_turn_payload(
+    turn: PtyCliTurnRecord,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    safe_turn = _redacted_pty_turn(
+        turn,
+        sensitive_input=sensitive_input,
+        protected_values=protected_values,
+    )
+    previous_response = safe_turn.previous_agent_response
+    user_message = safe_turn.user_message
+    agent_response = safe_turn.agent_response
+    payload = asdict(safe_turn)
+    payload.update({
+        "previous_agent_response": previous_response,
+        "user_message": user_message,
+        "agent_response": agent_response,
+        "transcript_hash": pty_transcript_hash(
+            session_id=turn.session_id,
+            turn_index=turn.turn_index,
+            previous_agent_response=previous_response,
+            user_message=user_message,
+            agent_response=agent_response,
+        ),
+    })
+    payload["previous_response_hash"] = content_hash(previous_response)
+    payload["user_message_hash"] = content_hash(user_message)
+    payload["agent_response_hash"] = content_hash(agent_response)
+    return payload
+
+
+def _redacted_dynamic_selection_payload(
+    selection: DynamicTurnSelection,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    payload = asdict(_redacted_dynamic_selection(
+        selection,
+        sensitive_input=sensitive_input,
+        protected_values=protected_values,
+    ))
+    payload["target_coverage_ids"] = list(selection.target_coverage_ids)
+    return payload
+
+
+def _verified_postcondition_payload(postcondition: VerifiedPostcondition) -> dict[str, Any]:
+    payload = asdict(postcondition)
+    payload["observed_coverage_ids"] = list(postcondition.observed_coverage_ids)
+    payload["admitted_typed_actions"] = list(postcondition.admitted_typed_actions)
+    payload["job_artifacts"] = [dict(item) for item in postcondition.job_artifacts]
+    return payload
+
+
+def _redacted_verified_postcondition_payload(
+    postcondition: VerifiedPostcondition,
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Redact business content while preserving immutable coverage identity."""
+
+    payload = _verified_postcondition_payload(postcondition)
+    payload["state_diff"] = _evidence_projection(
+        _project_tainted_free_text(
+            dict(postcondition.state_diff),
+            protected_values,
+        )
+    )
+    payload["next_question_or_result"] = _evidence_projection(
+        _project_tainted_free_text(
+            dict(postcondition.next_question_or_result),
+            protected_values,
+        )
+    )
+    details = dict(postcondition.details)
+    declared = details.pop("declared_target_results", None)
+    safe_details = _evidence_projection(
+        _project_tainted_free_text(details, protected_values)
+    )
+    if isinstance(declared, Mapping):
+        safe_details["declared_target_results"] = {
+            str(coverage_id): _evidence_projection(
+                _project_tainted_free_text(
+                    dict(result),
+                    protected_values,
+                )
+            )
+            if isinstance(result, Mapping)
+            else _evidence_projection(
+                _project_tainted_free_text(result, protected_values)
+            )
+            for coverage_id, result in declared.items()
+        }
+    payload["details"] = safe_details
+    payload["job_artifacts"] = [
+        _evidence_projection(
+            _project_tainted_free_text(
+                dict(item),
+                protected_values,
+            )
+        )
+        for item in postcondition.job_artifacts
+    ]
+    return redact_secret_references(payload)
+
+
+def build_pty_cli_evidence_artifact(
+    *,
+    edge: Mapping[str, Any],
+    evidence_class: str,
+    revision: Mapping[str, str],
+    turn: PtyCliTurnRecord,
+    observation: TurnObservation,
+    dynamic_selection: DynamicTurnSelection | None = None,
+    execution_case: Mapping[str, Any] | None = None,
+    seed_receipt: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build tamper-evident evidence from a real PTY CLI turn.
+
+    ``real_cli`` proves that the product terminal executed an observed turn.
+    ``dynamic_dual_ai`` additionally proves that the selected user message was
+    chosen after the previous Agent response by a response-driven Codex actor.
+    """
+
+    if evidence_class not in {"real_cli", "dynamic_dual_ai"}:
+        raise ValueError("PTY evidence class must be real_cli or dynamic_dual_ai")
+    _require_lane(edge, evidence_class)
+    runner_type = (
+        PTY_DYNAMIC_DUAL_AI_RUNNER
+        if evidence_class == "dynamic_dual_ai"
+        else PTY_REAL_CLI_RUNNER
+    )
+    _validate_pty_turn_record(turn)
+    selection_payload: dict[str, Any] | None = None
+    if evidence_class == "dynamic_dual_ai":
+        if dynamic_selection is None:
+            raise ValueError("dynamic_dual_ai evidence requires a dynamic selection record")
+        _validate_dynamic_selection(turn, dynamic_selection)
+        selection_payload = asdict(dynamic_selection)
+        selection_payload["target_coverage_ids"] = list(dynamic_selection.target_coverage_ids)
+        selection_payload["previous_response_hash"] = content_hash(turn.previous_agent_response)
+    elif dynamic_selection is not None:
+        raise ValueError("real_cli evidence must not carry a dynamic selection record")
+    fixed_real_cli = (
+        evidence_class == "real_cli"
+        and not bool(((edge.get("evidence") or {}).get("dynamic_dual_ai") or {}).get("required"))
+    )
+    if fixed_real_cli:
+        if not isinstance(execution_case, Mapping) or not isinstance(seed_receipt, Mapping):
+            raise ValueError("real_cli evidence requires execution-case and seed provenance")
+        _validate_real_cli_provenance(
+            edge=edge,
+            turn=turn,
+            observation=observation,
+            execution_case=execution_case,
+            seed_receipt=seed_receipt,
+        )
+    elif evidence_class != "real_cli" and (execution_case is not None or seed_receipt is not None):
+        raise ValueError("dynamic evidence must not claim fixed execution-case provenance")
+
+    required_identity = {
+        "edge_key": edge.get("edge_key"),
+        "contract_hash": edge.get("contract_hash"),
+        "runtime_variant_hash": edge.get("contract_variant_hash"),
+        "revision.commit": revision.get("commit"),
+        "revision.worktree_hash": revision.get("worktree_hash"),
+    }
+    missing = sorted(
+        name for name, value in required_identity.items()
+        if not str(value or "").strip()
+    )
+    if missing:
+        raise ValueError(f"missing evidence identity: {', '.join(missing)}")
+    _validate_turn_observation(
+        observation,
+        edge=edge,
+        revision=revision,
+        turn=turn,
+        dynamic_selection=dynamic_selection,
+    )
+
+    canonical_facts = canonical_controller_turn_facts(
+        edge=edge,
+        turn=turn,
+        observation=observation,
+        dynamic_selection=dynamic_selection,
+    )
+    turn_payload = dict(canonical_facts["turn"])
+    selection_payload = (
+        dict(canonical_facts["dynamic_selection"])
+        if isinstance(canonical_facts.get("dynamic_selection"), Mapping)
+        else None
+    )
+    observation_payload = dict(canonical_facts["turn_observation"])
+    payload: dict[str, Any] = {
+        "artifact_type": "pty_cli_turn",
+        "schema_version": CLI_ARTIFACT_SCHEMA_VERSION,
+        "edge_key": str(edge.get("edge_key") or ""),
+        "contract_hash": str(edge.get("contract_hash") or ""),
+        "runtime_variant_hash": str(edge.get("contract_variant_hash") or ""),
+        "evidence_class": evidence_class,
+        "runner_type": runner_type,
+        "revision": {
+            "commit": str(revision.get("commit") or ""),
+            "worktree_hash": str(revision.get("worktree_hash") or ""),
+        },
+        "turn": turn_payload,
+        "turn_hash": content_hash(turn_payload),
+        "dynamic_selection": selection_payload,
+        "execution_case": _evidence_projection(dict(execution_case or {})),
+        "execution_case_hash": content_hash(
+            _evidence_projection(dict(execution_case or {}))
+        ) if execution_case else "",
+        "seed_receipt": _evidence_projection(dict(seed_receipt or {})),
+        "seed_receipt_hash": content_hash(
+            _evidence_projection(dict(seed_receipt or {}))
+        ) if seed_receipt else "",
+        "turn_observation": observation_payload,
+        "turn_observation_hash": content_hash(observation_payload),
+        "outcome": "passed",
+        "exit_status": 0,
+        "error": "",
+        "content_redacted": True,
+        "started_at": _utc_timestamp(),
+        "finished_at": _utc_timestamp(),
+    }
+    if _contains_owning_secret_reference(payload):
+        raise ValueError("PTY evidence retains an owning secret capability")
+    payload["evidence_id"] = content_hash(payload)
+    payload["artifact_hash"] = content_hash(payload)
+    return payload
+
+
+def canonical_controller_turn_facts(
+    *,
+    edge: Mapping[str, Any],
+    turn: PtyCliTurnRecord,
+    observation: TurnObservation,
+    dynamic_selection: DynamicTurnSelection | None,
+) -> dict[str, Any]:
+    """Project an in-memory PTY turn through the canonical evidence redactor."""
+
+    sensitive_turn = _pending_contract_is_sensitive(observation.pending_contract)
+    protected_inputs = [
+        turn.user_message
+        for is_sensitive in (sensitive_turn,)
+        if is_sensitive and turn.user_message
+    ]
+    for index, continuation_turn in enumerate(
+        observation.continuation_turns
+    ):
+        preceding_event = observation.runtime_events[index + 1]
+        if (
+            _pending_contract_is_sensitive(
+                preceding_event.pending_contract
+            )
+            and continuation_turn.user_message
+        ):
+            protected_inputs.append(continuation_turn.user_message)
+    protected_turn_values = tuple(dict.fromkeys(protected_inputs))
+    safe_turn = _redacted_pty_turn(
+        turn,
+        sensitive_input=sensitive_turn,
+        protected_values=protected_turn_values,
+    )
+    safe_selection = (
+        _redacted_dynamic_selection(
+            dynamic_selection,
+            sensitive_input=sensitive_turn,
+            protected_values=protected_turn_values,
+        )
+        if dynamic_selection is not None
+        else None
+    )
+    safe_observation = _redacted_turn_observation(
+        observation,
+        sensitive_input=sensitive_turn,
+        protected_values=protected_turn_values,
+    )
+    turn_payload = redact_secret_references(asdict(safe_turn))
+    sensitive_source_hash = _sensitive_event_hash(identity={
+        "edge_key": str(edge.get("edge_key") or ""),
+        "session_id": safe_turn.session_id,
+        "turn_index": safe_turn.turn_index,
+        "question_id": str(
+            observation.pending_contract.get("id") or ""
+        ),
+    })
+    turn_payload.update({
+        "previous_response_hash": content_hash(safe_turn.previous_agent_response),
+        "user_message_hash": content_hash(safe_turn.user_message),
+        "agent_response_hash": content_hash(safe_turn.agent_response),
+        "source_previous_response_hash": content_hash(
+            safe_turn.previous_agent_response
+        ),
+        "source_user_message_hash": (
+            sensitive_source_hash
+            if sensitive_turn
+            else content_hash(safe_turn.user_message)
+        ),
+        "source_agent_response_hash": content_hash(safe_turn.agent_response),
+    })
+    selection_payload = None
+    if safe_selection is not None:
+        selection_payload = redact_secret_references(asdict(safe_selection))
+        selection_payload["target_coverage_ids"] = list(safe_selection.target_coverage_ids)
+        selection_payload["previous_response_hash"] = content_hash(
+            safe_turn.previous_agent_response
+        )
+    observation_payload = redact_secret_references(
+        _turn_observation_payload(safe_observation)
+    )
+    if sensitive_turn and _contains_tainted_free_text(
+        {
+            "turn": {
+                "previous_agent_response": turn_payload[
+                    "previous_agent_response"
+                ],
+                "user_message": turn_payload["user_message"],
+                "agent_response": turn_payload["agent_response"],
+            },
+            "dynamic_selection": selection_payload or {},
+            "observation": {
+                "prior_agent_response": observation_payload[
+                    "prior_agent_response"
+                ],
+                "exact_user_turn": observation_payload["exact_user_turn"],
+                "simulator_decision": observation_payload[
+                    "simulator_decision"
+                ],
+                "continuation_turns": observation_payload[
+                    "continuation_turns"
+                ],
+                "continuation_simulator_decisions": observation_payload[
+                    "continuation_simulator_decisions"
+                ],
+                "verified_postcondition": observation_payload[
+                    "verified_postcondition"
+                ],
+            },
+        },
+        protected_turn_values,
+    ):
+        raise ValueError("sensitive PTY evidence retains tainted free text")
+    return {
+        "turn": turn_payload,
+        "dynamic_selection": selection_payload,
+        "turn_observation": observation_payload,
+    }
+
+
+def _redacted_pty_turn(
+    turn: PtyCliTurnRecord,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> PtyCliTurnRecord:
+    previous = str(redact(_project_tainted_free_text(
+        turn.previous_agent_response,
+        protected_values,
+    )))
+    user_message = (
+        SENSITIVE_INPUT_MARKER
+        if sensitive_input
+        else str(redact(turn.user_message))
+    )
+    response = str(redact(_project_tainted_free_text(
+        turn.agent_response,
+        protected_values,
+    )))
+    return replace(
+        turn,
+        previous_agent_response=previous,
+        user_message=user_message,
+        agent_response=response,
+        transcript_hash=pty_transcript_hash(
+            session_id=turn.session_id,
+            turn_index=turn.turn_index,
+            previous_agent_response=previous,
+            user_message=user_message,
+            agent_response=response,
+        ),
+    )
+
+
+def _redacted_dynamic_selection(
+    selection: DynamicTurnSelection,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> DynamicTurnSelection:
+    return replace(
+        selection,
+        selected_message=(
+            SENSITIVE_INPUT_MARKER
+            if sensitive_input
+            else str(redact(selection.selected_message))
+        ),
+        persona=str(redact(_project_tainted_free_text(
+            selection.persona,
+            protected_values,
+        ))),
+        goal=str(redact(_project_tainted_free_text(
+            selection.goal,
+            protected_values,
+        ))),
+        rationale=str(redact(_project_tainted_free_text(
+            selection.rationale,
+            protected_values,
+        ))),
+    )
+
+
+def _redacted_turn_observation(
+    observation: TurnObservation,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> TurnObservation:
+    payload = _turn_observation_payload(observation)
+    payload["prior_agent_response"] = str(redact(
+        _project_tainted_free_text(
+            observation.prior_agent_response,
+            protected_values,
+        )
+    ))
+    payload["exact_user_turn"] = (
+        SENSITIVE_INPUT_MARKER
+        if sensitive_input
+        else str(redact(observation.exact_user_turn))
+    )
+    payload["simulator_decision"] = _redacted_simulator_decision(
+        observation.simulator_decision,
+        protected_values=protected_values,
+    )
+    payload["runtime_events"] = [
+        _project_runtime_event_payload(
+            event,
+            protected_values=protected_values,
+        )
+        for event in observation.runtime_events
+    ]
+    if sensitive_input and "selected_message" in payload["simulator_decision"]:
+        payload["simulator_decision"]["selected_message"] = (
+            SENSITIVE_INPUT_MARKER
+        )
+    payload["continuation_turns"] = []
+    for index, turn in enumerate(observation.continuation_turns):
+        preceding_event = observation.runtime_events[index + 1]
+        payload["continuation_turns"].append(asdict(_redacted_pty_turn(
+            turn,
+            sensitive_input=_pending_contract_is_sensitive(
+                preceding_event.pending_contract
+            ),
+            protected_values=protected_values,
+        )))
+    payload["continuation_simulator_decisions"] = [
+        _redacted_simulator_decision(
+            decision,
+            protected_values=protected_values,
+        )
+        for decision in observation.continuation_simulator_decisions
+    ]
+    payload["verified_postcondition"] = _redacted_verified_postcondition_payload(
+        observation.verified_postcondition,
+        protected_values=protected_values,
+    )
+    return _turn_observation_from_payload(redact_secret_references(payload))
+
+
+def _redacted_simulator_decision(
+    decision: Mapping[str, Any],
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Project simulator content separately from coverage identity."""
+
+    payload = {
+        str(key): redact(_project_tainted_free_text(
+            value,
+            protected_values,
+        ))
+        for key, value in decision.items()
+        if str(key) != "target_coverage_ids"
+    }
+    if "target_coverage_ids" in decision:
+        payload["target_coverage_ids"] = [
+            str(value) for value in decision.get("target_coverage_ids") or ()
+        ]
+    return payload
+
+
+def validate_pty_cli_evidence_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    authority: Mapping[str, Any] | None = None,
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+    _candidate_only: bool = False,
+) -> tuple[bool, str]:
+    """Validate a candidate or one proven shard-bundle member.
+
+    A legacy per-item authority receipt proves signature integrity only. It
+    cannot qualify evidence without immutable shard-bundle membership.
+    """
+
+    if artifact.get("artifact_type") != "pty_cli_turn":
+        return False, "artifact is not PTY CLI evidence"
+    if artifact.get("schema_version") != CLI_ARTIFACT_SCHEMA_VERSION:
+        return False, "unsupported PTY CLI evidence schema"
+    if artifact.get("content_redacted") is not True:
+        return False, "PTY CLI evidence does not declare redaction"
+    if not _candidate_only:
+        if authority is None or not trusted_public_key_b64:
+            return False, "PTY evidence requires controller authority"
+        if not isinstance(authority, _PtyBundleAuthorityView):
+            return (
+                False,
+                "legacy per-item authority receipt is non-qualifying; "
+                "PTY evidence requires shard-bundle membership",
+            )
+        artifact_id = str(artifact.get("evidence_id") or "")
+        if (
+            not _is_sha256(authority.bundle_digest)
+            or authority.artifact_id != artifact_id
+            or authority.artifact_hash != str(artifact.get("artifact_hash") or "")
+        ):
+            return False, "PTY shard-bundle membership binding is invalid"
+        authority_valid, authority_reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not authority_valid:
+            return False, authority_reason
+    turn_payload = artifact.get("turn")
+    if not isinstance(turn_payload, Mapping):
+        return False, "PTY evidence has no turn payload"
+    evidence_class = str(artifact.get("evidence_class") or "")
+    lane_error = _lane_error(edge, evidence_class)
+    if lane_error:
+        return False, lane_error
+    expected_runner = {
+        "real_cli": PTY_REAL_CLI_RUNNER,
+        "dynamic_dual_ai": PTY_DYNAMIC_DUAL_AI_RUNNER,
+    }.get(evidence_class)
+    if expected_runner is None:
+        return False, "PTY evidence class is invalid"
+    if str(artifact.get("runner_type") or "") != expected_runner:
+        return False, "PTY runner and evidence class disagree"
+    if str(artifact.get("edge_key") or "") != str(edge.get("edge_key") or ""):
+        return False, "edge key mismatch"
+    if str(artifact.get("contract_hash") or "") != str(edge.get("contract_hash") or ""):
+        return False, "contract hash mismatch"
+    if str(artifact.get("runtime_variant_hash") or "") != str(
+        edge.get("contract_variant_hash") or ""
+    ):
+        return False, "runtime variant hash mismatch"
+    if dict(artifact.get("revision") or {}) != dict(revision):
+        return False, "repository revision mismatch"
+
+    raw_turn = dict(artifact.get("turn") or {})
+    for derived in (
+        "previous_response_hash", "user_message_hash", "agent_response_hash",
+        "source_previous_response_hash", "source_user_message_hash",
+        "source_agent_response_hash",
+    ):
+        raw_turn.pop(derived, None)
+    try:
+        turn = PtyCliTurnRecord(**raw_turn)
+    except (TypeError, ValueError) as exc:
+        return False, f"invalid PTY turn record: {exc}"
+    try:
+        _validate_pty_turn_record(turn)
+    except ValueError as exc:
+        return False, str(exc)
+
+    raw_case = artifact.get("execution_case")
+    raw_receipt = artifact.get("seed_receipt")
+    fixed_real_cli = (
+        evidence_class == "real_cli"
+        and not bool(((edge.get("evidence") or {}).get("dynamic_dual_ai") or {}).get("required"))
+    )
+    if fixed_real_cli:
+        if not isinstance(raw_case, Mapping) or not isinstance(raw_receipt, Mapping):
+            return False, "real CLI artifact has no execution-case seed provenance"
+        if content_hash(raw_case) != str(artifact.get("execution_case_hash") or ""):
+            return False, "execution-case hash mismatch"
+        if content_hash(raw_receipt) != str(artifact.get("seed_receipt_hash") or ""):
+            return False, "seed receipt hash mismatch"
+        try:
+            _validate_real_cli_provenance(
+                edge=edge,
+                turn=turn,
+                observation=_turn_observation_from_payload(
+                    dict(artifact.get("turn_observation") or {})
+                ),
+                execution_case=raw_case,
+                seed_receipt=raw_receipt,
+            )
+        except (TypeError, ValueError) as exc:
+            return False, f"invalid real CLI provenance: {exc}"
+    elif evidence_class != "real_cli" and (
+        raw_case or raw_receipt or artifact.get("execution_case_hash") or artifact.get("seed_receipt_hash")
+    ):
+        return False, "dynamic artifact carries fixed execution-case provenance"
+
+    turn_payload = dict(artifact.get("turn") or {})
+    expected_hashes = {
+        "previous_response_hash": content_hash(turn.previous_agent_response),
+        "user_message_hash": content_hash(turn.user_message),
+        "agent_response_hash": content_hash(turn.agent_response),
+    }
+    if any(turn_payload.get(name) != value for name, value in expected_hashes.items()):
+        return False, "PTY turn content hash mismatch"
+    if content_hash(turn_payload) != str(artifact.get("turn_hash") or ""):
+        return False, "PTY turn hash mismatch"
+
+    controller_context = (
+        expected_controller_context
+        if expected_controller_context is not None
+        else {}
+    )
+    observed_turns = controller_context.get("observed_turns")
+    if controller_context and not isinstance(observed_turns, list):
+        return False, "controller observation ledger is missing"
+    if isinstance(observed_turns, list):
+        previous_controller_hash = ""
+        for item in observed_turns:
+            if not isinstance(item, Mapping):
+                return False, "controller observation ledger is malformed"
+            if item.get("controller_observation_hash"):
+                unsigned_item = dict(item)
+                item_hash = str(
+                    unsigned_item.pop("controller_observation_hash", "") or ""
+                )
+                if (
+                    content_hash(unsigned_item) != item_hash
+                    or item.get("previous_controller_observation_hash")
+                    != previous_controller_hash
+                ):
+                    return False, "controller observation chain is invalid"
+                previous_controller_hash = item_hash
+        matching_observations = [
+            dict(item)
+            for item in observed_turns
+            if isinstance(item, Mapping)
+            and item.get("previous_response_hash")
+            == turn_payload.get("previous_response_hash")
+            and (
+                "turn_index" not in item
+                or int(item.get("turn_index") or 0) == turn.turn_index
+            )
+            and (
+                "edge_key" not in item
+                or str(item.get("edge_key") or "")
+                == str(artifact.get("edge_key") or "")
+            )
+        ]
+        if len(matching_observations) != 1:
+            return False, "PTY turn is not bound to one controller observation"
+        controller_observation = matching_observations[0]
+        raw_observation = artifact.get("turn_observation")
+        simulator_decision = (
+            raw_observation.get("simulator_decision")
+            if isinstance(raw_observation, Mapping)
+            else None
+        )
+        if (
+            not isinstance(simulator_decision, Mapping)
+            or content_hash(simulator_decision)
+            != controller_observation.get("simulator_decision_hash")
+        ):
+            return False, "PTY simulator decision differs from controller observation"
+        if controller_observation.get("controller_observation_hash"):
+            unsigned_controller_observation = dict(controller_observation)
+            controller_observation_hash = str(
+                unsigned_controller_observation.pop(
+                    "controller_observation_hash",
+                    "",
+                )
+                or ""
+            )
+            if (
+                content_hash(unsigned_controller_observation)
+                != controller_observation_hash
+            ):
+                return False, "controller observation receipt hash is invalid"
+            submitted_input_commitment = str(
+                controller_observation.get(
+                    "submitted_input_commitment"
+                )
+                or ""
+            )
+            if not _is_sha256(submitted_input_commitment):
+                return False, "controller input commitment is invalid"
+            approved_hashes = controller_observation.get(
+                "approved_decision_hashes"
+            )
+            context_hashes = controller_observation.get(
+                "simulator_context_hashes"
+            )
+            submission_sequences = controller_observation.get(
+                "submission_sequences"
+            )
+            if (
+                not isinstance(approved_hashes, list)
+                or not approved_hashes
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in approved_hashes
+                )
+                or not isinstance(context_hashes, list)
+                or len(context_hashes) != len(approved_hashes)
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in context_hashes
+                )
+                or not isinstance(submission_sequences, list)
+                or len(submission_sequences) != len(approved_hashes)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                    for value in submission_sequences
+                )
+            ):
+                return False, "controller decision/submission binding is invalid"
+            terminal_outcome_hashes = controller_observation.get(
+                "terminal_outcome_hashes"
+            )
+            if (
+                not isinstance(terminal_outcome_hashes, list)
+                or not terminal_outcome_hashes
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in terminal_outcome_hashes
+                )
+            ):
+                return False, "controller terminal outcome binding is invalid"
+            runtime_events = (
+                raw_observation.get("runtime_events")
+                if isinstance(raw_observation, Mapping)
+                else None
+            )
+            verified_postcondition = (
+                raw_observation.get("verified_postcondition")
+                if isinstance(raw_observation, Mapping)
+                else None
+            )
+            if not isinstance(runtime_events, list) or not isinstance(
+                verified_postcondition,
+                Mapping,
+            ):
+                return False, "PTY controller observation payload is incomplete"
+            exact_bindings = {
+                "turn_index": turn.turn_index,
+                "edge_key": str(artifact.get("edge_key") or ""),
+                "previous_response_hash": turn_payload.get(
+                    "source_previous_response_hash"
+                ),
+                "user_message_hash": turn_payload.get(
+                    "source_user_message_hash"
+                ),
+                "agent_response_hash": turn_payload.get(
+                    "source_agent_response_hash"
+                ),
+                "runtime_event_payload_hashes": [
+                    str(item.get("runtime_event_payload_hash") or "")
+                    for item in runtime_events
+                    if isinstance(item, Mapping)
+                ],
+                "terminal_runtime_event_id": str(
+                    (
+                        runtime_events[-1]
+                        if runtime_events
+                        and isinstance(runtime_events[-1], Mapping)
+                        else {}
+                    ).get("runtime_event_id")
+                    or ""
+                ),
+                "terminal_runtime_event_sequence": (
+                    (
+                        runtime_events[-1]
+                        if runtime_events
+                        and isinstance(runtime_events[-1], Mapping)
+                        else {}
+                    ).get("runtime_event_sequence")
+                ),
+                "verified_postcondition_hash": content_hash(
+                    verified_postcondition
+                ),
+                "turn_observation_hash": content_hash(raw_observation),
+                "candidate_artifact_hash": str(
+                    artifact.get("artifact_hash") or ""
+                ),
+            }
+            if any(
+                controller_observation.get(name) != value
+                for name, value in exact_bindings.items()
+            ):
+                return False, "PTY artifact differs from controller-owned observation"
+
+    selection_payload = artifact.get("dynamic_selection")
+    if evidence_class == "dynamic_dual_ai":
+        if not isinstance(selection_payload, Mapping):
+            return False, "dynamic evidence has no selection record"
+        raw_selection = dict(selection_payload)
+        previous_response_hash = raw_selection.pop("previous_response_hash", "")
+        raw_selection["target_coverage_ids"] = tuple(raw_selection.get("target_coverage_ids") or ())
+        try:
+            selection = DynamicTurnSelection(**raw_selection)
+            _validate_dynamic_selection(turn, selection)
+        except (TypeError, ValueError) as exc:
+            return False, f"invalid dynamic selection: {exc}"
+        if previous_response_hash != content_hash(turn.previous_agent_response):
+            return False, "dynamic selection previous response hash mismatch"
+    elif selection_payload is not None:
+        return False, "scripted real_cli evidence carries a dynamic selection"
+
+    raw_observation = artifact.get("turn_observation")
+    if not isinstance(raw_observation, Mapping):
+        return False, "PTY evidence has no turn observation"
+    try:
+        observation = _turn_observation_from_payload(raw_observation)
+        if any(event.schema_version != 6 for event in observation.runtime_events):
+            return False, "qualifying PTY evidence has a legacy runtime event"
+        if any(
+            not _runtime_event_payload_hash_is_valid(event)
+            for event in observation.runtime_events
+        ):
+            return False, "qualifying PTY runtime payload hash is invalid"
+        _validate_turn_observation(
+            observation,
+            edge=edge,
+            revision=revision,
+            turn=turn,
+            dynamic_selection=(selection if evidence_class == "dynamic_dual_ai" else None),
+        )
+    except (TypeError, ValueError) as exc:
+        return False, f"invalid turn observation: {exc}"
+    if content_hash(raw_observation) != str(artifact.get("turn_observation_hash") or ""):
+        return False, "turn observation hash mismatch"
+    sensitive_turn = _pending_contract_is_sensitive(
+        observation.pending_contract
+    )
+    expected_source_hashes = {
+        "source_previous_response_hash": content_hash(
+            turn.previous_agent_response
+        ),
+        "source_user_message_hash": (
+            _sensitive_event_hash(identity={
+                "edge_key": str(edge.get("edge_key") or ""),
+                "session_id": turn.session_id,
+                "turn_index": turn.turn_index,
+                "question_id": str(
+                    observation.pending_contract.get("id") or ""
+                ),
+            })
+            if sensitive_turn
+            else content_hash(turn.user_message)
+        ),
+        "source_agent_response_hash": content_hash(turn.agent_response),
+    }
+    if any(
+        turn_payload.get(name) != expected
+        for name, expected in expected_source_hashes.items()
+    ):
+        return False, "PTY source boundary hash is not content-derived"
+    if _contains_owning_secret_reference(artifact):
+        return False, "PTY evidence contains an owning secret capability"
+
+    outcome = str(artifact.get("outcome") or "")
+    try:
+        exit_status = int(artifact.get("exit_status"))
+    except (TypeError, ValueError):
+        return False, "PTY exit status is invalid"
+    if outcome != "passed" or exit_status != 0 or str(artifact.get("error") or ""):
+        return False, "qualifying PTY evidence must be an observed pass"
+
+    unsigned = dict(artifact)
+    artifact_hash = str(unsigned.pop("artifact_hash", ""))
+    if content_hash(unsigned) != artifact_hash:
+        return False, "artifact hash mismatch"
+    evidence_payload = dict(unsigned)
+    evidence_id = str(evidence_payload.pop("evidence_id", ""))
+    if content_hash(evidence_payload) != evidence_id:
+        return False, "evidence id mismatch"
+    return True, ""
+
+
+def validate_pty_cli_candidate_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate an unsigned worker candidate before controller admission."""
+
+    return validate_pty_cli_evidence_artifact(
+        artifact,
+        edge=edge,
+        revision=revision,
+        expected_controller_context=controller_context,
+        _candidate_only=True,
+    )
+
+
+def _validate_real_cli_provenance(
+    *,
+    edge: Mapping[str, Any],
+    turn: PtyCliTurnRecord,
+    observation: TurnObservation,
+    execution_case: Mapping[str, Any],
+    seed_receipt: Mapping[str, Any],
+) -> None:
+    from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
+    from tests.agent_live.runtime_checkpoint import validate_seed_receipt
+
+    resolved = reviewed_execution_case(edge)
+    if resolved is None:
+        raise ValueError("ledger edge has no reviewed execution case")
+    scenario, authoritative_case = resolved
+    if dict(execution_case) != authoritative_case.descriptor:
+        raise ValueError("execution case is not the authoritative reviewed descriptor")
+    if authoritative_case.case_id not in set(edge.get("execution_case_ids") or ()):
+        raise ValueError("execution case is not bound to the ledger edge")
+    if authoritative_case.descriptor_hash != str(edge.get("execution_case_hash") or ""):
+        raise ValueError("ledger execution-case hash is stale")
+    validate_seed_receipt(
+        seed_receipt,
+        expected_scenario_id=scenario.scenario_id,
+        expected_session_id=turn.session_id,
+        expected_session_purpose=str(
+            observation.runtime_events[0].session_purpose
+        ),
+    )
+    if not authoritative_case.admits_recorded_input(turn.user_message):
+        raise ValueError("PTY input does not match the reviewed execution case")
+
+
+def _validate_pty_turn_record(turn: PtyCliTurnRecord) -> None:
+    required = {
+        "session_id": turn.session_id,
+        "previous_agent_response": turn.previous_agent_response,
+        "user_message": turn.user_message,
+        "agent_response": turn.agent_response,
+        "provider": turn.provider,
+        "model": turn.model,
+        "before_fingerprint": turn.before_fingerprint,
+        "after_fingerprint": turn.after_fingerprint,
+        "transcript_hash": turn.transcript_hash,
+    }
+    missing = sorted(name for name, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(f"PTY turn is missing: {', '.join(missing)}")
+    if turn.turn_index < 1:
+        raise ValueError("PTY turn index must be positive")
+    for name in ("before_fingerprint", "after_fingerprint", "transcript_hash"):
+        if not _is_sha256(str(getattr(turn, name))):
+            raise ValueError(f"PTY turn fingerprint is invalid: {name}")
+    expected_transcript_hash = pty_transcript_hash(
+        session_id=turn.session_id,
+        turn_index=turn.turn_index,
+        previous_agent_response=turn.previous_agent_response,
+        user_message=turn.user_message,
+        agent_response=turn.agent_response,
+    )
+    if turn.transcript_hash != expected_transcript_hash:
+        raise ValueError("PTY transcript hash does not match the recorded turn")
+    if not (
+        turn.previous_response_received_at_ns
+        <= turn.user_message_submitted_at_ns
+        <= turn.agent_response_received_at_ns
+    ):
+        raise ValueError("PTY turn timestamps are not ordered")
+
+
+def _validate_dynamic_selection(
+    turn: PtyCliTurnRecord,
+    selection: DynamicTurnSelection,
+) -> None:
+    if selection.selection_mode != "response_driven":
+        raise ValueError("fixed or scripted prompts cannot be labeled dynamic_dual_ai")
+    if selection.simulator.casefold() != "codex":
+        raise ValueError("dynamic_dual_ai requires the Codex user simulator")
+    if selection.selected_message != turn.user_message:
+        raise ValueError("dynamic selected message differs from the PTY user message")
+    if not all((selection.persona.strip(), selection.goal.strip(), selection.rationale.strip())):
+        raise ValueError("dynamic selection requires persona, goal, and rationale")
+    if not selection.target_coverage_ids or any(
+        not str(item or "").strip() for item in selection.target_coverage_ids
+    ):
+        raise ValueError("dynamic selection requires target coverage ids")
+    if not (
+        turn.previous_response_received_at_ns
+        <= selection.selected_at_ns
+        <= turn.user_message_submitted_at_ns
+    ):
+        raise ValueError("dynamic message was not selected after the previous response")
+
+
+def _turn_observation_payload(observation: TurnObservation) -> dict[str, Any]:
+    payload = asdict(observation)
+    payload["runtime_events"] = [
+        {**asdict(event), "action_queue_types": list(event.action_queue_types)}
+        for event in observation.runtime_events
+    ]
+    postcondition = asdict(observation.verified_postcondition)
+    postcondition["observed_coverage_ids"] = list(
+        observation.verified_postcondition.observed_coverage_ids
+    )
+    postcondition["admitted_typed_actions"] = list(
+        observation.verified_postcondition.admitted_typed_actions
+    )
+    postcondition["job_artifacts"] = [
+        dict(item) for item in observation.verified_postcondition.job_artifacts
+    ]
+    payload["verified_postcondition"] = postcondition
+    return payload
+
+
+def turn_observation_payload(observation: TurnObservation) -> dict[str, Any]:
+    """Return the canonical public serialization for a turn observation."""
+
+    return _turn_observation_payload(observation)
+
+
+def _turn_observation_from_payload(payload: Mapping[str, Any]) -> TurnObservation:
+    values = dict(payload)
+    values["runtime_events"] = tuple(
+        RuntimeTurnEvent(
+            **{
+                **dict(item),
+                "action_queue_types": tuple(dict(item).get("action_queue_types") or ()),
+                "admitted_action_types": tuple(
+                    dict(item).get("admitted_action_types") or ()
+                ),
+            }
+        )
+        for item in values.get("runtime_events") or ()
+    )
+    values["continuation_turns"] = tuple(
+        PtyCliTurnRecord(**dict(item))
+        for item in values.get("continuation_turns") or ()
+    )
+    values["continuation_simulator_decisions"] = tuple(
+        dict(item)
+        for item in values.get("continuation_simulator_decisions") or ()
+    )
+    raw_postcondition = dict(values.get("verified_postcondition") or {})
+    raw_postcondition["observed_coverage_ids"] = tuple(
+        raw_postcondition.get("observed_coverage_ids") or ()
+    )
+    raw_postcondition["admitted_typed_actions"] = tuple(
+        raw_postcondition.get("admitted_typed_actions") or ()
+    )
+    raw_postcondition["job_artifacts"] = tuple(
+        dict(item) for item in raw_postcondition.get("job_artifacts") or ()
+    )
+    values["verified_postcondition"] = VerifiedPostcondition(**raw_postcondition)
+    return TurnObservation(**values)
+
+
+def _validate_turn_observation(
+    observation: TurnObservation,
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    turn: PtyCliTurnRecord,
+    dynamic_selection: DynamicTurnSelection | None,
+) -> None:
+    if observation.schema_version != TURN_OBSERVATION_SCHEMA_VERSION:
+        raise ValueError("unsupported turn observation schema")
+    if dict(observation.revision) != dict(revision):
+        raise ValueError("turn observation repository revision mismatch")
+    expected_identity = (
+        str(edge.get("edge_key") or ""),
+        str(edge.get("contract_hash") or ""),
+        str(edge.get("contract_variant_hash") or ""),
+    )
+    observed_identity = (
+        observation.target_edge_key,
+        observation.target_contract_hash,
+        observation.target_variant_hash,
+    )
+    if observed_identity != expected_identity:
+        raise ValueError("turn observation target is not the authoritative ledger edge")
+    if observation.prior_agent_response != turn.previous_agent_response:
+        raise ValueError("turn observation prior response mismatch")
+    if observation.exact_user_turn != turn.user_message:
+        raise ValueError("turn observation user turn mismatch")
+    if observation.provider != turn.provider or observation.model != turn.model:
+        raise ValueError("turn observation provider identity mismatch")
+    if not observation.provider.strip() or not observation.model.strip():
+        raise ValueError("turn observation provider identity is missing")
+    if observation.before_turn_index < 0:
+        raise ValueError("turn observation before turn index is invalid")
+    if len(observation.runtime_events) < 2:
+        raise ValueError("turn observation requires a baseline and at least one committed event")
+    baseline, committed, *continuation_events = observation.runtime_events
+    expected_after_index = observation.before_turn_index + len(observation.runtime_events) - 1
+    if observation.after_turn_index != expected_after_index:
+        raise ValueError("turn observation indexes do not cover its complete event chain")
+    if turn.turn_index != observation.before_turn_index + 1:
+        raise ValueError("root PTY turn does not immediately follow the baseline")
+    if len(observation.continuation_turns) != len(continuation_events):
+        raise ValueError("continuation PTY turns do not match continuation runtime events")
+    for event in observation.runtime_events:
+        _validate_runtime_event(event)
+        if dict(event.revision) != dict(observation.revision):
+            raise ValueError("runtime event revision mismatch within linked journey")
+        if event.thread_id != turn.session_id:
+            raise ValueError("runtime event thread does not match the PTY session")
+        if event.session_purpose != baseline.session_purpose:
+            raise ValueError("runtime event session purpose changed")
+    for previous, current in zip(
+        observation.runtime_events,
+        observation.runtime_events[1:],
+    ):
+        if (
+            current.event_type != "turn_committed"
+            and not (
+                current.schema_version < 4
+                and current.event_type == "turn_recovered"
+            )
+        ):
+            raise ValueError("linked runtime event is not a committed turn")
+        if current.turn_index != previous.turn_index + 1:
+            raise ValueError("linked runtime event turn indexes are not contiguous")
+        if current.before_fingerprint != previous.after_fingerprint:
+            raise ValueError("linked runtime event fingerprint chain is stale")
+    if baseline.turn_index != observation.before_turn_index:
+        raise ValueError("baseline runtime event turn index is stale")
+    terminal_event = observation.runtime_events[-1]
+    if terminal_event.turn_index != observation.after_turn_index:
+        raise ValueError("terminal runtime event turn index is stale")
+    if observation.before_state_fingerprint != committed.before_fingerprint:
+        raise ValueError("turn observation before fingerprint mismatch")
+    if observation.after_state_fingerprint != terminal_event.after_fingerprint:
+        raise ValueError("turn observation after fingerprint mismatch")
+    if turn.before_fingerprint != committed.before_fingerprint:
+        raise ValueError("PTY before fingerprint was not observed from the committed event")
+    if turn.after_fingerprint != committed.after_fingerprint:
+        raise ValueError("PTY after fingerprint was not observed from the committed event")
+    for continuation_turn, continuation_event in zip(
+        observation.continuation_turns,
+        continuation_events,
+    ):
+        _validate_pty_turn_record(continuation_turn)
+        if continuation_turn.session_id != turn.session_id:
+            raise ValueError("continuation PTY turn changed session identity")
+        if continuation_turn.provider != turn.provider or continuation_turn.model != turn.model:
+            raise ValueError("continuation PTY turn changed provider identity")
+        if continuation_turn.turn_index != continuation_event.turn_index:
+            raise ValueError("continuation PTY and runtime turn indexes disagree")
+        if continuation_turn.before_fingerprint != continuation_event.before_fingerprint:
+            raise ValueError("continuation PTY before fingerprint mismatch")
+        if continuation_turn.after_fingerprint != continuation_event.after_fingerprint:
+            raise ValueError("continuation PTY after fingerprint mismatch")
+    if dict(observation.pending_contract) != dict(baseline.pending_contract):
+        raise ValueError("pending contract is not bound to the baseline runtime event")
+    edge_type = str(edge.get("edge_type") or "")
+    if edge_type != "action_transition" and not baseline.pending_question_id:
+        raise ValueError("baseline runtime event has no pending contract")
+    elif edge_type != "action_transition":
+        expected_question = str(edge.get("question_id") or "")
+        if baseline.pending_question_id != expected_question:
+            raise ValueError("baseline pending question does not match the target edge")
+        from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+
+        if contract_variant_hash(baseline.pending_contract) != str(
+            edge.get("contract_hash") or ""
+        ):
+            raise ValueError("baseline pending contract hash does not match the target edge")
+    if dynamic_selection is not None:
+        if dict(observation.simulator_decision) != {
+            **asdict(dynamic_selection),
+            "target_coverage_ids": list(dynamic_selection.target_coverage_ids),
+        }:
+            raise ValueError("turn observation simulator decision mismatch")
+        if observation.target_edge_key not in dynamic_selection.target_coverage_ids:
+            raise ValueError("dynamic selection did not target the authoritative edge key")
+        if len(observation.continuation_simulator_decisions) != len(
+            observation.continuation_turns
+        ):
+            raise ValueError("continuation simulator decisions do not match continuation turns")
+        for continuation_turn, raw_selection in zip(
+            observation.continuation_turns,
+            observation.continuation_simulator_decisions,
+        ):
+            selection_values = dict(raw_selection)
+            selection_values["target_coverage_ids"] = tuple(
+                selection_values.get("target_coverage_ids") or ()
+            )
+            continuation_selection = DynamicTurnSelection(**selection_values)
+            _validate_dynamic_selection(continuation_turn, continuation_selection)
+            if observation.target_edge_key not in continuation_selection.target_coverage_ids:
+                raise ValueError("continuation selection lost the authoritative edge target")
+    elif observation.simulator_decision:
+        raise ValueError("real CLI observation must not claim a simulator decision")
+    elif observation.continuation_simulator_decisions:
+        raise ValueError("real CLI observation must not claim continuation simulator decisions")
+
+    postcondition = observation.verified_postcondition
+    if not postcondition.verifier_id.strip():
+        raise ValueError("turn observation postcondition verifier is missing")
+    if not postcondition.passed:
+        raise ValueError("turn observation postcondition did not pass")
+    if observation.target_edge_key not in postcondition.observed_coverage_ids:
+        raise ValueError("verified postcondition did not observe the target edge")
+    rejection_expected = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and edge.get("expected_admitted") is False
+    )
+    if not postcondition.admitted_typed_actions and not rejection_expected:
+        raise ValueError("verified postcondition has no admitted typed actions")
+    if not postcondition.state_diff:
+        raise ValueError("verified postcondition has no state diff")
+    if not postcondition.next_question_or_result:
+        raise ValueError("verified postcondition has no next question or result")
+    if not postcondition.details:
+        raise ValueError("verified postcondition has no assertion details")
+    if edge.get("real_execution_required") and not postcondition.job_artifacts:
+        raise ValueError("real execution edge has no verified job artifact")
+    for artifact in postcondition.job_artifacts:
+        if not all(str(artifact.get(name) or "").strip() for name in ("path", "sha256")):
+            raise ValueError("verified job artifact identity is incomplete")
+        if not _is_sha256(str(artifact.get("sha256") or "")):
+            raise ValueError("verified job artifact hash is invalid")
+
+
+def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
+    if event.schema_version not in {2, 3, 4, 5, 6}:
+        raise ValueError("unsupported runtime turn event schema")
+    if event.schema_version >= 4 and event.event_type != "turn_committed":
+        raise ValueError("runtime event transaction type must be turn_committed")
+    if event.schema_version < 4 and event.event_type not in {
+        "startup_snapshot",
+        "turn_committed",
+        "turn_recovered",
+    }:
+        raise ValueError("runtime event type is not observable")
+    if event.schema_version >= 4 and not event.observation.strip():
+        raise ValueError("runtime event observation is missing")
+    if not event.thread_id.strip() or not event.session_purpose.strip():
+        raise ValueError("runtime event identity is missing")
+    if event.turn_index < 0:
+        raise ValueError("runtime event turn index is invalid")
+    for value in (event.before_fingerprint, event.after_fingerprint):
+        if not _is_sha256(value):
+            raise ValueError("runtime event fingerprint is invalid")
+    if not event.revision.get("commit") or not _is_sha256(
+        str(event.revision.get("worktree_hash") or "")
+    ):
+        raise ValueError("runtime event revision is invalid")
+    if event.schema_version >= 3:
+        turn_receipt = dict(event.turn_receipt_summary or {})
+        if turn_receipt:
+            if (
+                not str(turn_receipt.get("turn_id") or "")
+                or not _is_sha256(str(turn_receipt.get("input_hash") or ""))
+            ):
+                raise ValueError("runtime turn receipt identity is invalid")
+            if event.schema_version >= 6 and not _is_sha256(
+                str(turn_receipt.get("submitted_input_hash") or "")
+            ):
+                raise ValueError(
+                    "runtime submitted input identity is invalid"
+                )
+            admitted_ids = [
+                str(item)
+                for item in turn_receipt.get("admitted_action_ids") or ()
+                if str(item)
+            ]
+            provenance_ids = [
+                str(item.get("action_id") or "")
+                for item in event.admitted_action_provenance
+                if str(item.get("action_id") or "")
+            ]
+            if (
+                len(provenance_ids) != len(set(provenance_ids))
+                or any(item not in provenance_ids for item in admitted_ids)
+            ):
+                raise ValueError(
+                    "runtime turn receipt is not covered by transaction action provenance"
+                )
+            execution_order = [
+                str(item)
+                for item in turn_receipt.get("execution_order") or ()
+                if str(item)
+            ]
+            if any(item not in admitted_ids for item in execution_order):
+                raise ValueError("runtime turn receipt executed an unadmitted action")
+        for action in event.admitted_action_provenance:
+            if not isinstance(action, Mapping) or not str(action.get("type") or ""):
+                raise ValueError("runtime action provenance is invalid")
+            for field_name in ("arguments_hash", "source_hash"):
+                if not _is_sha256(str(action.get(field_name) or "")):
+                    raise ValueError("runtime action provenance hash is invalid")
+            value_hashes = action.get("argument_value_hashes")
+            if (
+                not isinstance(value_hashes, Mapping)
+                or set(value_hashes)
+                != set(action.get("argument_names") or ())
+                or any(
+                    not str(key)
+                    or not _is_sha256(str(value))
+                    for key, value in value_hashes.items()
+                )
+            ):
+                raise ValueError(
+                    "runtime action argument-value provenance is invalid"
+                )
+        transition = dict(event.pending_transition or {})
+        for field_name in ("before_hash", "after_hash"):
+            if not _is_sha256(str(transition.get(field_name) or "")):
+                raise ValueError("runtime pending transition hash is invalid")
+        manifest = dict(event.render_manifest or {})
+        if any(
+            not _is_sha256(str(item))
+            for item in manifest.get("fragment_hashes") or ()
+        ):
+            raise ValueError("runtime render manifest hash is invalid")
+        for receipt in event.control_receipts:
+            if (
+                not isinstance(receipt, Mapping)
+                or not str(receipt.get("receipt_type") or "")
+                or not _is_sha256(str(receipt.get("receipt_id") or ""))
+            ):
+                raise ValueError("runtime control receipt is invalid")
+            unsigned = dict(receipt)
+            receipt_id = str(unsigned.pop("receipt_id"))
+            if content_hash(unsigned) != receipt_id:
+                raise ValueError("runtime control receipt hash is stale")
+            valid, reason = validate_persisted_domain_control_receipt(
+                receipt,
+                turn_index=event.turn_index,
+            )
+            if not valid:
+                raise ValueError(
+                    f"runtime domain control receipt is invalid: {reason}"
+                )
+        for path, hashes in event.material_state_diff_hashes.items():
+            if (
+                not str(path)
+                or not isinstance(hashes, Mapping)
+                or any(
+                    value and not _is_sha256(str(value))
+                    for value in (
+                        hashes.get("before"),
+                        hashes.get("after"),
+                    )
+                )
+            ):
+                raise ValueError("runtime material state diff is invalid")
+    if event.schema_version >= 4:
+        if (
+            not event.runtime_event_id
+            or not event.terminal_event_id
+            or not event.transaction_id
+            or event.terminal_outcome != "committed"
+            or not _is_sha256(event.render_hash)
+            or not isinstance(event.product_revision, int)
+            or event.product_revision < 0
+            or not event.product_checkpoint_thread_id
+            or not event.product_checkpoint_id
+        ):
+            raise ValueError("runtime event terminal transaction binding is invalid")
+    if event.schema_version >= 5:
+        if (
+            not isinstance(event.base_revision, int)
+            or event.base_revision < 0
+            or not event.base_checkpoint_thread_id
+            or not event.base_checkpoint_id
+            or event.product_revision != event.base_revision + 1
+            or not isinstance(event.runtime_event_sequence, int)
+            or event.runtime_event_sequence < 1
+            or event.runtime_event_sequence != event.product_revision
+            or not _is_sha256(event.runtime_event_payload_hash)
+        ):
+            raise ValueError(
+                "runtime event complete Product Head binding is invalid"
+            )
+    if event.schema_version >= 6:
+        if (
+            not event.product_authority_id
+            or event.product_authority_id
+            != f"{event.session_purpose}:{event.thread_id}"
+            or not event.physical_thread_id
+            or not event.attempt_checkpoint_id
+            or event.product_checkpoint_thread_id
+            != event.physical_thread_id
+            or event.product_checkpoint_id
+            != event.attempt_checkpoint_id
+        ):
+            raise ValueError(
+                "runtime event Product Head authority or attempt binding is invalid"
+            )
+    if str(event.pending_contract.get("id") or "") != event.pending_question_id:
+        raise ValueError("runtime event pending contract identity is inconsistent")
+
+
+def validate_runtime_turn_event(event: RuntimeTurnEvent) -> None:
+    """Validate one complete runtime event at an external evidence boundary."""
+
+    _validate_runtime_event(event)
+
+
+def verify_runtime_postcondition(
+    edge: Mapping[str, Any],
+    baseline: RuntimeTurnEvent,
+    committed: RuntimeTurnEvent,
+    turn: PtyCliTurnRecord,
+    *,
+    continuation_events: Iterable[RuntimeTurnEvent] = (),
+) -> VerifiedPostcondition:
+    """Verify an immediate turn or a linked deferred-transition journey.
+
+    This verifier is fixed by the evidence module. Callers cannot replace it
+    with a callback that simply declares the scheduled edge successful. A
+    prerequisite-deferred first turn never qualifies by itself.
+    """
+
+    errors: list[str] = []
+    linked_events = tuple(continuation_events)
+    if committed.before_fingerprint != baseline.after_fingerprint:
+        errors.append("runtime fingerprint chain did not advance from the baseline")
+    if committed.turn_index != baseline.turn_index + 1:
+        errors.append("runtime turn index did not advance exactly once")
+    edge_type = str(edge.get("edge_type") or "")
+    admitted = tuple(item for item in committed.admitted_action_types if item)
+    rejection_expected = edge_type == "manual_input" and edge.get("expected_admitted") is False
+    if not admitted and not rejection_expected:
+        errors.append("runtime emitted no admitted typed action")
+    scheduled_action = str(edge.get("action_type") or "")
+    navigation_transition_outcome = ""
+    expected_admitted_actions = {
+        str(item)
+        for item in edge.get("expected_admitted_action_types") or ()
+        if str(item)
+    }
+    if edge_type == "question_option" and expected_admitted_actions:
+        declared_by_pending = {
+            str(item)
+            for item in baseline.pending_contract.get("accepted_action_types") or ()
+            if str(item)
+        }
+        undeclared_equivalents = sorted(expected_admitted_actions - declared_by_pending)
+        if undeclared_equivalents:
+            errors.append(
+                "option-owner equivalence was not declared by the pending contract: "
+                + ", ".join(undeclared_equivalents)
+            )
+        if not expected_admitted_actions.intersection(admitted):
+            errors.append(
+                "no declared option-owner action was admitted: expected one of "
+                f"{sorted(expected_admitted_actions)}"
+            )
+    elif (
+        edge_type in {"action_transition", "question_option"}
+        and scheduled_action
+        and scheduled_action not in admitted
+    ):
+        errors.append(f"scheduled action was not admitted: {scheduled_action}")
+    if edge_type == "action_transition" and scheduled_action == "change_group":
+        navigation_targets = {
+            str(item.get("group") or "")
+            for item in committed.admitted_action_targets
+            if str(item.get("type") or "") == "change_group"
+            and str(item.get("group") or "")
+        }
+        visible_group = str((committed.next_result or {}).get("group") or committed.active_group or "")
+        if not navigation_targets:
+            errors.append("change_group emitted no admitted destination")
+        expected_target = str((edge.get("expected_postcondition") or {}).get("target_group") or "")
+        if expected_target and expected_target not in navigation_targets:
+            errors.append(
+                "change_group admitted the wrong destination: "
+                f"expected={expected_target}, admitted={sorted(navigation_targets)}"
+            )
+        else:
+            navigation_contract = dict(
+                (edge.get("expected_postcondition") or {}).get("navigation_transition") or {}
+            )
+            admitted_target = next(iter(navigation_targets)) if len(navigation_targets) == 1 else ""
+            immediate_group = str(
+                navigation_contract.get("immediate_group")
+                or expected_target
+                or admitted_target
+                or ""
+            )
+            deferred_groups = {
+                str(item)
+                for item in navigation_contract.get("prerequisite_deferred_groups") or ()
+                if str(item)
+            }
+            deferred_target_observed = bool(
+                expected_target
+                and _postcondition_value_matches(
+                    committed.after_value_hashes,
+                    "control.deferred_group",
+                    expected_target,
+                )
+            )
+            if visible_group == immediate_group and not deferred_target_observed:
+                navigation_transition_outcome = "immediate"
+            elif deferred_target_observed and visible_group in deferred_groups:
+                navigation_transition_outcome = "prerequisite_deferred"
+            else:
+                errors.append(
+                    "change_group destination was not observed as either immediate or "
+                    "prerequisite-deferred: "
+                    f"visible={visible_group or '<none>'}, target={expected_target or '<none>'}, "
+                    f"prerequisites={sorted(deferred_groups)}"
+                )
+    if edge_type == "manual_input":
+        expected_question = str(edge.get("question_id") or "")
+        if expected_question and baseline.pending_question_id != expected_question:
+            errors.append(f"manual input baseline question mismatch: {expected_question}")
+        accepted = {
+            str(item).strip()
+            for item in baseline.pending_contract.get("accepted_action_types") or []
+            if str(item).strip()
+        }
+        interrupts_pending = bool(edge.get("interrupts_pending_contract"))
+        if (
+            not rejection_expected
+            and not interrupts_pending
+            and not accepted.intersection(admitted)
+        ):
+            errors.append("manual input admitted no action declared by the pending contract")
+        if rejection_expected and admitted and not accepted.intersection(admitted):
+            errors.append("rejected manual input admitted an unrelated action")
+
+    expected = dict(edge.get("expected_postcondition") or {})
+    expected_paths: list[str] = []
+    structured_review_keys: list[str] = []
+    deferred_option_action = ""
+    deferred_option_prerequisite = ""
+    if edge_type == "question_option":
+        deferred_contract = {
+            str(action_type): tuple(str(item) for item in prerequisites if str(item))
+            for action_type, prerequisites in (
+                edge.get("prerequisite_deferred_actions") or {}
+            ).items()
+        }
+        visible_group = str(
+            (committed.next_result or {}).get("group") or committed.active_group or ""
+        )
+        for action_type in admitted:
+            prerequisites = deferred_contract.get(action_type, ())
+            if (
+                action_type in committed.action_queue_types
+                and visible_group in prerequisites
+            ):
+                deferred_option_action = action_type
+                deferred_option_prerequisite = visible_group
+                if committed.pending_contract.get("resume_action_queue") is not True:
+                    errors.append(
+                        "prerequisite-deferred option did not preserve the queue barrier"
+                    )
+                break
+    if scheduled_action == "propose_config_values" and turn is not None:
+        from agent.harness.domains.environment import extract_structured_input_candidates
+
+        candidates = extract_structured_input_candidates(turn.user_message) or {}
+        structured_paths = {
+            **{
+                str(key): f"inferred_config.pending_review.config_values.{key}"
+                for key in (candidates.get("config_values") or {})
+            },
+            **{
+                str(key): f"inferred_config.pending_review.unmapped_values.{key}"
+                for key in (candidates.get("unmapped_values") or {})
+            },
+        }
+        for key, path in structured_paths.items():
+            structured_review_keys.append(key)
+            if not _path_value_hashes(committed.after_value_hashes, path):
+                errors.append(f"structured review silently lost source key: {key}")
+    if edge_type == "question_option":
+        for path, value in expected.items():
+            expected_paths.append(str(path))
+            if deferred_option_action:
+                if _path_value_hashes(committed.after_value_hashes, str(path)) != _path_value_hashes(
+                    baseline.after_value_hashes, str(path)
+                ):
+                    errors.append(
+                        f"prerequisite-deferred option mutated its destination early: {path}"
+                    )
+            elif not _postcondition_value_matches(
+                committed.after_value_hashes,
+                str(path),
+                value,
+            ):
+                errors.append(f"expected postcondition was not observed: {path}")
+        if not deferred_option_action:
+            _verify_runtime_state_relations(
+                tuple(edge.get("expected_state_relations") or ()),
+                baseline,
+                committed,
+                errors,
+            )
+    elif edge_type == "manual_input":
+        path = str(expected.get("path") or "").strip()
+        if path:
+            expected_paths.append(path)
+            after_hashes = _path_value_hashes(committed.after_value_hashes, path)
+            before_hashes = _path_value_hashes(baseline.after_value_hashes, path)
+            if rejection_expected:
+                if "rejection_value" in expected and not _postcondition_value_matches(
+                    committed.after_value_hashes,
+                    path,
+                    expected["rejection_value"],
+                ):
+                    errors.append(
+                        f"rejected manual input did not record declared evidence: {path}"
+                    )
+                elif "rejection_value" not in expected and after_hashes != before_hashes:
+                    errors.append(f"rejected manual input changed the destination field: {path}")
+                if committed.pending_question_id != baseline.pending_question_id:
+                    errors.append("rejected manual input did not preserve the pending question")
+                from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+
+                if contract_variant_hash(committed.pending_contract) != contract_variant_hash(
+                    baseline.pending_contract
+                ):
+                    errors.append("rejected manual input changed the pending contract")
+            elif not after_hashes:
+                errors.append(f"manual-input postcondition was not observed: {path}")
+            elif after_hashes == before_hashes:
+                errors.append(f"manual-input postcondition did not change: {path}")
+            elif "value" in expected and not _postcondition_value_matches(
+                committed.after_value_hashes,
+                path,
+                expected["value"],
+            ):
+                errors.append(f"manual-input postcondition value mismatch: {path}")
+        expected_next_ids = {
+            str(item).strip()
+            for item in expected.get("next_question_ids") or []
+            if str(item).strip()
+        }
+        if (
+            not rejection_expected
+            and expected_next_ids
+            and committed.pending_question_id not in expected_next_ids
+        ):
+            errors.append(
+                "manual input reached an unexpected next question: "
+                f"{committed.pending_question_id or '<none>'}; "
+                f"expected one of {sorted(expected_next_ids)}"
+            )
+
+    next_result = dict(committed.next_result or {})
+    if not next_result:
+        errors.append("runtime emitted no next question or terminal result")
+    state_diff = dict(committed.state_diff_hashes or {})
+    if not state_diff:
+        errors.append("runtime emitted no state transition")
+
+    deferred_transition = bool(
+        navigation_transition_outcome == "prerequisite_deferred"
+        or deferred_option_action
+    )
+    terminal_event = committed
+    journey_status = "not_required"
+    pre_journey_errors = tuple(errors)
+    linkage_errors: tuple[str, ...] = ()
+    if deferred_transition:
+        journey_status = "awaiting_terminal_postcondition"
+        if not linked_events:
+            errors.append(
+                "prerequisite-deferred transition requires linked multi-turn "
+                "terminal postcondition evidence"
+            )
+        else:
+            previous = committed
+            linkage_error_start = len(errors)
+            for index, event in enumerate(linked_events, start=1):
+                if event.thread_id != committed.thread_id:
+                    errors.append(f"linked journey event {index} changed thread identity")
+                if event.session_purpose != committed.session_purpose:
+                    errors.append(f"linked journey event {index} changed session purpose")
+                if dict(event.revision) != dict(committed.revision):
+                    errors.append(f"linked journey event {index} changed repository revision")
+                if event.turn_index != previous.turn_index + 1:
+                    errors.append(f"linked journey event {index} is not the next turn")
+                if event.before_fingerprint != previous.after_fingerprint:
+                    errors.append(
+                        f"linked journey event {index} broke the fingerprint chain"
+                    )
+                previous = event
+            linkage_errors = tuple(errors[linkage_error_start:])
+            terminal_event = linked_events[-1]
+            terminal_visible_group = str(
+                (terminal_event.next_result or {}).get("group")
+                or terminal_event.active_group
+                or ""
+            )
+            if navigation_transition_outcome == "prerequisite_deferred":
+                target_group = str(expected.get("target_group") or "")
+                if terminal_visible_group != target_group:
+                    errors.append(
+                        "linked navigation journey did not reach its terminal group: "
+                        f"expected={target_group or '<none>'}, "
+                        f"visible={terminal_visible_group or '<none>'}"
+                    )
+                if _path_value_hashes(
+                    terminal_event.after_value_hashes,
+                    "control.deferred_group",
+                ):
+                    errors.append("linked navigation journey did not clear its deferred target")
+            if deferred_option_action:
+                for path, value in expected.items():
+                    if not _postcondition_value_matches(
+                        terminal_event.after_value_hashes,
+                        str(path),
+                        value,
+                    ):
+                        errors.append(
+                            f"linked option journey did not reach terminal postcondition: {path}"
+                        )
+                if deferred_option_action in terminal_event.action_queue_types:
+                    errors.append("linked option journey did not drain its deferred action")
+                _verify_runtime_state_relations(
+                    tuple(edge.get("expected_state_relations") or ()),
+                    baseline,
+                    terminal_event,
+                    errors,
+                )
+            if not terminal_event.next_result:
+                errors.append("linked journey emitted no terminal question or result")
+            if not errors:
+                journey_status = "terminal_postcondition_observed"
+
+    continuation_eligible = bool(
+        deferred_transition
+        and journey_status == "awaiting_terminal_postcondition"
+        and not pre_journey_errors
+        and not linkage_errors
+    )
+
+    edge_key = str(edge.get("edge_key") or "")
+    observed_actions = tuple(dict.fromkeys(
+        action_type
+        for event in (committed, *linked_events)
+        for action_type in event.admitted_action_types
+        if action_type
+    ))
+    combined_state_diff = {
+        path: hashes
+        for event in (committed, *linked_events)
+        for path, hashes in event.state_diff_hashes.items()
+    }
+    details = {
+        "baseline_question_id": baseline.pending_question_id,
+        "committed_question_id": committed.pending_question_id,
+        "expected_postcondition_paths": sorted(expected_paths),
+        "expected_admitted": edge.get("expected_admitted"),
+        "transition_outcome": (
+            navigation_transition_outcome
+            or ("prerequisite_deferred" if deferred_option_action else "immediate")
+        ),
+        "deferred_action": deferred_option_action,
+        "deferred_prerequisite": deferred_option_prerequisite,
+        "journey_status": journey_status,
+        "continuation_eligible": continuation_eligible,
+        "pre_journey_errors": list(pre_journey_errors),
+        "linkage_errors": list(linkage_errors),
+        "linked_turn_count": len(linked_events),
+        "structured_review_keys": sorted(structured_review_keys),
+        "rejection_observed": bool(rejection_expected and not errors),
+        "errors": errors,
+    }
+    return VerifiedPostcondition(
+        verifier_id="anychain.runtime-transition-proof.v1",
+        passed=not errors,
+        observed_coverage_ids=(edge_key,) if not errors and edge_key else (),
+        admitted_typed_actions=observed_actions,
+        state_diff=combined_state_diff,
+        next_question_or_result=dict(terminal_event.next_result or {}),
+        details=details,
+    )
+
+
+def _path_value_hashes(values: Mapping[str, str], path: str) -> dict[str, str]:
+    """Return one scalar hash or all leaf hashes owned by a structured path."""
+
+    prefix = f"{path}."
+    return {
+        candidate[len(prefix):] if candidate.startswith(prefix) else "": value
+        for candidate, value in values.items()
+        if candidate == path or candidate.startswith(prefix)
+    }
+
+
+def _postcondition_value_matches(
+    observed: Mapping[str, str],
+    path: str,
+    expected: Any,
+) -> bool:
+    expected_hashes = _leaf_hashes_for_expected(expected)
+    return _path_value_hashes(observed, path) == expected_hashes
+
+
+def _leaf_hashes_for_expected(value: Any, prefix: tuple[str, ...] = ()) -> dict[str, str]:
+    if isinstance(value, Mapping) and value:
+        output: dict[str, str] = {}
+        for key in sorted(value, key=str):
+            output.update(_leaf_hashes_for_expected(value[key], (*prefix, str(key))))
+        return output
+    return {".".join(prefix): content_hash(value)}
+
+
+def _verify_runtime_state_relations(
+    relations: tuple[Mapping[str, Any], ...],
+    baseline: RuntimeTurnEvent,
+    committed: RuntimeTurnEvent,
+    errors: list[str],
+) -> None:
+    for relation in relations:
+        kind = str(relation.get("kind") or "")
+        if kind == "path_absent_after":
+            path = str(relation.get("path") or "")
+            observed = any(
+                candidate == path or candidate.startswith(f"{path}.")
+                for candidate in committed.after_value_hashes
+            )
+            if not path or observed:
+                errors.append(f"state relation path remains present: {path or '<empty>'}")
+            continue
+        if kind == "path_equals_before_path":
+            after_path = str(relation.get("after_path") or "")
+            before_path = str(relation.get("before_path") or "")
+            if (
+                not before_path
+                or not after_path
+                or before_path not in baseline.after_value_hashes
+                or after_path not in committed.after_value_hashes
+                or baseline.after_value_hashes[before_path] != committed.after_value_hashes[after_path]
+            ):
+                errors.append(f"state relation was not observed: {after_path} <- {before_path}")
+            continue
+        if kind == "prefix_equals_before_prefix":
+            after_prefix = str(relation.get("after_prefix") or "")
+            before_prefix = str(relation.get("before_prefix") or "")
+            ignored = {str(item) for item in relation.get("ignored_suffixes") or ()}
+            before_values = {
+                path[len(before_prefix):]: value
+                for path, value in baseline.after_value_hashes.items()
+                if path == before_prefix or path.startswith(f"{before_prefix}.")
+                if path.rsplit(".", 1)[-1] not in ignored
+            }
+            after_values = {
+                path[len(after_prefix):]: value
+                for path, value in committed.after_value_hashes.items()
+                if path == after_prefix or path.startswith(f"{after_prefix}.")
+                if path.rsplit(".", 1)[-1] not in ignored
+            }
+            if not before_values or not after_values or before_values != after_values:
+                errors.append(f"state prefix relation was not observed: {after_prefix} <- {before_prefix}")
+            continue
+        errors.append(f"unsupported state relation: {kind or '<empty>'}")
+
+
+def validate_evidence_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+) -> tuple[bool, str]:
+    required = {
+        "schema_version", "evidence_id", "artifact_hash", "edge_key",
+        "contract_hash", "runtime_variant_hash", "evidence_class",
+        "scenario_id", "runner_type", "revision", "input_hash",
+        "seed_state_hash", "before_state_hash", "after_state_hash",
+        "turn_evidence", "turn_evidence_hash", "event_trace", "event_trace_hash",
+        "exit_status", "outcome", "error", "started_at", "finished_at",
+        "content_redacted", "source_input_hash", "source_boundary_hashes",
+    }
+    missing = sorted(required - set(artifact))
+    if missing:
+        return False, f"missing artifact fields: {', '.join(missing)}"
+    try:
+        schema_version = int(artifact.get("schema_version"))
+        exit_status = int(artifact.get("exit_status"))
+    except (TypeError, ValueError):
+        return False, "schema version or exit status is not an integer"
+    if schema_version != ARTIFACT_SCHEMA_VERSION:
+        return False, "unsupported artifact schema"
+    if str(artifact.get("runner_type") or "") != COMPILED_GRAPH_RUNNER:
+        return False, "artifact did not use the compiled LangGraph helper"
+    for field in (
+        "edge_key", "contract_hash", "runtime_variant_hash", "evidence_class",
+        "scenario_id", "runner_type", "input_hash", "seed_state_hash",
+        "before_state_hash", "after_state_hash", "turn_evidence_hash",
+        "event_trace_hash", "evidence_id", "artifact_hash", "started_at", "finished_at",
+    ):
+        if not str(artifact.get(field) or "").strip():
+            return False, f"artifact field is empty: {field}"
+    if str(artifact.get("evidence_class")) != "deterministic":
+        return False, "compiled-graph artifact must use deterministic evidence"
+    if artifact.get("content_redacted") is not True:
+        return False, "compiled-graph artifact does not declare redaction"
+    source_boundary_hashes = artifact.get("source_boundary_hashes")
+    if not isinstance(source_boundary_hashes, Mapping) or any(
+        not _is_sha256(str(source_boundary_hashes.get(name) or ""))
+        for name in (
+            "before_hash", "input_hash", "question_hash", "after_hash",
+            "state_diff_hash", "response_hash", "next_question_hash",
+        )
+    ):
+        return False, "compiled-graph source boundary hashes are invalid"
+    lane_error = _lane_error(edge, "deterministic")
+    if lane_error:
+        return False, lane_error
+    artifact_revision = artifact.get("revision")
+    if not isinstance(artifact_revision, Mapping):
+        return False, "artifact revision is not an object"
+    if not str(artifact_revision.get("commit") or "").strip():
+        return False, "artifact revision commit is empty"
+    if not _is_sha256(str(artifact_revision.get("worktree_hash") or "")):
+        return False, "artifact worktree hash is invalid"
+    for field in (
+        "input_hash", "seed_state_hash", "before_state_hash", "after_state_hash",
+        "turn_evidence_hash", "event_trace_hash", "evidence_id", "artifact_hash",
+        "source_input_hash",
+    ):
+        if not _is_sha256(str(artifact.get(field) or "")):
+            return False, f"artifact hash is invalid: {field}"
+    if str(artifact.get("edge_key") or "") != str(edge.get("edge_key") or ""):
+        return False, "edge key mismatch"
+    if str(artifact.get("contract_hash") or "") != str(edge.get("contract_hash") or ""):
+        return False, "contract hash mismatch"
+    if str(artifact.get("runtime_variant_hash") or "") != str(edge.get("contract_variant_hash") or ""):
+        return False, "runtime variant hash mismatch"
+    if dict(artifact_revision) != dict(revision):
+        return False, "repository revision mismatch"
+    outcome = str(artifact.get("outcome") or "")
+    if outcome not in {"passed", "failed"}:
+        return False, "runner outcome is invalid"
+    if outcome == "passed" and exit_status != 0:
+        return False, "passed artifact has nonzero exit status"
+    if outcome == "failed" and exit_status == 0:
+        return False, "failed artifact has zero exit status"
+    if outcome == "failed" and not str(artifact.get("error") or "").strip():
+        return False, "failed artifact has no error"
+
+    raw_events = artifact.get("event_trace")
+    if not isinstance(raw_events, list) or not all(isinstance(event, Mapping) for event in raw_events):
+        return False, "event trace is not a list of objects"
+    events = list(raw_events)
+    if any(
+        str(event.get("event_type") or "") in {"edge_executed", "edge_execution_failed"}
+        for event in events
+    ):
+        return False, "runner-declared edge outcome event is forbidden"
+    if content_hash(events) != str(artifact.get("event_trace_hash") or ""):
+        return False, "event trace hash mismatch"
+    returned = _event(events, "compiled_graph_turn_returned", edge)
+    raised = _event(events, "compiled_graph_turn_raised", edge)
+    if outcome == "passed" and returned is None:
+        return False, "compiled graph return event is missing"
+    if outcome == "failed" and returned is None and raised is None:
+        return False, "compiled graph observation is missing"
+
+    turn = artifact.get("turn_evidence")
+    if not isinstance(turn, Mapping):
+        return False, "turn evidence is not an object"
+    required_turn = {
+        "compiled_graph_helper", "seed", "before", "input", "admitted_action",
+        "runtime_actions",
+        "state_diff", "after", "question", "next_question", "response", "turn_context",
+    }
+    missing_turn = sorted(required_turn - set(turn))
+    if missing_turn:
+        return False, f"missing turn evidence fields: {', '.join(missing_turn)}"
+    if str(turn.get("compiled_graph_helper") or "") != COMPILED_GRAPH_RUNNER:
+        return False, "turn evidence helper mismatch"
+    seed = turn.get("seed")
+    before = turn.get("before")
+    after = turn.get("after")
+    question = turn.get("question")
+    if not all(isinstance(value, Mapping) for value in (seed, before, after, question)):
+        return False, "turn state or question evidence is not an object"
+    if content_hash(turn) != str(artifact.get("turn_evidence_hash") or ""):
+        return False, "turn evidence hash mismatch"
+    if content_hash(seed) != str(artifact.get("seed_state_hash") or ""):
+        return False, "seed state hash mismatch"
+    if content_hash(before) != str(artifact.get("before_state_hash") or ""):
+        return False, "before state hash mismatch"
+    if content_hash(after) != str(artifact.get("after_state_hash") or ""):
+        return False, "after state hash mismatch"
+    if content_hash(turn.get("input")) != str(artifact.get("input_hash") or ""):
+        return False, "input hash mismatch"
+    if before.get("last_user_input") != turn.get("input"):
+        return False, "recorded input differs from invocation state"
+    if dict(before.get("pending_question") or {}) != dict(question):
+        return False, "recorded question differs from invocation state"
+    if dict(after.get("pending_question") or {}) != dict(turn.get("next_question") or {}):
+        return False, "recorded next question differs from graph result"
+    if list(after.get("visible_response") or []) != list(turn.get("response") or []):
+        return False, "recorded response differs from graph result"
+    if dict(after.get("turn_context") or {}) != dict(turn.get("turn_context") or {}):
+        return False, "recorded turn context differs from graph result"
+    expected_diff = state_diff_between(before, after)
+    if dict(turn.get("state_diff") or {}) != expected_diff:
+        return False, "recorded state diff is not reproducible"
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and _pending_contract_is_sensitive(question)
+    )
+    expected_source_input_hash = (
+        _sensitive_event_hash(identity={
+            "edge_key": str(edge.get("edge_key") or ""),
+            "scenario_id": str(artifact.get("scenario_id") or ""),
+            "question_id": str(question.get("id") or ""),
+        })
+        if sensitive_manual_input
+        else content_hash(turn.get("input"))
+    )
+    expected_source_boundary_hashes = {
+        "before_hash": content_hash(before),
+        "input_hash": expected_source_input_hash,
+        "question_hash": content_hash(question),
+        "after_hash": content_hash(after),
+        "state_diff_hash": content_hash(_evidence_projection(expected_diff)),
+        "response_hash": content_hash(
+            _evidence_projection(list(turn.get("response") or ()))
+        ),
+        "next_question_hash": content_hash(
+            _evidence_projection(dict(turn.get("next_question") or {}))
+        ),
+    }
+    if str(artifact.get("source_input_hash") or "") != expected_source_input_hash:
+        return False, "compiled-graph source input hash is not content-derived"
+    if dict(source_boundary_hashes) != expected_source_boundary_hashes:
+        return False, "compiled-graph source boundary hashes are not reproducible"
+    if _contains_owning_secret_reference(artifact):
+        return False, "compiled-graph evidence contains an owning secret capability"
+    raw_expected_admitted = edge.get("expected_admitted")
+    expected_admitted = True if raw_expected_admitted is None else bool(raw_expected_admitted)
+    expected_action = _action_admission(
+        edge,
+        question,
+        turn.get("input"),
+        admitted=expected_admitted,
+    )
+    if not expected_action:
+        return False, "compiled turn has no derivable action admission evidence"
+    if dict(turn.get("admitted_action") or {}) != expected_action:
+        return False, "recorded admitted action is not derived from the question contract"
+    runtime_actions = turn.get("runtime_actions")
+    if not isinstance(runtime_actions, Mapping):
+        return False, "runtime action evidence is not an object"
+    expected_runtime_actions = {
+        "proposed": list(after.get("proposed_actions") or []),
+        "queued": list(after.get("action_queue") or []),
+        "completed": list(after.get("completed_actions") or []),
+        "applied_action_ids": list(after.get("applied_action_ids") or []),
+    }
+    if dict(runtime_actions) != expected_runtime_actions:
+        return False, "runtime action evidence differs from graph result"
+    if returned is not None:
+        reason = _validate_return_event(returned, artifact, turn)
+        if reason:
+            return False, reason
+        context = dict(turn.get("turn_context") or {})
+        # A reset action intentionally returns a fresh state and therefore
+        # clears turn_context. For all other turns that retain it, verify the
+        # graph's normalized input and exact pending snapshot.
+        if context and expected_admitted:
+            if context.get("kind") != "pending":
+                return False, "compiled turn did not admit the pending-question path"
+            input_reason = _validate_admitted_turn_context_input(
+                artifact,
+                edge,
+                turn,
+                question,
+                context,
+            )
+            if input_reason:
+                return False, input_reason
+            if dict(context.get("pending_snapshot") or {}) != dict(question):
+                return False, "turn context question snapshot mismatch"
+        if not expected_admitted:
+            if str((after.get("pending_question") or {}).get("id") or "") != str(question.get("id") or ""):
+                return False, "rejected input did not preserve the pending question"
+            protected_path = str((edge.get("expected_postcondition") or {}).get("path") or "")
+            if protected_path and _read_path(before, protected_path) != _read_path(after, protected_path):
+                return False, "rejected input mutated the protected field"
+            if not any(str(item).strip() for item in after.get("visible_response") or []):
+                return False, "rejected input has no explicit response"
+
+    unsigned = dict(artifact)
+    artifact_hash = str(unsigned.pop("artifact_hash", ""))
+    if content_hash(unsigned) != artifact_hash:
+        return False, "artifact hash mismatch"
+    evidence_id_payload = dict(unsigned)
+    evidence_id = str(evidence_id_payload.pop("evidence_id", ""))
+    if content_hash(evidence_id_payload) != evidence_id:
+        return False, "evidence id mismatch"
+    return True, ""
+
+
+def load_valid_evidence_reference(
+    reference: str,
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    path = Path(reference)
+    if path.with_suffix(".admitted").is_dir():
+        try:
+            artifact, _authority, _digest = _load_pty_admitted_bundle(path)
+        except ValueError as exc:
+            return None, str(exc)
+    else:
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"cannot load evidence artifact: {exc}"
+        if not isinstance(artifact, dict):
+            return None, "evidence artifact is not an object"
+    if artifact.get("artifact_type") == "pty_cli_turn":
+        return (
+            None,
+            "PTY evidence qualifies only as a validated shard-bundle member",
+        )
+    elif artifact.get("artifact_type") == "real_execution":
+        valid, reason = validate_real_execution_evidence_artifact(
+            artifact,
+            edge=edge,
+            revision=revision,
+        )
+    elif artifact.get("artifact_type") == "pty_diagnostic":
+        return None, "PTY diagnostic artifacts never qualify as coverage evidence"
+    else:
+        valid, reason = validate_evidence_artifact(artifact, edge=edge, revision=revision)
+    return (artifact, "") if valid else (None, reason)
+
+
+def build_real_execution_evidence_artifact(
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    scenario_id: str,
+    operation_kind: str,
+    request: Mapping[str, Any],
+    result: Mapping[str, Any],
+    job_id: str,
+    job_artifacts: Iterable[Mapping[str, Any]],
+    log_artifacts: Iterable[Mapping[str, Any]],
+    outcome: str = "passed",
+    exit_status: int = 0,
+    error: str = "",
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the independent proof contract for a real side-effecting job.
+
+    This producer does not run a benchmark.  A Linux/Docker integration runner
+    must supply the observed request, result, job identity, logs, and hashed
+    artifacts.  That separation prevents a PTY acknowledgement from being
+    mistaken for execution evidence.
+    """
+
+    _require_lane(edge, "real_execution")
+    if operation_kind not in {"preflight_smoke", "final_benchmark", "sync_observe"}:
+        raise ValueError(f"unsupported real execution operation: {operation_kind}")
+    scenario = scenario_by_id(scenario_id)
+    if scenario.action_type != str(edge.get("action_type") or ""):
+        raise ValueError(
+            f"real execution scenario disagrees with {edge.get('action_type')}: {scenario_id}"
+        )
+    if scenario.operation_kind != operation_kind:
+        raise ValueError(
+            f"real execution operation disagrees with {scenario_id}: {operation_kind}"
+        )
+    required_identity = {
+        "edge_key": edge.get("edge_key"),
+        "contract_hash": edge.get("contract_hash"),
+        "runtime_variant_hash": edge.get("contract_variant_hash"),
+        "revision.commit": revision.get("commit"),
+        "revision.worktree_hash": revision.get("worktree_hash"),
+    }
+    missing = [name for name, value in required_identity.items() if not str(value or "").strip()]
+    if missing or not _is_sha256(str(revision.get("worktree_hash") or "")):
+        raise ValueError(f"invalid real execution identity: {', '.join(missing) or 'worktree hash'}")
+    if not str(job_id or "").strip():
+        raise ValueError("real execution evidence requires a job id")
+    if outcome not in {"passed", "observed-fail"}:
+        raise ValueError(f"invalid real execution outcome: {outcome}")
+    if outcome == "passed" and (int(exit_status) != 0 or str(error or "").strip()):
+        raise ValueError("passed real execution evidence cannot contain a failure")
+    if outcome == "observed-fail" and int(exit_status) == 0:
+        raise ValueError("observed-fail real execution evidence requires non-zero exit status")
+    if outcome == "observed-fail" and not str(error or "").strip():
+        raise ValueError("observed-fail real execution evidence requires an error")
+    if not request or not result:
+        raise ValueError("real execution evidence requires request and result objects")
+    raw_artifacts = [dict(item) for item in job_artifacts]
+    raw_logs = [dict(item) for item in log_artifacts]
+    if not raw_artifacts or not raw_logs:
+        raise ValueError("real execution evidence requires hashed job and log artifacts")
+    observed_job = dict(result.get("observed_job") or {})
+    run_dir = Path(str(observed_job.get("run_dir") or ""))
+    if not run_dir.is_dir() or run_dir.is_symlink() or run_dir.name != str(job_id):
+        raise ValueError("real execution evidence requires one fresh non-symlink run_dir")
+    for item in (*raw_artifacts, *raw_logs):
+        _validate_hashed_artifact_identity(
+            item,
+            expected_job_id=str(job_id),
+            expected_run_dir=run_dir,
+        )
+    safe_request = redact(deepcopy(dict(request)))
+    safe_result = redact(deepcopy(dict(result)))
+    artifacts = redact(raw_artifacts)
+    logs = redact(raw_logs)
+    payload: dict[str, Any] = {
+        "artifact_type": "real_execution",
+        "schema_version": REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION,
+        "edge_key": str(edge.get("edge_key") or ""),
+        "contract_hash": str(edge.get("contract_hash") or ""),
+        "runtime_variant_hash": str(edge.get("contract_variant_hash") or ""),
+        "evidence_class": "real_execution",
+        "runner_type": REAL_EXECUTION_RUNNER,
+        "revision": dict(revision),
+        "scenario_id": scenario_id,
+        "operation_kind": operation_kind,
+        "request": safe_request,
+        "request_hash": content_hash(safe_request),
+        "source_request_hash": content_hash(request),
+        "result": safe_result,
+        "result_hash": content_hash(safe_result),
+        "source_result_hash": content_hash(result),
+        "job_id": str(job_id),
+        "job_artifacts": artifacts,
+        "job_artifacts_hash": content_hash(artifacts),
+        "log_artifacts": logs,
+        "log_artifacts_hash": content_hash(logs),
+        "outcome": outcome,
+        "exit_status": int(exit_status),
+        "error": str(redact(str(error or ""))),
+        "content_redacted": True,
+        "started_at": started_at or _utc_timestamp(),
+        "finished_at": finished_at or _utc_timestamp(),
+    }
+    payload["evidence_id"] = content_hash(payload)
+    payload["artifact_hash"] = content_hash(payload)
+    return payload
+
+
+def validate_real_execution_evidence_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    allow_observed_failure: bool = False,
+) -> tuple[bool, str]:
+    lane_error = _lane_error(edge, "real_execution")
+    if lane_error:
+        return False, lane_error
+    if artifact.get("artifact_type") != "real_execution":
+        return False, "artifact is not real execution evidence"
+    if artifact.get("schema_version") != REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION:
+        return False, "unsupported real execution evidence schema"
+    if artifact.get("content_redacted") is not True:
+        return False, "real execution evidence does not declare redaction"
+    for name in ("source_request_hash", "source_result_hash"):
+        if not _is_sha256(str(artifact.get(name) or "")):
+            return False, f"real execution source hash is invalid: {name}"
+    if artifact.get("evidence_class") != "real_execution":
+        return False, "real execution evidence class is invalid"
+    if artifact.get("runner_type") != REAL_EXECUTION_RUNNER:
+        return False, "real execution runner identity is invalid"
+    identity = (
+        str(artifact.get("edge_key") or ""),
+        str(artifact.get("contract_hash") or ""),
+        str(artifact.get("runtime_variant_hash") or ""),
+    )
+    expected = (
+        str(edge.get("edge_key") or ""),
+        str(edge.get("contract_hash") or ""),
+        str(edge.get("contract_variant_hash") or ""),
+    )
+    if identity != expected:
+        return False, "real execution edge identity mismatch"
+    if dict(artifact.get("revision") or {}) != dict(revision):
+        return False, "repository revision mismatch"
+    if artifact.get("operation_kind") not in {"preflight_smoke", "final_benchmark", "sync_observe"}:
+        return False, "real execution operation is invalid"
+    try:
+        scenario = scenario_by_id(str(artifact.get("scenario_id") or ""))
+    except ValueError as exc:
+        return False, str(exc)
+    if scenario.action_type != str(edge.get("action_type") or ""):
+        return False, "real execution scenario disagrees with action"
+    if artifact.get("operation_kind") != scenario.operation_kind:
+        return False, "real execution operation disagrees with scenario"
+    if not str(artifact.get("job_id") or "").strip():
+        return False, "real execution job id is missing"
+    outcome = str(artifact.get("outcome") or "")
+    exit_status = artifact.get("exit_status")
+    error = str(artifact.get("error") or "")
+    if outcome == "passed":
+        if exit_status != 0 or error:
+            return False, "passed real execution evidence contains a failure"
+    elif outcome == "observed-fail":
+        if not allow_observed_failure:
+            return False, "observed-fail evidence does not qualify as a passing execution edge"
+        if not isinstance(exit_status, int) or exit_status == 0 or not error:
+            return False, "observed-fail evidence has no observed failure"
+    else:
+        return False, "real execution outcome is invalid"
+    try:
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+        finished_at = datetime.fromisoformat(
+            str(artifact.get("finished_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False, "real execution observation timestamp is invalid"
+    if (
+        started_at.tzinfo is None
+        or finished_at.tzinfo is None
+        or finished_at < started_at
+    ):
+        return False, "real execution observation time range is invalid"
+    request = artifact.get("request")
+    result = artifact.get("result")
+    if not isinstance(request, Mapping) or not request:
+        return False, "real execution request is missing"
+    if not isinstance(result, Mapping) or not result:
+        return False, "real execution result is missing"
+    if content_hash(request) != artifact.get("request_hash"):
+        return False, "real execution request hash mismatch"
+    if content_hash(result) != artifact.get("result_hash"):
+        return False, "real execution result hash mismatch"
+    observed_job = dict(result.get("observed_job") or {})
+    run_dir = Path(str(observed_job.get("run_dir") or ""))
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        return False, "real execution run_dir is missing or symlinked"
+    observed_status = str(observed_job.get("status") or "")
+    observed_exit_status = observed_job.get("exit_code")
+    observed_error = str(observed_job.get("error") or "")
+    expected_outcome = (
+        "passed"
+        if observed_status == "completed" and observed_exit_status == 0
+        else "observed-fail"
+    )
+    expected_error = "" if expected_outcome == "passed" else observed_error
+    if (
+        not isinstance(observed_exit_status, int)
+        or artifact.get("outcome") != expected_outcome
+        or artifact.get("exit_status") != observed_exit_status
+        or str(artifact.get("error") or "") != expected_error
+    ):
+        return False, "real execution outcome is not derived from persisted job state"
+    if expected_outcome == "observed-fail" and (
+        observed_exit_status == 0 or not observed_error
+    ):
+        return False, "persisted observed failure is incomplete"
+    for field, hash_field in (
+        ("job_artifacts", "job_artifacts_hash"),
+        ("log_artifacts", "log_artifacts_hash"),
+    ):
+        items = artifact.get(field)
+        if not isinstance(items, list) or not items:
+            return False, f"{field} is missing"
+        try:
+            for item in items:
+                _validate_hashed_artifact_identity(
+                    item,
+                    expected_job_id=str(artifact.get("job_id") or ""),
+                    expected_run_dir=run_dir,
+                )
+        except ValueError as exc:
+            return False, str(exc)
+        if content_hash(items) != artifact.get(hash_field):
+            return False, f"{field} hash mismatch"
+    scenario_error = _real_execution_scenario_error(artifact, scenario)
+    if scenario_error:
+        return False, scenario_error
+    unsigned = dict(artifact)
+    artifact_hash = str(unsigned.pop("artifact_hash", ""))
+    if content_hash(unsigned) != artifact_hash:
+        return False, "artifact hash mismatch"
+    evidence_payload = dict(unsigned)
+    evidence_id = str(evidence_payload.pop("evidence_id", ""))
+    if content_hash(evidence_payload) != evidence_id:
+        return False, "evidence id mismatch"
+    return True, ""
+
+
+def _real_execution_scenario_error(
+    artifact: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    request = dict(artifact.get("request") or {})
+    if str(request.get("scenario_id") or "") != scenario.scenario_id:
+        return "real execution request scenario mismatch"
+    if str(request.get("service_operation") or "") != scenario.operation:
+        return "real execution request operation mismatch"
+    approved_plan_file = Path(str(request.get("approved_plan_file") or ""))
+    try:
+        approved_plan_sha256 = hashlib.sha256(approved_plan_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"approved plan cannot be rehashed: {exc}"
+    if approved_plan_sha256 != str(request.get("approved_plan_sha256") or ""):
+        return "approved plan hash mismatch"
+    if dict(request.get("approved_plan_revision") or {}) != dict(artifact.get("revision") or {}):
+        return "approved plan revision binding mismatch"
+    approval_file = Path(str(request.get("approved_plan_provenance_file") or ""))
+    try:
+        approval_sha256 = hashlib.sha256(approval_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"approved-plan provenance cannot be rehashed: {exc}"
+    if approval_sha256 != str(request.get("approved_plan_provenance_sha256") or ""):
+        return "approved-plan provenance hash mismatch"
+    expected_target_mode = (
+        "sync-observe"
+        if scenario.workflow_type == "sync_observe"
+        else "fake-node"
+        if scenario.operation == "fake_node_smoke"
+        else "real-node"
+    )
+    approval_valid, approval_reason = validate_approved_plan_artifact(
+        approval_file,
+        expected_revision=dict(artifact.get("revision") or {}),
+        expected_plan_file=approved_plan_file,
+        expected_workflow=scenario.workflow_type,
+        expected_target_mode=expected_target_mode,
+        expected_approval_action=scenario.action_type,
+    )
+    if not approval_valid:
+        return f"approved-plan provenance is invalid: {approval_reason}"
+    try:
+        approved_plan = json.loads(approved_plan_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"approved plan is invalid: {exc}"
+    envelope_file = Path(str(request.get("admission_envelope_file") or ""))
+    try:
+        envelope_sha256 = hashlib.sha256(envelope_file.read_bytes()).hexdigest()
+        envelope = json.loads(envelope_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"G5 admission envelope is invalid: {exc}"
+    if envelope_sha256 != str(request.get("admission_envelope_sha256") or ""):
+        return "G5 admission envelope hash mismatch"
+    envelope_error = _g5_admission_envelope_error(
+        envelope=envelope,
+        request=request,
+        scenario=scenario,
+        artifact=artifact,
+        approved_plan=approved_plan,
+    )
+    if envelope_error:
+        return envelope_error
+    result = dict(artifact.get("result") or {})
+    observed_job = dict(result.get("observed_job") or {})
+    artifacts = dict(observed_job.get("artifacts") or {})
+    plan_paths = [
+        Path(str(item.get("path") or ""))
+        for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "plan.json"
+    ]
+    if len(plan_paths) != 1:
+        return "real execution evidence must bind one job plan"
+    job_paths = [
+        Path(str(item.get("path") or ""))
+        for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "job.json"
+    ]
+    if len(job_paths) != 1:
+        return "real execution evidence must bind one persisted job"
+    try:
+        plan = json.loads(plan_paths[0].read_text(encoding="utf-8"))
+        persisted_job = redact(
+            json.loads(job_paths[0].read_text(encoding="utf-8"))
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"real execution job plan or persisted job is invalid: {exc}"
+    if workflow_type_from_plan(plan) != scenario.workflow_type:
+        return "real execution workflow mismatch"
+    provenance = dict(plan.get("execution_provenance") or {})
+    if str(provenance.get("scenario_id") or "") != scenario.scenario_id:
+        return "real execution provenance scenario mismatch"
+    if str(provenance.get("operation") or "") != scenario.operation:
+        return "real execution provenance operation mismatch"
+    if str(provenance.get("approved_plan_file") or "") != str(approved_plan_file.resolve()):
+        return "job plan approved-plan path mismatch"
+    if str(provenance.get("approved_plan_sha256") or "") != approved_plan_sha256:
+        return "job plan approved-plan hash mismatch"
+    if str(provenance.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "job plan provenance job mismatch"
+    if str(provenance.get("job_plan_file") or "") != str(plan_paths[0].resolve()):
+        return "job plan provenance path mismatch"
+    if "g5_admission_provenance" in plan:
+        return "G5 admission metadata leaked into the product job plan"
+    try:
+        validate_execution_plan_projection(
+            approved_plan,
+            plan,
+            approved_plan_file=approved_plan_file,
+            operation=scenario.operation,
+            scenario_id=scenario.scenario_id,
+            job_id=str(artifact.get("job_id") or ""),
+            job_plan_file=plan_paths[0],
+        )
+    except (OSError, ValueError) as exc:
+        return f"job plan projection is invalid: {exc}"
+    observed_job = dict(result.get("observed_job") or {})
+    if str(observed_job.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "observed job identity mismatch"
+    for field in ("job_id", "status", "exit_code", "error", "created_at"):
+        observed_value = observed_job.get(field)
+        persisted_value = persisted_job.get(field)
+        if field == "error":
+            observed_value = str(observed_value or "")
+            persisted_value = str(persisted_value or "")
+        if observed_value != persisted_value:
+            return f"observed job disagrees with persisted job: {field}"
+    jobs_dir = Path(str(request.get("jobs_dir") or "")).resolve()
+    run_dir = Path(str(observed_job.get("run_dir") or "")).resolve()
+    if run_dir.parent != jobs_dir or run_dir.name != str(artifact.get("job_id") or ""):
+        return "observed job is outside the admitted jobs root"
+    try:
+        owner_roots = derive_artifact_owner_roots(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"real execution artifact owner roots are invalid: {exc}"
+    try:
+        runtime_projection = validate_runtime_env_projection(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"real execution runtime.env projection is invalid: {exc}"
+    if request.get("runtime_env_projection") != runtime_projection:
+        return "real execution runtime.env projection receipt mismatch"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        created_at = datetime.fromisoformat(
+            str(observed_job.get("created_at") or "").replace("Z", "+00:00")
+        )
+        submitted_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution freshness timestamp is invalid"
+    if admitted_at.tzinfo is None or created_at.tzinfo is None or created_at < admitted_at:
+        return "observed job predates the admitted jobs root"
+    if submitted_at.tzinfo is None or created_at < submitted_at:
+        return "observed job predates its execution submission"
+    endpoint_error = _real_execution_endpoint_error(
+        request=request,
+        plan=approved_plan,
+        scenario=scenario,
+        artifact=artifact,
+        envelope=envelope,
+    )
+    if endpoint_error:
+        return endpoint_error
+    runtime_error = _real_execution_runtime_attestation_error(
+        request=request,
+        plan=approved_plan,
+        scenario=scenario,
+        artifact=artifact,
+        envelope=envelope,
+    )
+    if runtime_error:
+        return runtime_error
+    command = [str(item) for item in (plan.get("execution") or {}).get("command") or ()]
+    for token in scenario.required_command_tokens:
+        if token not in command:
+            return f"real execution command is missing required token: {token}"
+    for token in scenario.forbidden_command_tokens:
+        if token in command:
+            return f"real execution command contains forbidden token: {token}"
+    if scenario.operation_kind == "sync_observe":
+        try:
+            duration_index = command.index("--duration")
+            duration_seconds = int(command[duration_index + 1])
+        except (ValueError, IndexError):
+            return "bounded sync-observe command has no valid duration"
+        if duration_seconds <= 0:
+            return "bounded sync-observe duration must be positive"
+        execution_env = dict((plan.get("execution") or {}).get("environment") or {})
+        if str(plan.get("rpc_mode") or "") != "sync_observe":
+            return "sync-observe plan has an RPC workload mode"
+        if plan.get("use_fake_node") is not False:
+            return "sync-observe plan is not bound to a real-node source"
+        if str(execution_env.get("LOCAL_RPC_URL") or ""):
+            return "sync-observe plan contains an RPC benchmark endpoint"
+        if not str(execution_env.get("SYNC_OBSERVE_RPC_URL") or ""):
+            return "sync-observe plan has no observation endpoint"
+        if any(
+            str(execution_env.get(name) or "")
+            for name in (
+                "SYNC_OBSERVE_INITIAL_QPS",
+                "SYNC_OBSERVE_MAX_QPS",
+                "SYNC_OBSERVE_QPS_STEP",
+            )
+        ):
+            return "sync-observe plan contains a QPS profile"
+    if str(artifact.get("outcome") or "") == "observed-fail":
+        return ""
+    manifest_error = _required_artifact_manifest_error(
+        artifact=artifact,
+        request=request,
+        observed_artifacts=artifacts,
+        scenario=scenario,
+    )
+    if manifest_error:
+        return manifest_error
+    for name in scenario.required_artifacts:
+        raw = str(artifacts.get(name) or "")
+        if not raw or not Path(raw).is_file():
+            return f"real execution required artifact is missing: {name}"
+    for name in scenario.forbidden_artifacts:
+        if str(artifacts.get(name) or ""):
+            return f"real execution contains forbidden artifact: {name}"
+    content_error = _real_execution_content_error(
+        artifacts=artifacts,
+        plan=plan,
+        scenario=scenario,
+    )
+    if content_error:
+        return content_error
+    return ""
+
+
+def _real_execution_content_error(
+    *,
+    artifacts: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    summary_error = _summary_artifact_error(
+        Path(str(artifacts.get("summary_json") or "")),
+        plan=plan,
+        sync_observe=scenario.operation_kind == "sync_observe",
+    )
+    if summary_error:
+        return summary_error
+    report_names = (
+        ("html_report_en", "html_report_zh")
+        if scenario.operation_kind == "sync_observe"
+        else ("html_report",)
+    )
+    for name in report_names:
+        report_error = _html_report_error(
+            Path(str(artifacts.get(name) or "")),
+            label=name,
+        )
+        if report_error:
+            return report_error
+    if scenario.operation_kind == "sync_observe":
+        return _sync_observe_content_error(artifacts)
+    return _rpc_benchmark_content_error(artifacts, plan=plan)
+
+
+def _summary_artifact_error(
+    path: Path,
+    *,
+    plan: Mapping[str, Any],
+    sync_observe: bool,
+) -> str:
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"real execution summary JSON is invalid: {exc}"
+    if not isinstance(summary, Mapping) or not str(summary.get("run_id") or ""):
+        return "real execution summary has no run identity"
+    expected_mode = (
+        "sync_observe"
+        if sync_observe
+        else str(plan.get("benchmark_mode") or "").strip().lower()
+    )
+    if str(summary.get("benchmark_mode") or "").strip().lower() != expected_mode:
+        return "real execution summary benchmark mode mismatch"
+    try:
+        start_epoch = _observation_epoch(summary.get("start_time"))
+        end_epoch = _observation_epoch(summary.get("end_time"))
+    except ValueError as exc:
+        return f"real execution summary time range is invalid: {exc}"
+    if end_epoch < start_epoch:
+        return "real execution summary time range is reversed"
+    parameters = dict(summary.get("test_parameters") or {})
+    parameter_names = {
+        "initial_qps",
+        "max_qps",
+        "qps_step",
+        "duration_per_level",
+    }
+    if set(parameters) != parameter_names or any(
+        not isinstance(parameters.get(name), int) for name in parameter_names
+    ):
+        return "real execution summary test parameters are invalid"
+    max_successful_qps = summary.get("max_successful_qps")
+    if not isinstance(max_successful_qps, int):
+        return "real execution summary successful QPS is invalid"
+    if sync_observe:
+        if max_successful_qps != 0 or any(parameters.values()):
+            return "sync-observe summary contains an RPC workload"
+    elif (
+        max_successful_qps <= 0
+        or parameters["initial_qps"] <= 0
+        or parameters["max_qps"] < parameters["initial_qps"]
+        or parameters["qps_step"] <= 0
+        or parameters["duration_per_level"] <= 0
+    ):
+        return "RPC benchmark summary has no successful workload"
+    return ""
+
+
+def _html_report_error(path: Path, *, label: str) -> str:
+    try:
+        raw = path.read_bytes()
+        document = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"{label} is not a valid UTF-8 HTML report: {exc}"
+    lowered = document.lower()
+    if (
+        len(raw) < 256
+        or "<html" not in lowered
+        or "</html>" not in lowered
+        or "<title" not in lowered
+        or "report" not in lowered
+    ):
+        return f"{label} has no complete report document"
+    return ""
+
+
+def _rpc_benchmark_content_error(
+    artifacts: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+) -> str:
+    summary_path = Path(str(artifacts.get("summary_json") or ""))
+    performance_path = Path(str(artifacts.get("performance_csv") or ""))
+    try:
+        with performance_path.open(newline="", encoding="utf-8") as handle:
+            performance_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"RPC performance CSV is invalid: {exc}"
+    required_performance_columns = {
+        "timestamp",
+        "current_qps",
+        "rpc_latency_ms",
+        "qps_data_available",
+        "cpu_usage",
+        "mem_usage",
+    }
+    if not performance_rows:
+        return "RPC performance CSV has no observed rows"
+    if missing := sorted(required_performance_columns - set(performance_rows[0])):
+        return "RPC performance CSV is missing columns: " + ", ".join(missing)
+    has_workload_observation = False
+    for row in performance_rows:
+        try:
+            current_qps = float(str(row.get("current_qps") or "0"))
+            latency = float(str(row.get("rpc_latency_ms") or "0"))
+        except ValueError:
+            return "RPC performance CSV contains a non-numeric workload observation"
+        if current_qps < 0 or latency < 0:
+            return "RPC performance CSV contains a negative workload observation"
+        if (
+            current_qps > 0
+            and str(row.get("qps_data_available") or "").strip().lower()
+            in {"true", "1"}
+        ):
+            has_workload_observation = True
+    if not has_workload_observation:
+        return "RPC performance CSV has no available positive-QPS observation"
+    range_error = _observation_range_error(
+        summary_path,
+        performance_rows,
+        label="RPC performance CSV",
+    )
+    if range_error:
+        return range_error
+
+    proxy_path = Path(str(artifacts.get("proxy_method_csv") or ""))
+    try:
+        with proxy_path.open(newline="", encoding="utf-8") as handle:
+            proxy_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"RPC proxy method CSV is invalid: {exc}"
+    proxy_columns = {"timestamp_ns", "method_name", "status_code", "latency_ms"}
+    if not proxy_rows or not proxy_columns.issubset(proxy_rows[0]):
+        return "RPC proxy method CSV has no typed method observations"
+    for row in proxy_rows:
+        try:
+            status_code = int(str(row.get("status_code") or ""))
+            latency = float(str(row.get("latency_ms") or ""))
+            timestamp_ns = int(str(row.get("timestamp_ns") or ""))
+        except ValueError:
+            return "RPC proxy method CSV contains an invalid observation"
+        if (
+            not str(row.get("method_name") or "").strip()
+            or not 100 <= status_code <= 599
+            or latency < 0
+            or timestamp_ns <= 0
+        ):
+            return "RPC proxy method CSV contains an invalid observation"
+
+    vegeta_path = Path(str(artifacts.get("vegeta_json") or ""))
+    try:
+        vegeta = json.loads(vegeta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"Vegeta result JSON is invalid: {exc}"
+    if not isinstance(vegeta, Mapping):
+        return "Vegeta result is not a JSON object"
+    requests = vegeta.get("requests")
+    success = vegeta.get("success")
+    status_codes = dict(vegeta.get("status_codes") or {})
+    if (
+        not isinstance(requests, int)
+        or requests <= 0
+        or not isinstance(success, (int, float))
+        or not 0 <= float(success) <= 1
+        or not isinstance(vegeta.get("throughput"), (int, float))
+        or float(vegeta["throughput"]) <= 0
+    ):
+        return "Vegeta result has no valid request statistics"
+    try:
+        observed_status_total = sum(int(value) for value in status_codes.values())
+    except (TypeError, ValueError):
+        return "Vegeta result status counts are invalid"
+    if observed_status_total != requests or not any(
+        str(code).startswith("2") and int(count) > 0
+        for code, count in status_codes.items()
+    ):
+        return "Vegeta result status counts do not prove successful requests"
+    expected_methods, workload_error = _approved_rpc_methods(plan)
+    if workload_error:
+        return workload_error
+    workload_rows = [
+        row
+        for row in proxy_rows
+        if str(row.get("method_name") or "").strip() in expected_methods
+    ]
+    if len(workload_rows) != requests:
+        return "RPC proxy workload count does not match Vegeta requests"
+    observed_method_names = {
+        str(row.get("method_name") or "").strip() for row in workload_rows
+    }
+    if observed_method_names != expected_methods:
+        return "RPC proxy workload methods do not match the approved plan"
+    proxy_status_counts: dict[str, int] = {}
+    for row in workload_rows:
+        status = str(int(str(row.get("status_code") or "")))
+        proxy_status_counts[status] = proxy_status_counts.get(status, 0) + 1
+    normalized_vegeta_status = {
+        str(int(str(code))): int(count) for code, count in status_codes.items()
+    }
+    if proxy_status_counts != normalized_vegeta_status:
+        return "RPC proxy workload status counts do not match Vegeta results"
+    try:
+        summary_start, summary_end = _summary_time_range(summary_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"RPC summary time range cannot be loaded: {exc}"
+    for row in workload_rows:
+        observed = int(str(row.get("timestamp_ns") or "")) / 1_000_000_000
+        if not summary_start <= observed <= summary_end:
+            return "RPC proxy workload observation is outside the summary time range"
+    return ""
+
+
+def _sync_observe_content_error(artifacts: Mapping[str, Any]) -> str:
+    summary_path = Path(str(artifacts.get("summary_json") or ""))
+    csv_path = Path(str(artifacts.get("performance_csv") or ""))
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"sync-observe performance CSV is invalid: {exc}"
+    if not rows:
+        return "sync-observe performance CSV has no observed rows"
+    required_columns = {
+        "timestamp",
+        "cpu_usage",
+        "mem_usage",
+        "net_total_mbps",
+        "local_block_height",
+        "sync_status",
+        "execution_mgas_per_sec",
+        "execution_metric_source",
+        "execution_metric_status",
+        "current_qps",
+        "qps_data_available",
+    }
+    columns = set(rows[0])
+    if missing := sorted(required_columns - columns):
+        return "sync-observe performance CSV is missing columns: " + ", ".join(missing)
+    if not any(column.endswith("_total_iops") for column in columns):
+        return "sync-observe performance CSV has no disk IOPS column"
+    if not any(column.endswith("_avg_await") for column in columns):
+        return "sync-observe performance CSV has no disk latency column"
+    has_healthy_node_observation = False
+    for row in rows:
+        if str(row.get("current_qps") or "").strip() not in {"0", "0.0", "0.00"}:
+            return "sync-observe reported a non-zero QPS workload"
+        if str(row.get("qps_data_available") or "").strip().lower() not in {"false", "0"}:
+            return "sync-observe incorrectly reports QPS data as available"
+        status = str(row.get("execution_metric_status") or "").strip().lower()
+        source = str(row.get("execution_metric_source") or "").strip()
+        if status not in {"available", "unavailable"} or not source:
+            return "sync-observe MGas provenance is ambiguous"
+        if status == "available":
+            try:
+                mgas = float(str(row.get("execution_mgas_per_sec") or ""))
+                gas = float(str(row.get("execution_gas_per_sec") or ""))
+            except ValueError:
+                return "sync-observe available MGas row has no numeric value"
+            if mgas < 0 or gas < 0 or abs(gas - (mgas * 1_000_000)) > 0.5:
+                return "sync-observe MGas and gas/s observations disagree"
+        local_height = str(row.get("local_block_height") or "").strip().lower()
+        local_health = str(row.get("local_health") or "").strip().lower()
+        sync_status = str(row.get("sync_status") or "").strip().lower()
+        probe_error = str(row.get("probe_error") or "").strip().lower()
+        if (
+            local_height not in {"", "null", "n/a"}
+            and local_health in {"1", "true"}
+            and sync_status not in {"", "unknown", "unhealthy"}
+            and probe_error in {"", "null", "none"}
+        ):
+            try:
+                has_healthy_node_observation = float(local_height) >= 0
+            except ValueError:
+                return "sync-observe local height observation is invalid"
+    if not has_healthy_node_observation:
+        return "sync-observe has no healthy observed node sample"
+    range_error = _observation_range_error(
+        summary_path,
+        rows,
+        label="sync-observe performance CSV",
+    )
+    if range_error:
+        return range_error
+    health_path = Path(str(artifacts.get("sync_health_csv") or ""))
+    try:
+        with health_path.open(newline="", encoding="utf-8") as handle:
+            health_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"sync-observe health CSV is invalid: {exc}"
+    health_columns = {
+        "timestamp",
+        "local_block_height",
+        "sync_status",
+        "probe_error",
+    }
+    if not health_rows or not health_columns.issubset(health_rows[0]):
+        return "sync-observe health CSV has no typed observations"
+    if not any(
+        str(row.get("local_block_height") or "").strip().lower()
+        not in {"", "null", "n/a"}
+        and str(row.get("sync_status") or "").strip().lower()
+        not in {"", "unknown", "unhealthy"}
+        and str(row.get("probe_error") or "").strip().lower()
+        in {"", "null", "none"}
+        for row in health_rows
+    ):
+        return "sync-observe health CSV has no successful node probe"
+    range_error = _observation_range_error(
+        summary_path,
+        health_rows,
+        label="sync-observe health CSV",
+        require_all_within=False,
+    )
+    if range_error:
+        return range_error
+    chart_path = Path(str(artifacts.get("sync_timeline_chart") or ""))
+    try:
+        chart = chart_path.read_bytes()
+    except OSError as exc:
+        return f"sync-observe timeline chart is unreadable: {exc}"
+    return _png_error(chart)
+
+
+def _approved_rpc_methods(plan: Mapping[str, Any]) -> tuple[set[str], str]:
+    mode = str(plan.get("rpc_mode") or "").strip().lower()
+    requirements = dict(plan.get("chain_template_requirements") or {})
+    if mode == "single":
+        method = str(requirements.get("single_method") or "").strip()
+        return ({method}, "") if method else (set(), "approved single RPC method is missing")
+    if mode == "mixed":
+        weighted = requirements.get("mixed_weighted")
+        if not isinstance(weighted, list):
+            return set(), "approved mixed RPC workload is missing"
+        methods = {
+            str(item.get("method") or "").strip()
+            for item in weighted
+            if isinstance(item, Mapping)
+            and isinstance(item.get("weight"), int)
+            and item["weight"] > 0
+        }
+        if not methods:
+            return set(), "approved mixed RPC workload has no positive-weight methods"
+        return methods, ""
+    return set(), "approved RPC mode is invalid"
+
+
+def _observation_epoch(value: Any) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("timestamp is missing")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _summary_time_range(path: Path) -> tuple[float, float]:
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(summary, Mapping):
+        raise ValueError("summary is not a JSON object")
+    start = _observation_epoch(summary.get("start_time"))
+    end = _observation_epoch(summary.get("end_time"))
+    if end < start:
+        raise ValueError("summary time range is reversed")
+    return start, end
+
+
+def _observation_range_error(
+    summary_path: Path,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    label: str,
+    require_all_within: bool = True,
+) -> str:
+    try:
+        start, end = _summary_time_range(summary_path)
+        observations = [_observation_epoch(row.get("timestamp")) for row in rows]
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"{label} time range is invalid: {exc}"
+    if not observations:
+        return f"{label} has no timestamped observations"
+    if require_all_within:
+        if min(observations) < start or max(observations) > end:
+            return f"{label} observations are outside the summary time range"
+    elif max(observations) < start or min(observations) > end:
+        return f"{label} does not overlap the summary time range"
+    return ""
+
+
+def _png_error(data: bytes) -> str:
+    if len(data) < 45 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return "sync-observe timeline chart is not a valid PNG"
+    offset = 8
+    seen_ihdr = False
+    seen_iend = False
+    width = height = bit_depth = color_type = interlace = 0
+    decompressor = zlib.decompressobj()
+    decoded_bytes = 0
+    try:
+        while offset < len(data):
+            if offset + 12 > len(data):
+                raise ValueError("truncated PNG chunk")
+            length = struct.unpack(">I", data[offset : offset + 4])[0]
+            chunk_type = data[offset + 4 : offset + 8]
+            end = offset + 12 + length
+            if end > len(data):
+                raise ValueError("truncated PNG chunk payload")
+            payload = data[offset + 8 : offset + 8 + length]
+            expected_crc = struct.unpack(">I", data[offset + 8 + length : end])[0]
+            if zlib.crc32(chunk_type + payload) & 0xFFFFFFFF != expected_crc:
+                raise ValueError("PNG chunk CRC mismatch")
+            if chunk_type == b"IHDR":
+                if seen_ihdr or offset != 8 or length != 13:
+                    raise ValueError("invalid PNG IHDR")
+                width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+                    ">IIBBBBB", payload
+                )
+                if (
+                    width <= 0
+                    or height <= 0
+                    or bit_depth != 8
+                    or color_type != 6
+                    or compression != 0
+                    or filtering != 0
+                    or interlace != 0
+                ):
+                    raise ValueError("unsupported PNG image format")
+                seen_ihdr = True
+            elif chunk_type == b"IDAT":
+                if not seen_ihdr or seen_iend:
+                    raise ValueError("invalid PNG IDAT ordering")
+                decoded_bytes += len(decompressor.decompress(payload))
+            elif chunk_type == b"IEND":
+                if length != 0 or not seen_ihdr or seen_iend:
+                    raise ValueError("invalid PNG IEND")
+                decoded_bytes += len(decompressor.flush())
+                seen_iend = True
+                if end != len(data):
+                    raise ValueError("data follows PNG IEND")
+            offset = end
+    except (struct.error, zlib.error, ValueError) as exc:
+        return f"sync-observe timeline chart is invalid: {exc}"
+    expected_decoded = height * (1 + width * 4)
+    if not seen_ihdr or not seen_iend or decoded_bytes != expected_decoded:
+        return "sync-observe timeline chart has incomplete image data"
+    return ""
+
+
+def _g5_admission_envelope_error(
+    *,
+    envelope: Mapping[str, Any],
+    request: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    approved_plan: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    if envelope.get("schema_version") != 1:
+        return "G5 admission envelope schema is invalid"
+    if dict(envelope.get("repository_revision") or {}) != dict(
+        artifact.get("revision") or {}
+    ):
+        return "G5 admission envelope revision mismatch"
+    if (
+        str(envelope.get("scenario_id") or "") != scenario.scenario_id
+        or envelope.get("sequence_index") != admission.sequence_index
+    ):
+        return "G5 admission envelope scenario mismatch"
+    approved_path = Path(str(request.get("approved_plan_file") or "")).resolve()
+    if (
+        str(envelope.get("approved_plan_file") or "") != str(approved_path)
+        or str(envelope.get("approved_plan_sha256") or "")
+        != str(request.get("approved_plan_sha256") or "")
+    ):
+        return "G5 admission envelope approved-plan binding mismatch"
+    endpoint_contract = dict(envelope.get("endpoint_identity_contract") or {})
+    container_requirements = dict(envelope.get("container_metrics_requirements") or {})
+    runtime_contract = dict(envelope.get("g5_runtime_contract") or {})
+    runtime_contract_sha256 = str(envelope.get("g5_runtime_contract_sha256") or "")
+    if not admission.endpoint_env_var:
+        if (
+            endpoint_contract
+            or container_requirements
+            or runtime_contract
+            or runtime_contract_sha256
+        ):
+            return "fake-node G5 envelope contains real-node requirements"
+        return ""
+    expected_runtime_contract = G5_RUNTIME_CONTRACT.to_dict()
+    if (
+        runtime_contract != expected_runtime_contract
+        or runtime_contract_sha256 != content_hash(runtime_contract)
+    ):
+        return "G5 runtime contract binding mismatch"
+    execution_env = dict((approved_plan.get("execution") or {}).get("environment") or {})
+    endpoint = str(execution_env.get(admission.endpoint_env_var) or "")
+    plan_metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "")
+    if (
+        admission.endpoint_env_var == "SYNC_OBSERVE_RPC_URL"
+        and plan_metrics_url != G5_RUNTIME_CONTRACT.metrics_url
+    ):
+        return "sync-observe approved plan metrics endpoint mismatch"
+    expected_endpoint = {
+        "chain": str(approved_plan.get("chain") or ""),
+        "env_var": admission.endpoint_env_var,
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest(),
+        "probe_method": "eth_chainId",
+        "params_sha256": content_hash([]),
+        "expected_identity": G5_RUNTIME_CONTRACT.chain_id,
+    }
+    if (
+        endpoint != G5_RUNTIME_CONTRACT.rpc_url
+        or endpoint_contract != expected_endpoint
+    ):
+        return "G5 admission endpoint identity contract mismatch"
+    expected_container = {
+        "compose_service": G5_RUNTIME_CONTRACT.compose_service,
+        "image_digest": G5_RUNTIME_CONTRACT.image_digest,
+        "image_reference": G5_RUNTIME_CONTRACT.image_reference,
+        "rpc_url_sha256": hashlib.sha256(
+            G5_RUNTIME_CONTRACT.rpc_url.encode("utf-8")
+        ).hexdigest(),
+        "metrics_env_var": "NODE_PROMETHEUS_METRICS_URL",
+        "metrics_url_sha256": hashlib.sha256(
+            G5_RUNTIME_CONTRACT.metrics_url.encode("utf-8")
+        ).hexdigest(),
+        "metrics_required": True,
+    }
+    if container_requirements != expected_container:
+        return "G5 admission container/metrics requirements mismatch"
+    try:
+        created_at = datetime.fromisoformat(
+            str(envelope.get("created_at") or "").replace("Z", "+00:00")
+        )
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "G5 admission envelope timestamp is invalid"
+    if (
+        any(value.tzinfo is None for value in (created_at, admitted_at, started_at))
+        or not admitted_at <= created_at <= started_at
+    ):
+        return "G5 admission envelope timestamp is out of bounds"
+    return ""
+
+
+def _real_execution_endpoint_error(
+    *,
+    request: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    probe = dict(request.get("endpoint_probe") or {})
+    if not admission.endpoint_env_var:
+        return "fake-node scenario unexpectedly contains endpoint probe evidence" if probe else ""
+    identity = dict(envelope.get("endpoint_identity_contract") or {})
+    execution_env = dict((plan.get("execution") or {}).get("environment") or {})
+    endpoint = str(execution_env.get(admission.endpoint_env_var) or "").strip()
+    expected = str(identity.get("expected_identity") or "").strip()
+    method = str(identity.get("probe_method") or "").strip()
+    required = {
+        "chain": str(plan.get("chain") or ""),
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else "",
+        "endpoint_env_var": admission.endpoint_env_var,
+        "probe_method": method,
+        "expected_identity": expected,
+        "verified": True,
+    }
+    for name, value in required.items():
+        if probe.get(name) != value:
+            return f"real execution endpoint probe mismatch: {name}"
+    if not isinstance(probe.get("http_status"), int) or not 200 <= probe["http_status"] < 300:
+        return "real execution endpoint probe HTTP status is invalid"
+    request_contract = dict(probe.get("request_contract") or {})
+    response_contract = dict(probe.get("response_contract") or {})
+    expected_request_contract = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params_sha256": str(identity.get("params_sha256") or ""),
+    }
+    if request_contract != expected_request_contract:
+        return "real execution endpoint request extraction contract mismatch"
+    if content_hash(request_contract) != str(probe.get("request_contract_sha256") or ""):
+        return "real execution endpoint request contract hash mismatch"
+    if (
+        response_contract.get("jsonrpc") != "2.0"
+        or response_contract.get("id") != request_contract.get("id")
+        or response_contract.get("result_path") != "$.result"
+        or response_contract.get("result_type") != "hex_quantity"
+        or not isinstance(response_contract.get("result"), str)
+        or re.fullmatch(r"0x[0-9a-fA-F]+", response_contract["result"]) is None
+        or set(response_contract)
+        != {"jsonrpc", "id", "result_path", "result_type", "result"}
+    ):
+        return "real execution endpoint response extraction contract is invalid"
+    if content_hash(response_contract) != str(probe.get("response_contract_sha256") or ""):
+        return "real execution endpoint response contract hash mismatch"
+    observed = str(response_contract.get("result") or "").strip()
+    if str(probe.get("observed_identity") or "") != observed:
+        return "real execution endpoint observed identity is not probe-derived"
+    if observed.lower() != expected.lower():
+        return "real execution endpoint observed identity does not match approved identity"
+    if content_hash(response_contract) != str(probe.get("response_sha256") or ""):
+        return "real execution endpoint typed response hash mismatch"
+    try:
+        probed_at = datetime.fromisoformat(str(probe.get("probed_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return "real execution endpoint probe timestamp is invalid"
+    if probed_at.tzinfo is None:
+        return "real execution endpoint probe timestamp has no timezone"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution endpoint admission timestamp is invalid"
+    if probed_at < admitted_at:
+        return "real execution endpoint probe predates jobs-root admission"
+    try:
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution endpoint execution timestamp is invalid"
+    if probed_at > started_at:
+        return "real execution endpoint probe occurred after submission"
+    return ""
+
+
+def _real_execution_runtime_attestation_error(
+    *,
+    request: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    attestation = dict(request.get("runtime_attestation") or {})
+    if not admission.endpoint_env_var:
+        return (
+            "fake-node scenario unexpectedly contains runtime attestation"
+            if attestation
+            else ""
+        )
+    if attestation.get("schema_version") != 1:
+        return "geth-dev runtime attestation schema is invalid"
+    if dict(attestation.get("repository_revision") or {}) != dict(
+        artifact.get("revision") or {}
+    ):
+        return "geth-dev runtime attestation revision mismatch"
+    unsigned = dict(attestation)
+    attestation_hash = str(unsigned.pop("attestation_sha256", ""))
+    if content_hash(unsigned) != attestation_hash:
+        return "geth-dev runtime attestation hash mismatch"
+    host_attestation_file = str(attestation.get("host_attestation_file") or "")
+    host_attestation_hash = str(attestation.get("host_attestation_sha256") or "")
+    try:
+        host_attestation = validate_host_attestation_file(
+            host_attestation_file,
+            repo_root=REPO_ROOT,
+            revision=dict(artifact.get("revision") or {}),
+        )
+    except (OSError, ValueError) as exc:
+        return f"G5 host attestation is invalid: {exc}"
+    if host_attestation.get("attestation_file_sha256") != host_attestation_hash:
+        return "G5 host attestation hash binding mismatch"
+    container = dict(attestation.get("container") or {})
+    container_id = str(container.get("container_id") or "")
+    image_digest = str(container.get("image_digest") or "")
+    requirements = dict(envelope.get("container_metrics_requirements") or {})
+    if (
+        len(container_id) < 12
+        or any(character not in "0123456789abcdef" for character in container_id.lower())
+        or image_digest != G5_RUNTIME_CONTRACT.image_digest
+        or container.get("image_reference") != G5_RUNTIME_CONTRACT.image_reference
+        or container.get("compose_service") != G5_RUNTIME_CONTRACT.compose_service
+        or image_digest != requirements.get("image_digest")
+        or container.get("image_reference") != requirements.get("image_reference")
+        or G5_RUNTIME_CONTRACT.compose_service
+        not in (container.get("network_aliases") or ())
+        or not container.get("network_addresses")
+    ):
+        return "geth-dev container identity is invalid"
+    if content_hash(container) != str(attestation.get("container_contract_sha256") or ""):
+        return "geth-dev container contract hash mismatch"
+    target_container = dict(host_attestation.get("target_container") or {})
+    target_networks = dict(target_container.get("networks") or {})
+    target_addresses = sorted({
+        str(details.get("ip_address") or "")
+        for details in target_networks.values()
+        if str(details.get("ip_address") or "")
+    })
+    target_aliases = sorted({
+        str(alias)
+        for details in target_networks.values()
+        for alias in (details.get("aliases") or ())
+        if str(alias)
+    })
+    expected_container = {
+        "container_id": str(target_container.get("container_id") or ""),
+        "image_digest": str(target_container.get("image_digest") or ""),
+        "image_reference": str(target_container.get("image_reference") or ""),
+        "compose_service": str(target_container.get("compose_service") or ""),
+        "compose_project": str(target_container.get("compose_project") or ""),
+        "network_addresses": target_addresses,
+        "network_aliases": target_aliases,
+    }
+    inspect_hash = str(attestation.get("docker_inspect_sha256") or "")
+    if container != expected_container:
+        return "geth-dev runtime container disagrees with host attestation"
+    if (
+        not _is_sha256(inspect_hash)
+        or inspect_hash
+        != str(
+            (host_attestation.get("docker_inspect_sha256") or {}).get(
+                G5_RUNTIME_CONTRACT.compose_service
+            )
+            or ""
+        )
+    ):
+        return "geth-dev docker inspect hash is invalid"
+    endpoint_probe = dict(request.get("endpoint_probe") or {})
+    if (
+        attestation.get("rpc_endpoint_sha256") != endpoint_probe.get("endpoint_sha256")
+        or attestation.get("rpc_chain_id") != endpoint_probe.get("observed_identity")
+        or attestation.get("rpc_response_sha256") != endpoint_probe.get("response_sha256")
+    ):
+        return "geth-dev RPC attestation is not bound to the endpoint probe"
+    rpc_route = dict(attestation.get("rpc_route") or {})
+    metrics_route = dict(attestation.get("metrics_route") or {})
+    container_addresses = set(container.get("network_addresses") or ())
+    for label, route, expected_url in (
+        ("RPC", rpc_route, G5_RUNTIME_CONTRACT.rpc_url),
+        ("metrics", metrics_route, G5_RUNTIME_CONTRACT.metrics_url),
+    ):
+        parsed = urllib.parse.urlsplit(expected_url)
+        if (
+            route.get("scheme") != parsed.scheme
+            or route.get("hostname") != G5_RUNTIME_CONTRACT.compose_service
+            or route.get("port") != parsed.port
+            or route.get("path") != (parsed.path or "/")
+            or not set(route.get("resolved_addresses") or ()) & container_addresses
+        ):
+            return f"geth-dev {label} route is not bound to the inspected container"
+    metrics_url = G5_RUNTIME_CONTRACT.metrics_url
+    metrics = dict(attestation.get("metrics_probe") or {})
+    if metrics.get("metrics_url_sha256") != hashlib.sha256(
+        metrics_url.encode("utf-8")
+    ).hexdigest():
+        return "geth-dev metrics URL hash mismatch"
+    if metrics.get("metrics_url_sha256") != requirements.get("metrics_url_sha256"):
+        return "geth-dev metrics probe does not satisfy the G5 envelope"
+    if (
+        not isinstance(metrics.get("http_status"), int)
+        or not 200 <= metrics["http_status"] < 300
+        or not _is_sha256(str(metrics.get("body_sha256") or ""))
+        or not isinstance(metrics.get("body_size_bytes"), int)
+        or metrics["body_size_bytes"] <= 0
+        or not isinstance(metrics.get("non_comment_sample_count"), int)
+        or metrics["non_comment_sample_count"] <= 0
+        or not isinstance(metrics.get("metric_family_count"), int)
+        or metrics["metric_family_count"] <= 0
+        or metrics.get("parser") != "prometheus_text_v0.0.4"
+    ):
+        return "geth-dev metrics probe contract is invalid"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        metrics_at = datetime.fromisoformat(
+            str(metrics.get("probed_at") or "").replace("Z", "+00:00")
+        )
+        attested_at = datetime.fromisoformat(
+            str(attestation.get("attested_at") or "").replace("Z", "+00:00")
+        )
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "geth-dev runtime attestation timestamp is invalid"
+    if (
+        any(
+            value.tzinfo is None
+            for value in (admitted_at, metrics_at, attested_at, started_at)
+        )
+        or not admitted_at <= metrics_at <= attested_at <= started_at
+    ):
+        return "geth-dev runtime attestation timestamps are out of bounds"
+    try:
+        host_attested_at = datetime.fromisoformat(
+            str(host_attestation.get("attested_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "G5 host attestation timestamp is invalid"
+    if host_attested_at.tzinfo is None or host_attested_at > admitted_at:
+        return "G5 host attestation postdates jobs-root admission"
+    return ""
+
+
+def _required_artifact_manifest_error(
+    *,
+    artifact: Mapping[str, Any],
+    request: Mapping[str, Any],
+    observed_artifacts: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    manifests = [
+        item for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "required-artifacts.sha256.json"
+    ]
+    if len(manifests) != 1:
+        return "real execution evidence must bind one required-artifact manifest"
+    manifest_record = manifests[0]
+    observed_job = dict(
+        ((artifact.get("result") or {}).get("observed_job") or {})
+    )
+    try:
+        owner_roots = derive_artifact_owner_roots(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"required-artifact owner roots are invalid: {exc}"
+    try:
+        _validate_hashed_artifact_identity(
+            manifest_record,
+            expected_job_id=str(artifact.get("job_id") or ""),
+            expected_run_dir=Path(
+                str(((artifact.get("result") or {}).get("observed_job") or {}).get("run_dir") or "")
+            ),
+        )
+        manifest = json.loads(Path(str(manifest_record["path"])).read_text(encoding="utf-8"))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return f"required-artifact manifest is invalid: {exc}"
+    if manifest.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA_VERSION:
+        return "required-artifact manifest schema mismatch"
+    if str(manifest.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "required-artifact manifest job mismatch"
+    if str(manifest.get("scenario_id") or "") != scenario.scenario_id:
+        return "required-artifact manifest scenario mismatch"
+    expected_roots = {
+        name: str(path)
+        for name, path in sorted(owner_roots.items())
+    }
+    if manifest.get("owner_roots") != expected_roots:
+        return "required-artifact manifest owner roots mismatch"
+    expected_roots_hash = hashlib.sha256(
+        json.dumps(
+            expected_roots,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if manifest.get("owner_roots_sha256") != expected_roots_hash:
+        return "required-artifact manifest owner roots hash mismatch"
+    job_plan_file = Path(str(observed_job.get("plan_file") or ""))
+    try:
+        expected_job_plan_hash = hashlib.sha256(job_plan_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"required-artifact job plan cannot be read: {exc}"
+    if manifest.get("job_plan_sha256") != expected_job_plan_hash:
+        return "required-artifact manifest job plan hash mismatch"
+    records = list(manifest.get("artifacts") or ())
+    names = [str(item.get("name") or "") for item in records]
+    if len(names) != len(set(names)) or set(names) != set(scenario.required_artifacts):
+        return "required-artifact manifest names mismatch"
+    if records != list(request.get("required_artifact_hashes") or ()):
+        return "required-artifact request binding mismatch"
+    for record in records:
+        name = str(record.get("name") or "")
+        path = Path(str(record.get("path") or ""))
+        if str(observed_artifacts.get(name) or "") != str(path):
+            return f"required-artifact observed path mismatch: {name}"
+        expected_owner = required_artifact_owner(scenario, name)
+        expected_root = owner_roots[expected_owner].resolve()
+        if (
+            record.get("owner") != expected_owner
+            or record.get("owner_root") != str(expected_root)
+        ):
+            return f"required-artifact owner mismatch: {name}"
+        try:
+            admitted_path = validate_owned_artifact_path(
+                path,
+                expected_owner=expected_owner,
+                owner_roots=owner_roots,
+            )
+            if record.get("relative_path") != str(
+                path.relative_to(expected_root)
+            ):
+                return f"required-artifact relative path mismatch: {name}"
+            if record.get("resolved_path") != str(admitted_path):
+                return f"required-artifact resolved path mismatch: {name}"
+            observed_link_target = os.readlink(path) if path.is_symlink() else ""
+            if record.get("link_target") != observed_link_target:
+                return f"required-artifact link target mismatch: {name}"
+            if hashlib.sha256(admitted_path.read_bytes()).hexdigest() != str(record.get("sha256") or ""):
+                return f"required-artifact hash mismatch: {name}"
+            if admitted_path.stat().st_size != int(record.get("size_bytes", -1)):
+                return f"required-artifact size mismatch: {name}"
+        except (OSError, TypeError, ValueError) as exc:
+            return f"required-artifact cannot be admitted: {name}: {exc}"
+    return ""
+
+
+def validate_real_execution_ledger_artifacts(
+    artifacts: Iterable[Mapping[str, Any]],
+    *,
+    revision: Mapping[str, str],
+) -> tuple[bool, str]:
+    observed = list(artifacts)
+    expected = sorted(
+        (scenario for scenario in EXECUTION_SCENARIOS if scenario.real_evidence_required),
+        key=lambda scenario: g5_scenario_admission(scenario.scenario_id).sequence_index,
+    )
+    if [item.get("scenario_id") for item in observed] != [
+        scenario.scenario_id for scenario in expected
+    ]:
+        return False, "real execution ledger scenario sequence mismatch"
+    job_ids = [str(item.get("job_id") or "") for item in observed]
+    if not all(job_ids) or len(set(job_ids)) != len(job_ids):
+        return False, "real execution ledger job identities are not unique"
+    if any(item.get("outcome") != "passed" for item in observed):
+        return False, "real execution ledger requires four passing scenarios"
+    for artifact, scenario in zip(observed, expected):
+        admission = g5_scenario_admission(scenario.scenario_id)
+        if dict(artifact.get("revision") or {}) != dict(revision):
+            return False, "real execution ledger revision mismatch"
+        request = dict(artifact.get("request") or {})
+        if request.get("ledger_sequence") != admission.sequence_index:
+            return False, "real execution ledger sequence binding mismatch"
+        if (
+            str(request.get("predecessor_scenario_id") or "")
+            != admission.predecessor_scenario_id
+        ):
+            return False, "real execution ledger predecessor binding mismatch"
+    for predecessor, current in zip(observed, observed[1:]):
+        try:
+            predecessor_finished = datetime.fromisoformat(
+                str(predecessor.get("finished_at") or "").replace("Z", "+00:00")
+            )
+            current_started = datetime.fromisoformat(
+                str(current.get("started_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False, "real execution ledger ordering timestamp is invalid"
+        if (
+            predecessor.get("outcome") != "passed"
+            or predecessor_finished.tzinfo is None
+            or current_started.tzinfo is None
+            or predecessor_finished > current_started
+        ):
+            return False, "real execution ledger is not a fully serial passing sequence"
+    smoke = observed[1]
+    final = observed[2]
+    smoke_probe = dict((smoke.get("request") or {}).get("endpoint_probe") or {})
+    final_probe = dict((final.get("request") or {}).get("endpoint_probe") or {})
+    if smoke_probe.get("endpoint_sha256") != final_probe.get("endpoint_sha256"):
+        return False, "real-node smoke and final target different endpoints"
+    smoke_profile = dict(
+        ((smoke.get("request") or {}).get("runtime_env_projection") or {}).get(
+            "execution_profile"
+        )
+        or {}
+    )
+    final_profile = dict(
+        ((final.get("request") or {}).get("runtime_env_projection") or {}).get(
+            "execution_profile"
+        )
+        or {}
+    )
+    smoke_units = smoke_profile.get("minimum_request_seconds")
+    final_units = final_profile.get("minimum_request_seconds")
+    if (
+        not isinstance(smoke_units, int)
+        or not isinstance(final_units, int)
+        or smoke_units <= 0
+        or final_units <= smoke_units
+        or smoke_profile.get("output_root_sha256")
+        == final_profile.get("output_root_sha256")
+    ):
+        return False, "real-node final profile is not materially stronger than smoke"
+    runtime_artifacts = (observed[1], observed[2], observed[3])
+    runtime_identities = {
+        (
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("container", {})
+                .get("container_id")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("container", {})
+                .get("image_digest")
+                or ""
+            ),
+        )
+        for item in runtime_artifacts
+    }
+    if len(runtime_identities) != 1 or not all(next(iter(runtime_identities), ())):
+        return False, "real/sync execution did not attest one geth-dev container image"
+    host_identities = {
+        (
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("host_attestation_file")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("host_attestation_sha256")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("docker_inspect_sha256")
+                or ""
+            ),
+        )
+        for item in runtime_artifacts
+    }
+    if len(host_identities) != 1 or not all(next(iter(host_identities), ())):
+        return False, "real/sync execution did not share one host attestation"
+    return True, ""
+
+
+def validate_real_execution_predecessor(
+    artifacts: Iterable[Mapping[str, Any]],
+    *,
+    scenario: Any,
+    started_at: str,
+    endpoint_probe: Mapping[str, Any],
+    runtime_attestation: Mapping[str, Any],
+) -> tuple[bool, str]:
+    predecessor_id = g5_scenario_admission(
+        scenario.scenario_id
+    ).predecessor_scenario_id
+    if not predecessor_id:
+        return True, ""
+    matches = [
+        artifact
+        for artifact in artifacts
+        if str(artifact.get("scenario_id") or "") == predecessor_id
+    ]
+    if len(matches) != 1:
+        return False, f"required predecessor evidence is missing: {predecessor_id}"
+    predecessor = matches[0]
+    if predecessor.get("outcome") != "passed":
+        return False, f"required predecessor did not pass: {predecessor_id}"
+    try:
+        predecessor_finished = datetime.fromisoformat(
+            str(predecessor.get("finished_at") or "").replace("Z", "+00:00")
+        )
+        current_started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "predecessor ordering timestamp is invalid"
+    if (
+        predecessor_finished.tzinfo is None
+        or current_started.tzinfo is None
+        or predecessor_finished > current_started
+    ):
+        return False, f"required predecessor is not serial: {predecessor_id}"
+    predecessor_probe = dict(
+        (predecessor.get("request") or {}).get("endpoint_probe") or {}
+    )
+    if (
+        predecessor_probe
+        and endpoint_probe
+        and predecessor_probe.get("endpoint_sha256")
+        != endpoint_probe.get("endpoint_sha256")
+    ):
+        return False, f"required predecessor targeted a different endpoint: {predecessor_id}"
+    predecessor_runtime = dict(
+        (predecessor.get("request") or {}).get("runtime_attestation") or {}
+    )
+    predecessor_container = dict(predecessor_runtime.get("container") or {})
+    current_container = dict(runtime_attestation.get("container") or {})
+    if predecessor_container and current_container and (
+        predecessor_container.get("container_id") != current_container.get("container_id")
+        or predecessor_container.get("image_digest") != current_container.get("image_digest")
+    ):
+        return False, f"required predecessor used a different runtime: {predecessor_id}"
+    return True, ""
+
+
+def _validate_hashed_artifact_identity(
+    item: Mapping[str, Any],
+    *,
+    expected_job_id: str = "",
+    expected_run_dir: Path | None = None,
+) -> None:
+    if not isinstance(item, Mapping):
+        raise ValueError("hashed artifact identity is not an object")
+    raw_path = str(item.get("path") or "").strip()
+    expected_hash = str(item.get("sha256") or "")
+    if not raw_path or not _is_sha256(expected_hash):
+        raise ValueError("hashed artifact identity requires path and sha256")
+    path = Path(raw_path)
+    if not path.is_file():
+        raise ValueError(f"hashed artifact does not exist: {path}")
+    if expected_run_dir is not None:
+        _validate_exact_descendant(path, expected_run_dir=expected_run_dir)
+    elif expected_job_id and expected_job_id not in path.parts:
+        raise ValueError(f"hashed artifact is not owned by job {expected_job_id}: {path}")
+    observed_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if observed_hash != expected_hash:
+        raise ValueError(f"hashed artifact content mismatch: {path}")
+
+
+def _validate_exact_descendant(path: Path, *, expected_run_dir: Path) -> None:
+    if expected_run_dir.is_symlink() or not expected_run_dir.is_dir():
+        raise ValueError("fresh run_dir is missing or symlinked")
+    root = expected_run_dir.resolve(strict=True)
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"artifact escapes fresh run_dir: {path}") from exc
+    current = path if path.is_absolute() else Path.cwd() / path
+    while current != root:
+        if current.is_symlink():
+            raise ValueError(f"artifact path contains a symlink: {current}")
+        parent = current.parent
+        if parent == current:
+            raise ValueError(f"artifact is not rooted in fresh run_dir: {path}")
+        current = parent
+    if resolved == root:
+        raise ValueError("artifact cannot be the run_dir itself")
+
+
+def _lane_error(edge: Mapping[str, Any], evidence_class: str) -> str:
+    lane = (edge.get("evidence") or {}).get(evidence_class)
+    if lane is None:
+        return "edge has no lane applicability declaration"
+    if not bool(lane.get("required")):
+        return f"edge is not required for {evidence_class}: {lane.get('applicability_reason') or 'unspecified'}"
+    return ""
+
+
+def _require_lane(edge: Mapping[str, Any], evidence_class: str) -> None:
+    reason = _lane_error(edge, evidence_class)
+    if reason:
+        raise ValueError(reason)
+
+
+def _action_admission(
+    edge: Mapping[str, Any],
+    question: Mapping[str, Any],
+    input_value: Any,
+    *,
+    admitted: bool,
+) -> dict[str, Any]:
+    if str(edge.get("edge_type") or "") == "question_option":
+        option_id = str(edge.get("option_id") or "")
+        for option in question.get("options") or []:
+            if str(option.get("id") or "") == option_id:
+                candidates = {
+                    option_id.casefold(),
+                    str(option.get("label") or "").strip().casefold(),
+                    str(option.get("value") or "").strip().casefold(),
+                }
+                if str(input_value or "").strip().casefold() not in candidates:
+                    return {}
+                return {
+                    "admitted": admitted,
+                    "source": "pending_question_option",
+                    "option_id": option_id,
+                    "input": deepcopy(input_value),
+                    "action": deepcopy(dict(option.get("action") or {})),
+                }
+        return {}
+    if str(edge.get("edge_type") or "") == "manual_input":
+        return {
+            "admitted": admitted,
+            "source": "pending_question_manual_input",
+            "input": deepcopy(input_value),
+            "action": {
+                "type": "answer_pending",
+                "question_id": str(question.get("id") or ""),
+                "field": str(question.get("field") or ""),
+                "value": _normalize_scalar(input_value),
+            },
+        }
+    return {}
+
+
+def _validate_admitted_turn_context_input(
+    artifact: Mapping[str, Any],
+    edge: Mapping[str, Any],
+    turn: Mapping[str, Any],
+    question: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> str:
+    recorded_input = str(turn.get("input") or "").strip()
+    context_text = str(context.get("text") or "")
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and bool(
+            question.get("sensitive_input")
+            or question.get("secret_reentry_binding")
+        )
+    )
+    if not sensitive_manual_input:
+        return (
+            "turn context input mismatch"
+            if context_text != recorded_input
+            else ""
+        )
+    if recorded_input != SENSITIVE_INPUT_MARKER:
+        return "sensitive turn input is not structurally projected"
+    if not context_text.startswith("secret-reference-hash:"):
+        return "sensitive turn context has no projected reference identity"
+    if "semantic-secret:" in canonical_json(turn):
+        return "sensitive turn evidence contains an owning secret capability"
+    return ""
+
+
+def _validate_return_event(
+    event: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    turn: Mapping[str, Any],
+) -> str:
+    details = event.get("details")
+    if not isinstance(details, Mapping):
+        return "compiled graph return event has no details"
+    expected = dict(artifact.get("source_boundary_hashes") or {})
+    mismatches = {key: (details.get(key), value) for key, value in expected.items() if details.get(key) != value}
+    return f"compiled graph return hashes mismatch: {mismatches}" if mismatches else ""
+
+
+def _has_event(events: Iterable[Mapping[str, Any]], event_type: str, edge: Mapping[str, Any]) -> bool:
+    return _event(events, event_type, edge) is not None
+
+
+def _event(
+    events: Iterable[Mapping[str, Any]],
+    event_type: str,
+    edge: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    edge_key = str(edge.get("edge_key") or "")
+    return next(
+        (
+            event for event in events
+            if str(event.get("event_type") or "") == event_type
+            and str(event.get("edge_key") or "") == edge_key
+        ),
+        None,
+    )
+
+
+def _normalize_scalar(value: Any) -> str:
+    return str(value or "").strip().rstrip(",，;；").strip()
+
+
+def _read_path(value: Mapping[str, Any], path: str) -> Any:
+    current: Any = value
+    for part in str(path).split("."):
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)

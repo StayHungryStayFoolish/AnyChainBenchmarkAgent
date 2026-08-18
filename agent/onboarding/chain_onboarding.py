@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from knowledge.gap_analyzer import analyze_capability_gap
-from onboarding.families import SUPPORTED_FAMILIES
-from onboarding.quality_gate import coding_brief, onboarding_quality_gate
+from agent.knowledge.gap_analyzer import analyze_capability_gap
+from agent.onboarding.families import SUPPORTED_FAMILIES
+from agent.onboarding.quality_gate import coding_brief, onboarding_quality_gate
 
 
 def generate_onboarding_package(
@@ -49,7 +49,7 @@ def generate_onboarding_package(
         ],
         "validation_commands": [
             "python3 tools/chain_adapters/cli.py validate-template --chain <chain>",
-            "python3 agent/cli.py gap-analysis --chain <chain> --method <method>",
+            "python3 -m agent.cli gap-analysis --chain <chain> --method <method>",
             "python3 tools/fake-node/check_fixture_coverage.py --json",
             "python3 tools/fake-node/runtime_probe.py",
             "./bin/anychain-agent --prompt \"Create a <chain> fake-node smoke benchmark at 1 QPS\"",

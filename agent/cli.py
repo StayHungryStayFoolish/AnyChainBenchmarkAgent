@@ -8,35 +8,36 @@ import json
 import sys
 from pathlib import Path
 
-from analyzers.result_analyzer import analyze_job
-from analyzers.history import compare_latest, list_history
-from analyzers.artifact_qa import answer_artifact_question
-from analyzers.bottleneck_rules import diagnose_artifacts
-from adk_app.app import status_payload as adk_status_payload
-from adk_app.compat import adk_feature_report
-from adk_app.workflow.native_smoke import run_native_workflow_smoke
-from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals
-from adk_app.runtime import run_adk_cli
-from diagnostics.doctor import run_doctor
-from discovery.environment import discover_environment
-from knowledge.gap_analyzer import analyze_capability_gap
-from knowledge.framework_capabilities import load_framework_capabilities
-from knowledge.framework_index import load_or_build_framework_index, write_framework_index
-from knowledge.loader import load_knowledge_provider, provider_status
-from llm.config import load_llm_config
-from llm.google_auth import credential_plan
-from llm.providers import provider_from_config
-from llm.types import LLMMessage, LLMRequest
-from onboarding.chain_onboarding import generate_onboarding_package
-from onboarding.template_drafter import draft_chain_template
-from planners.preflight import run_preflight
-from planners.diff import diff_plans
-from planners.risk import score_plan_risk
-from planners.strategy_planner import generate_plan, load_json, validate_plan_shape, write_json
-from runners.job_manager import get_job, list_jobs, resume_job, submit_job, tail_job_log
-from runners.runbook import render_runbook
-from tools.executor import execute_tool, load_arguments
-from tools.schema import tool_schema
+from agent.analyzers.artifact_qa import answer_artifact_question
+from agent.analyzers.bottleneck_rules import diagnose_artifacts
+from agent.analyzers.history import compare_latest, list_history
+from agent.analyzers.result_analyzer import analyze_job
+from agent.diagnostics.adk_status import adk_status
+from agent.diagnostics.doctor import run_doctor
+from agent.discovery.environment import discover_environment
+from agent.knowledge.framework_capabilities import load_framework_capabilities
+from agent.knowledge.framework_index import load_or_build_framework_index, write_framework_index
+from agent.knowledge.gap_analyzer import analyze_capability_gap
+from agent.knowledge.loader import load_knowledge_provider, provider_status
+from agent.llm.config import load_llm_config
+from agent.llm.google_auth import credential_plan
+from agent.llm.providers import provider_from_config
+from agent.llm.search_grounding import web_research_status
+from agent.llm.types import LLMMessage, LLMRequest
+from agent.onboarding.chain_onboarding import generate_onboarding_package
+from agent.onboarding.template_drafter import draft_chain_template
+from agent.planners.diff import diff_plans
+from agent.planners.risk import score_plan_risk
+from agent.planners.strategy_planner import generate_plan, load_json, validate_plan_shape, write_json
+from agent.runners.application_service import (
+    ExecutionOperation,
+    ExecutionRequest,
+    execution_service,
+)
+from agent.runners.job_manager import DEFAULT_JOBS_DIR, get_job, list_jobs, resume_job, tail_job_log
+from agent.runners.runbook import render_runbook
+from agent.tools.executor import execute_tool, load_arguments
+from agent.tools.schema import tool_schema
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -111,8 +112,6 @@ def main(argv: list[str] | None = None) -> int:
     tool_call.add_argument("--name", required=True)
     tool_call.add_argument("--arguments", default="{}", help="JSON object or path to a JSON file")
 
-    sub.add_parser("adk-native-smoke", help="Run a credential-free native google-adk Workflow smoke test")
-
     validate = sub.add_parser("validate-plan", help="Validate plan shape")
     validate.add_argument("plan")
 
@@ -123,7 +122,6 @@ def main(argv: list[str] | None = None) -> int:
     submit = sub.add_parser("submit", help="Submit a benchmark job")
     submit.add_argument("--plan", required=True)
     submit.add_argument("--jobs-dir")
-    submit.add_argument("--mock", action="store_true", help="Complete a lifecycle-only mock job")
     submit.add_argument("--approved", action="store_true", help="Confirm approval checkpoints for real execution")
 
     status = sub.add_parser("status", help="Show job status")
@@ -156,19 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     runbook.add_argument("--plan", required=True)
     runbook.add_argument("--output")
 
-    chat = sub.add_parser("chat", help="Run the official ADK CLI for the AnyChain agent")
-    chat.add_argument("--prompt", help="Send one prompt to the ADK CLI through stdin, then exit")
-    chat.add_argument("--agent-dir", default=None)
-    chat.add_argument("--adk-bin", default="adk")
-    chat.add_argument("adk_arg", nargs=argparse.REMAINDER)
-
-    adk_status_cmd = sub.add_parser("adk-status", help="Show optional ADK runtime availability")
+    adk_status_cmd = sub.add_parser("adk-status", help="Show optional google_search grounding availability")
     adk_status_cmd.add_argument("--output")
-
-    adk_feature_cmd = sub.add_parser("adk-feature-report", help="Show offline-safe Google ADK feature compatibility")
-    adk_feature_cmd.add_argument("--output")
-
-    sub.add_parser("adk-eval", help="Run no-key ADK package and tool-contract checks")
 
     args = parser.parse_args(argv)
 
@@ -247,7 +234,10 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(payload, args.output)
 
     if args.command == "preflight":
-        return _emit(run_preflight(load_json(args.plan)), None)
+        result = execution_service.execute(
+            ExecutionRequest(operation=ExecutionOperation.PREFLIGHT, plan_file=args.plan)
+        )
+        return _emit(result.to_dict(), None)
 
     if args.command == "discover":
         payload = discover_environment()
@@ -276,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 temperature=0,
                 max_tokens=512,
+                replay_safety="side_effect_free",
             )
         )
         return _emit({"provider": response.provider, "model": response.model, "text": response.text}, None)
@@ -285,10 +276,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "tool-call":
         return _emit(execute_tool(args.name, load_arguments(args.arguments)), None)
-
-    if args.command == "adk-native-smoke":
-        payload = run_native_workflow_smoke()
-        return _emit(payload, None)
 
     if args.command == "validate-plan":
         errors = validate_plan_shape(load_json(args.plan))
@@ -300,24 +287,28 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(diff_plans(load_json(args.old), load_json(args.new)), None)
 
     if args.command == "submit":
+        request_kwargs = {
+            "operation": ExecutionOperation.FINAL_BENCHMARK,
+            "plan_file": args.plan,
+            "approved": args.approved,
+        }
         if args.jobs_dir:
-            payload = submit_job(args.plan, jobs_dir=args.jobs_dir, mock=args.mock, approved=args.approved)
-        else:
-            payload = submit_job(args.plan, mock=args.mock, approved=args.approved)
-        return _emit(payload, None)
+            request_kwargs["jobs_dir"] = args.jobs_dir
+        result = execution_service.execute(ExecutionRequest(**request_kwargs))
+        return _emit(result.to_dict(), None)
 
     if args.command == "status":
         job = get_job(args.job_id, jobs_dir=args.jobs_dir) if args.jobs_dir else get_job(args.job_id)
         return _emit(job, None)
 
     if args.command == "jobs":
-        return _emit({"jobs": list_jobs(jobs_dir=args.jobs_dir or ".agent/jobs", limit=args.limit)}, None)
+        return _emit({"jobs": list_jobs(jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR, limit=args.limit)}, None)
 
     if args.command == "logs":
-        return _emit(tail_job_log(args.job_id, jobs_dir=args.jobs_dir or ".agent/jobs", lines=args.lines), None)
+        return _emit(tail_job_log(args.job_id, jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR, lines=args.lines), None)
 
     if args.command == "resume":
-        return _emit(resume_job(args.job_id, jobs_dir=args.jobs_dir or ".agent/jobs"), None)
+        return _emit(resume_job(args.job_id, jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR), None)
 
     if args.command == "analyze":
         job = get_job(args.job_id, jobs_dir=args.jobs_dir) if args.jobs_dir else get_job(args.job_id)
@@ -336,27 +327,13 @@ def main(argv: list[str] | None = None) -> int:
         print(text, end="")
         return 0
 
-    if args.command == "chat":
-        runtime_args: list[str] = []
-        if args.prompt:
-            runtime_args.extend(["--prompt", args.prompt])
-        if args.agent_dir:
-            runtime_args.extend(["--agent-dir", args.agent_dir])
-        if args.adk_bin:
-            runtime_args.extend(["--adk-bin", args.adk_bin])
-        runtime_args.extend(args.adk_arg or [])
-        return run_adk_cli(runtime_args)
-
     if args.command == "adk-status":
-        return _emit(adk_status_payload(), args.output)
-
-    if args.command == "adk-feature-report":
-        return _emit(adk_feature_report(), args.output)
-
-    if args.command == "adk-eval":
-        payload = run_adk_offline_evals()
-        _emit(payload, None)
-        return 0 if payload["status"] == "passed" else 1
+        status = adk_status().as_dict()
+        payload = {
+            "adk_package": status,
+            "google_search_grounding": web_research_status().as_dict(),
+        }
+        return _emit(payload, args.output)
 
     parser.error(f"unsupported command: {args.command}")
     return 2

@@ -20,6 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def discover_environment(command_runner: CommandRunner | None = None) -> dict[str, Any]:
+    fixture = _load_discovery_fixture()
+    if fixture is not None:
+        return fixture
+
     runner = command_runner or _run_command
     host = _discover_host()
     container = _discover_container()
@@ -48,6 +52,40 @@ def discover_environment(command_runner: CommandRunner | None = None) -> dict[st
         "dependencies": dependencies,
         "warnings": _warnings(cloud, disks, dependencies),
     }
+
+
+def _load_discovery_fixture() -> dict[str, Any] | None:
+    """Load a test-only discovery fixture when explicitly requested.
+
+    This hook lets live PTY tests exercise multi-disk and cloud-metadata
+    decision branches inside Docker, where host disk topology and cloud
+    metadata are otherwise not visible. It is opt-in and never mutates runtime
+    configuration.
+    """
+    raw_path = os.environ.get("ANYCHAIN_AGENT_DISCOVERY_FIXTURE", "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_file():
+        return {
+            "source": "agent.discovery.fixture",
+            "mode": "fixture_error",
+            "host": {},
+            "deployment": {"type": "unknown", "container": {}, "kubernetes": {}},
+            "cloud": {"provider": "other", "platform": "unknown", "confidence": 0.0},
+            "network": {},
+            "disks": {"candidates": [], "ambiguous_candidates": []},
+            "dependencies": {"mode": "audit", "tools": {}, "missing_required": []},
+            "warnings": [f"Discovery fixture not found: {raw_path}"],
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.setdefault("source", "agent.discovery.fixture")
+    payload.setdefault("mode", "read_only_fixture")
+    payload.setdefault("warnings", [])
+    payload["warnings"] = list(payload.get("warnings") or []) + [
+        "Discovery data came from ANYCHAIN_AGENT_DISCOVERY_FIXTURE for live CLI testing."
+    ]
+    return payload
 
 
 def _discover_host() -> dict[str, Any]:
@@ -214,9 +252,12 @@ def _discover_aws_instance_metadata(runner: CommandRunner) -> dict[str, str]:
 def _discover_network(runner: CommandRunner) -> dict[str, Any]:
     iface = ""
     driver = ""
+    interfaces = _network_interfaces_from_sysfs()
     code, stdout, _ = runner(["bash", "-lc", "ip route 2>/dev/null | awk '/^default/ {print $5; exit}'"], 2)
     if code == 0:
         iface = stdout.strip()
+    if iface and iface not in interfaces:
+        interfaces.insert(0, iface)
     if iface and shutil.which("ethtool"):
         code, stdout, _ = runner(["ethtool", "-i", iface], 2)
         if code == 0:
@@ -224,7 +265,15 @@ def _discover_network(runner: CommandRunner) -> dict[str, Any]:
                 if line.startswith("driver:"):
                     driver = line.split(":", 1)[1].strip()
                     break
-    return {"default_interface": iface, "driver": driver}
+    return {"default_interface": iface, "interfaces": interfaces, "driver": driver}
+
+
+def _network_interfaces_from_sysfs() -> list[str]:
+    sys_class_net = Path("/sys/class/net")
+    if not sys_class_net.is_dir():
+        return []
+    names = sorted(item.name for item in sys_class_net.iterdir() if item.name and item.name != "lo")
+    return names
 
 
 def _discover_disks(runner: CommandRunner) -> dict[str, Any]:
@@ -271,17 +320,30 @@ def _discover_disks(runner: CommandRunner) -> dict[str, Any]:
 
 
 def _collect_disk_candidates(item: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
-    if item.get("type") in {"disk", "part", "lvm"}:
+    mountpoint = item.get("mountpoint") or ""
+    if (
+        item.get("type") in {"disk", "part", "lvm"}
+        and not _is_zero_size(item.get("size", ""))
+        and not _is_container_system_mount(mountpoint)
+    ):
         candidates.append({
             "name": item.get("name", ""),
             "type": item.get("type", ""),
             "size": item.get("size", ""),
-            "mountpoint": item.get("mountpoint") or "",
+            "mountpoint": mountpoint,
             "fstype": item.get("fstype") or "",
             "label": item.get("label") or "",
         })
     for child in item.get("children", []) or []:
         _collect_disk_candidates(child, candidates)
+
+
+def _is_zero_size(size: Any) -> bool:
+    return str(size or "").strip().upper() in {"0", "0B", "0 B", "0K", "0M", "0G", "0T"}
+
+
+def _is_container_system_mount(mountpoint: str) -> bool:
+    return mountpoint in {"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"}
 
 
 def _score_disk(item: dict[str, Any]) -> int:
@@ -306,7 +368,12 @@ def _discover_dependencies(runner: CommandRunner) -> dict[str, Any]:
     tools = {}
     for name in ("bash", "python3", "jq", "curl", "vegeta", "docker", "kubectl", "go", "iostat", "ethtool", "ip", "lsblk"):
         code, stdout, _ = runner(["bash", "-lc", f"command -v {name}"], 1)
-        tools[name] = {"available": code == 0, "path": stdout.strip() if code == 0 else ""}
+        path = stdout.strip() if code == 0 else ""
+        if name == "vegeta" and code != 0:
+            home_vegeta = str(Path.home() / "bin" / "vegeta")
+            code, stdout, _ = runner(["bash", "-lc", f"test -x {home_vegeta!r} && printf '%s' {home_vegeta!r}"], 1)
+            path = stdout.strip() if code == 0 else ""
+        tools[name] = {"available": bool(path), "path": path}
     missing_required = [name for name in ("bash", "python3", "jq", "curl", "vegeta") if not tools[name]["available"]]
     return {
         "mode": "audit",

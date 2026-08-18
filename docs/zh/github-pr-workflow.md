@@ -34,9 +34,8 @@
    如果修改 Agent 代码，还需要运行：
 
    ```bash
-   python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+   python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
    python3 tools/check_agent_boundaries.py --root .
-   python3 agent/cli.py adk-eval
    ```
 
 5. 使用 Conventional Commit 格式提交。

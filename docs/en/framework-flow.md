@@ -7,6 +7,13 @@ AnyChain Benchmark Agent: from the entry command, through RPC workload
 generation and monitoring, to HTML reports, archives, and the optional
 Prometheus/Grafana data stream.
 
+The normal `--quick`, `--standard`, and `--intensive` modes are RPC benchmark
+flows. The `--sync-observe` mode is a separate observation flow: it watches
+sync progress and resource behavior without generating RPC benchmark load,
+without RPC proxy traffic, without Vegeta targets, and without QPS ramping.
+It also does not require `vegeta_results` artifacts for report success; reports
+come from monitoring, sync-health, node execution, disk, CPU, and network data.
+
 It is intentionally based on the current code path rather than older design
 notes. The key entry points are:
 
@@ -54,6 +61,53 @@ flowchart TD
 The runtime is built around file contracts. Collectors write timestamped CSV and
 JSON artifacts. Analysis and reporting consume those artifacts by path, not by
 calling collectors directly.
+
+## Sync-Observe Runtime Flow
+
+`--sync-observe` is used when the user wants to understand catch-up speed,
+MGas/s when node metrics expose it, node process CPU/thread hotspots, disk
+latency/iowait context, and network behavior during sync. It reuses monitoring,
+analysis, report generation, and archiving, but intentionally skips the RPC
+workload path.
+
+```mermaid
+flowchart TD
+    User["User runs --sync-observe"] --> Config["Load config layers and chain sync-health model"]
+    Config --> Clean["Prepare clean runtime state"]
+    Clean --> Monitor["Start monitoring coordinator"]
+    Monitor --> Observe["Observe until stopped, duration expires, or node is synced"]
+    Observe --> Analysis["Run offline analysis"]
+    Analysis --> Report["Generate HTML reports and sync execution chart"]
+    Report --> Archive["Archive current run"]
+    Archive --> Cleanup["Stop monitors and cleanup runtime state"]
+
+    Monitor --> PerfCSV["performance_session.csv<br/>system, disk, network, node execution"]
+    Monitor --> HeightCSV["block_height_monitor_session.csv<br/>sync-health and height progress"]
+    PerfCSV --> Analysis
+    HeightCSV --> Analysis
+```
+
+Required inputs for this path are chain/sync-health behavior, resource
+metadata, node process identity, and a stop condition. `NODE_PROMETHEUS_METRICS_URL`
+is optional; if the client does not expose MGas/s or gas-used metrics, the
+report shows `execution_metric_status=unavailable`. A numeric zero is treated
+as observed throughput only when `execution_metric_status=available` and
+`execution_metric_source` identifies the client metric. Geth's
+`chain_mgasps` summary is supported.
+
+When `BLOCKCHAIN_NODE=bsc`, the BSC v1.7.x profile reads exact native samples
+from the same endpoint: `chain_mgasps{quantile="0.5"}`, `chain_inserts`,
+`chain_insert_txsize`, `chain_insert_gasused`, and the imported/justified/
+finalized head gauges. The report adds block-insert P50, MGas/s, finality-lag
+P50/P90/P99, transactions, gas/block, gas/second, gas/transaction, TX/block,
+TPS, CPU, memory, and sample quality. These BSC samples are not assumed for
+other EVM clients. If the scrape interval skips imported blocks, cumulative
+transaction and gas values are explicitly marked as estimates with coverage.
+
+Sync-observe does not record fake-node fixtures. A node may first download a
+peer snapshot and then catch up from that snapshot height; the framework
+observes that behavior with endpoint/sync-health sanity checks rather than
+recording RPC request/response fixtures.
 
 ## Step 1: Configuration Loading
 
@@ -455,7 +509,11 @@ flowchart LR
 The exporter:
 
 - reads `latest_metrics.json`, `block_height_monitor_cache.json`,
-  `bottleneck_status.json`, `qps_status.json`, and `proxy_method.csv`;
+  `bottleneck_status.json`, `qps_status.json`, `performance_latest.csv`,
+  and `proxy_method.csv`;
+- exposes sync-observe fields from the latest performance CSV row, including
+  MGas/s when available, execution metric status/source, node process CPU,
+  hottest thread/core CPU, CPU iowait, and block-height fields;
 - exposes a bounded Prometheus text-format snapshot;
 - filters per-method metrics to workload methods from the selected chain
   template;

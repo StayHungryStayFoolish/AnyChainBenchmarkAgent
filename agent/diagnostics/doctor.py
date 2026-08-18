@@ -7,10 +7,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from discovery.environment import discover_environment
-from knowledge.framework_capabilities import load_framework_capabilities
-from llm.config import load_agent_environment, load_llm_config
-from llm.google_auth import credential_plan
+from agent.discovery.environment import discover_environment
+from agent.knowledge.framework_capabilities import load_framework_capabilities
+from agent.llm.config import load_agent_environment, load_llm_config
+from agent.llm.google_auth import credential_plan
 
 
 def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -27,7 +27,10 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     warnings = list(environment.get("warnings", []))
 
     if llm_errors:
-        warnings.append("LLM provider is not fully configured; offline dev checks still work, but ADK runtime needs a model configuration.")
+        warnings.append(
+            "LLM provider is not fully configured; offline development checks still work, "
+            "but natural-language AnyChain Agent operation needs a model configuration."
+        )
     warnings.extend(google_auth.get("warnings", []))
     if required_missing:
         warnings.append("Real benchmark execution may fail until required dependencies are available.")
@@ -39,6 +42,7 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
         "environment": {
             "cloud": environment.get("cloud", {}),
             "deployment": environment.get("deployment", {}),
+            "host": environment.get("host", {}),
             "network": environment.get("network", {}),
             "disks": environment.get("disks", {}),
             "dependencies": {
@@ -71,47 +75,6 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     return report
 
 
-def format_doctor_report(report: dict[str, Any]) -> str:
-    env = report.get("environment", {})
-    cloud = env.get("cloud", {})
-    deployment = env.get("deployment", {})
-    deps = env.get("dependencies", {})
-    llm = report.get("llm", {})
-    kb = report.get("knowledge_base", {})
-    google_auth = report.get("google_auth", {})
-    capabilities = report.get("capabilities", {})
-    lines = [
-        "Agent doctor report.",
-        f"- status: {report.get('status')}",
-        f"- cloud: {cloud.get('provider', 'unknown')} / {cloud.get('platform', 'unknown')}",
-        f"- deployment: {deployment.get('type', 'unknown')}",
-        f"- required dependencies missing: {', '.join(deps.get('missing_required', [])) or '<none>'}",
-        f"- optional dependencies missing: {', '.join(deps.get('missing_optional', [])) or '<none>'}",
-        f"- LLM provider: {llm.get('provider')} / {llm.get('model')}",
-        f"- LLM validation errors: {', '.join(llm.get('validation_errors', [])) or '<none>'}",
-        f"- Google auth mode: {google_auth.get('auth_mode', '<not-used>')}",
-        f"- gcloud available: {google_auth.get('gcloud_available', '<not-required>')}",
-        f"- local ADC file exists: {google_auth.get('local_adc_file_exists', '<not-required>')}",
-        f"- knowledge base: {kb.get('provider', 'disabled')}",
-        (
-            "- capabilities: "
-            f"{capabilities.get('chain_count')} chains, "
-            f"{capabilities.get('family_count')} families, "
-            f"{capabilities.get('unique_rpc_method_count')} unique RPC methods, "
-            f"{capabilities.get('fake_node_fixture_file_count')} fake-node fixtures"
-        ),
-    ]
-    warnings = report.get("warnings", [])
-    if warnings:
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in warnings)
-    next_actions = report.get("next_actions", [])
-    if next_actions:
-        lines.append("Next actions:")
-        lines.extend(f"- {action}" for action in next_actions)
-    return "\n".join(lines)
-
-
 def _readiness(required_missing: list[str], llm_errors: list[str]) -> str:
     if required_missing:
         return "needs_dependencies"
@@ -130,12 +93,15 @@ def _next_actions(
     if required_missing:
         actions.append("Use the project Docker image or isolated dependency installer before real benchmark execution.")
     if llm_errors:
-        actions.append("Configure config/agent_config.sh with a real model provider before starting the ADK Agent.")
+        actions.append("Configure config/agent_config.sh with a real model provider before starting AnyChain Agent.")
     actions.extend(google_auth.get("next_actions", []))
     disks = environment.get("disks", {})
     if disks.get("ambiguous_candidates"):
         actions.append("Confirm ledger/accounts devices before running disk bottleneck tests.")
-    actions.append("Run `run smoke` in the ADK terminal after creating a plan for a local lifecycle check.")
+    actions.append(
+        "Start ./bin/anychain-agent, create a plan, and approve the prompted smoke step "
+        "for a local lifecycle check."
+    )
     return actions
 
 

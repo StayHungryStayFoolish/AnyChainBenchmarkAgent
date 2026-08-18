@@ -106,6 +106,17 @@ ACCOUNT_SEMAPHORE_LIMIT="${ACCOUNT_SEMAPHORE_LIMIT:-10}"           # Account dis
 MONITOR_INTERVAL="${MONITOR_INTERVAL:-5}"                         # Unified monitoring interval, applicable to system resources, blockchain node, and monitoring overhead statistics
 DISK_MONITOR_RATE="${DISK_MONITOR_RATE:-1}"                       # Disk separate monitoring frequency
 
+# Optional node execution metrics. Set NODE_PROMETHEUS_METRICS_URL to the
+# blockchain client's Prometheus endpoint when the client exposes execution
+# gas/MGas metrics. NODE_PROCESS_PID is optional; when empty the monitor uses
+# BLOCKCHAIN_PROCESS_NAMES to locate the node process.
+# BSC v1.7.x exposes its native import profile at /debug/metrics/prometheus
+# when the client is started with --metrics. The profile is selected only when
+# BLOCKCHAIN_NODE=bsc; it is not assumed for every EVM client.
+NODE_PROMETHEUS_METRICS_URL="${NODE_PROMETHEUS_METRICS_URL:-}"     # Example: http://127.0.0.1:6060/debug/metrics/prometheus
+NODE_PROMETHEUS_TIMEOUT_SECONDS="${NODE_PROMETHEUS_TIMEOUT_SECONDS:-2}"
+NODE_PROCESS_PID="${NODE_PROCESS_PID:-}"
+
 # ----- Optional Observability Stack -----
 # Disabled by default. When set to true, the benchmark entry script starts the
 # read-only exporter, Prometheus, and Grafana stack before benchmark traffic.
@@ -154,6 +165,7 @@ export LEDGER_DEVICE ACCOUNTS_DEVICE
 export DATA_VOL_TYPE DATA_VOL_SIZE DATA_VOL_MAX_IOPS DATA_VOL_MAX_THROUGHPUT
 export ACCOUNTS_VOL_TYPE ACCOUNTS_VOL_SIZE ACCOUNTS_VOL_MAX_IOPS ACCOUNTS_VOL_MAX_THROUGHPUT
 export NETWORK_INTERFACE NETWORK_MAX_BANDWIDTH_GBPS ENA_MONITOR_ENABLED MONITOR_INTERVAL DISK_MONITOR_RATE
+export NODE_PROMETHEUS_METRICS_URL NODE_PROMETHEUS_TIMEOUT_SECONDS NODE_PROCESS_PID
 export OBSERVABILITY_STACK_ENABLED OBSERVABILITY_STACK_AUTO_STOP OBSERVABILITY_STACK_MODE EXPORTER_PORT PROMETHEUS_PORT GRAFANA_PORT PROMETHEUS_EXPORTER_MAX_PROXY_ROWS
 export QUICK_INITIAL_QPS QUICK_MAX_QPS QUICK_QPS_STEP QUICK_DURATION
 export STANDARD_INITIAL_QPS STANDARD_MAX_QPS STANDARD_QPS_STEP STANDARD_DURATION

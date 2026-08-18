@@ -113,6 +113,10 @@ This is stricter than coverage. Coverage says files exist; runtime probe proves 
 If you add, remove, or reweight mixed-mode RPC methods, verify the change before
 running a full benchmark:
 
+`weight` must be a positive integer. Missing, invalid, or zero weights are
+normalized to `1`; remove a method from `mixed_weighted` when you do not want it
+to appear in generated Vegeta targets.
+
 ```bash
 # 1. Confirm the chain template can build all mixed targets.
 python3 tests/test_chain_adapters.py

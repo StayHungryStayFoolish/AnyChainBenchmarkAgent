@@ -14,7 +14,7 @@
 #   - Does NOT modify system Python packages by default
 #   - Does NOT install Agent runtime dependencies
 #
-# For Agent runtime dependencies, including Google ADK and optional gcloud:
+# For core Agent runtime dependencies and optional Google Search/gcloud extras:
 #   bash scripts/install_agent_deps.sh --yes
 #   bash scripts/install_agent_deps.sh --yes --with-gcloud
 #

@@ -10,8 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
-from knowledge.framework_index import load_or_build_framework_index
+from agent.knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
+from agent.knowledge.framework_index import load_or_build_framework_index
 
 
 DOC_INDEX = [
@@ -78,7 +78,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "purpose": "Help users configure, validate, run, resume, and analyze blockchain node benchmark jobs.",
             "entrypoint": "./bin/anychain-agent",
             "benchmark_engine_entrypoint": "./blockchain_node_benchmark.sh",
-            "agent_runtime": "Google ADK-backed Agent runtime with deterministic AnyChain tools and gates.",
+            "agent_runtime": "LangGraph Harness Agent runtime with deterministic AnyChain tools and gates.",
         },
         "operating_principles": [
             "Discover environment and dependency state before asking benchmark configuration questions.",
@@ -86,6 +86,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "Ask for user confirmation before dependency installation or real benchmark execution.",
             "Generate runtime.env as the per-job confirmed configuration artifact; users normally do not edit it manually.",
             "Use fake-node for local closed-loop validation when real endpoints are unavailable.",
+            "Use sync-observe when the user wants to observe node catch-up speed, MGas/s, process CPU/thread hotspots, disk latency, or network behavior without generating RPC workload.",
             "For new chains or RPC methods, request official docs, KB evidence, or real request/response samples before claiming support.",
         ],
         "runtime_flow": [
@@ -99,6 +100,14 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "run smoke",
             "submit detached benchmark job after approval",
             "analyze artifacts and cite file paths",
+        ],
+        "sync_observe_flow": [
+            "confirm chain and sync-health/reference behavior",
+            "confirm resource metadata and node process identity",
+            "optionally confirm node Prometheus metrics endpoint for MGas/s",
+            "choose stop condition: until stopped, duration, or until synced",
+            "run ./blockchain_node_benchmark.sh --sync-observe",
+            "generate HTML report with sync, MGas/s when available, CPU, disk, and network timelines",
         ],
         "configuration_layers": [
             {"name": "config/agent_config.sh", "role": "Persistent Agent/LLM/KB provider configuration."},
@@ -114,6 +123,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "unique_rpc_method_count": capabilities.get("unique_rpc_method_count"),
             "configured_rpc_method_entries": capabilities.get("configured_rpc_method_entries"),
             "fake_node_fixture_file_count": capabilities.get("fake_node", {}).get("fixture_file_count"),
+            "client_metric_profiles": capabilities.get("client_metric_profiles", []),
         },
         "extension_points": capabilities.get("extension_points", []),
         "framework_index": {
@@ -158,6 +168,7 @@ def render_framework_context_for_prompt(root: str | Path = REPO_ROOT, language: 
         f"{caps['fake_node_fixture_file_count']} fake-node fixture files\n"
         f"- families: {caps['families']}\n"
         f"- runtime flow: {flow}\n"
+        "- sync-observe: observes node sync/resource behavior without RPC workload, proxy, Vegeta, or QPS ramp\n"
         "Operating rules:\n"
         f"{principles}\n"
         "Authoritative docs to use when the user asks for details:\n"

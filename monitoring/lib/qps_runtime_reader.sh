@@ -46,6 +46,11 @@ get_qps_runtime_fields() {
     local rpc_latency_ms="0.0"
     local qps_data_available="false"
 
+    if [[ "${QPS_STATUS_MODE:-}" == "sync_observe" || "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+        echo "0,0.0,false"
+        return 0
+    fi
+
     if [[ -f "$status_file" ]]; then
         local qps_status_content
         qps_status_content=$(cat "$status_file" 2>/dev/null || true)

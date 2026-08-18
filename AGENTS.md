@@ -3,15 +3,28 @@
 This file is for AI assistants helping a user configure, run, validate, or
 extend AnyChain Benchmark Agent.
 
-If you are an AI coding agent modifying this repository, read `AI_CODING_GUIDE.md` and
-`docs/en/anychain-agent-ai-work-gate.md` first. If you are helping a user use
-the project without changing code, start with this file and the linked runtime
-docs.
+If you are an AI coding agent modifying this repository, read
+`AI_CODING_GUIDE.md` and `docs/en/anychain-agent-ai-work-gate.md` first.
+
+For Agent workflow, prompt, terminal, validation, runner, fake-node smoke, or
+benchmark execution changes, do not edit code until the current task/design
+document is present, accurate, and reviewed. If the document is missing,
+outdated, or vague, update the document first. Do not rely on ad hoc patches,
+fallback logic, phrase repair, duplicate state, or local if/else fixes to make
+one transcript pass.
+
+For Agent workflow, prompt, terminal, validation, runner, Harness, or benchmark
+execution changes, also read the current reviewed task/design document before
+touching code. If the user or current branch provides a separate task/design
+document, read and reconcile it before editing code. If you are helping a user
+use the project without changing code, start with this file and the linked
+runtime docs.
 
 ## What This Project Is
 
-AnyChain Benchmark Agent is a Google ADK-based terminal Agent for blockchain
-node benchmark workflows. The Agent helps users:
+AnyChain Benchmark Agent is a LangGraph Harness-based terminal Agent for
+blockchain node benchmark workflows. Google ADK is only the optional Gemini
+`google_search` bridge, not the product workflow owner. The Agent helps users:
 
 - configure an LLM provider;
 - inspect local environment and dependencies;
@@ -21,8 +34,9 @@ node benchmark workflows. The Agent helps users:
 - run preflight, smoke, detached jobs, log follow, and report analysis;
 - generate secondary-development plans for new chains or RPC methods.
 
-The deterministic benchmark engine remains the source of truth. The Agent
-must use ADK and deterministic tools instead of terminal keyword routing.
+The deterministic benchmark engine remains the source of truth. Ambiguous user
+intent must flow through the Harness LLM resolver and deterministic workflow
+groups instead of terminal keyword routing.
 
 ## Fast Path For Helping A User Configure The Agent
 
@@ -56,9 +70,13 @@ environment.
 
    ```bash
    source config/agent_config.sh
-   python3 agent/cli.py adk-status
-   python3 agent/cli.py adk-eval
+   python3 -m agent.cli llm-config
+   python3 -m agent.cli adk-status
    ```
+
+   `llm-config` validates the selected provider/auth configuration without a
+   model call. `adk-status` reports only the optional Gemini
+   `google_search` bridge and is not a general provider-readiness check.
 
 6. Start the product terminal:
 
@@ -123,7 +141,7 @@ Gemini API key:
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro-preview"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="api_key"
 GEMINI_API_KEY="<secret>"
 ```
@@ -132,7 +150,7 @@ Gemini on Vertex AI with ADC:
 
 ```bash
 LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro-preview"
+LLM_MODEL="<available-gemini-model>"
 LLM_AUTH_MODE="google_adc"
 GOOGLE_CLOUD_PROJECT="<project-id>"
 GOOGLE_CLOUD_LOCATION="global"
@@ -187,16 +205,30 @@ research is unavailable unless a provider-specific integration is added later.
   samples, fixtures, validation, and smoke tests pass.
 - Do not implement natural-language intent handling with keyword lists, fuzzy
   matching, or regex routing in terminal code.
+- Do not preserve old Agent code merely because it is imported. Before Agent
+  workflow repair, audit legacy custom-Agent code and remove obsolete wizard,
+  fallback, mock-agent, phrase-repair, duplicate-state, and terminal
+  business-routing paths. If useful deterministic behavior exists, migrate that
+  behavior into the correct planner, validator, runner, analyzer, onboarding,
+  knowledge, or optional search-grounding module. Do not keep legacy product logic by
+  "isolating" it.
 
 ## Documents To Read For Deeper Work
 
 - `README.md`: user-facing quick start and full overview.
 - `agent/README.md`: Agent runtime and development contract.
-- `docs/en/adk-agent-architecture.md`: ADK architecture and Agent Loop.
+- `docs/en/adk-agent-architecture.md`: LangGraph Harness architecture, optional
+  ADK search boundary, and Agent Loop.
 - `docs/en/anychain-agent-ai-work-gate.md`: project-specific AI coding gate.
+- `docs/en/agent-cli-verification-guide.md`: Docker/Linux CLI and dual-AI
+  verification procedure.
+- `docs/en/agent-handoff-product-verification.md`: external-AI handoff and
+  product acceptance contract.
 - `docs/zh/adk-agent-architecture.md` and
   `docs/zh/anychain-agent-ai-work-gate.md`: Chinese-directory mirrors for users
   browsing localized docs.
+- `docs/zh/agent-cli-verification-guide.md` and
+  `docs/zh/agent-handoff-product-verification.md`: Chinese verification mirrors.
 - `docs/zh/how-to-add-chain.md`: adding chain and RPC support.
 - `docs/zh/local-closed-loop-testing.md`: fake-node closed-loop testing.
 - `docs/zh/secondary-development-guide.md`: secondary-development handoff.
@@ -223,11 +255,13 @@ research is unavailable unless a provider-specific integration is added later.
 When code changes are made, run:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 
-When model-facing behavior changes and credentials are available, also run the
-live matrices in `tests/agent_live/`.
+When Agent workflow, prompt, or terminal behavior changes, the product
+acceptance gate must include a real CLI Harness with deterministic assertions
+for transcript, workflow state, config, and artifacts. Lower-level PTY/live
+scripts may support that Harness, but they are not sufficient as the final
+product gate.

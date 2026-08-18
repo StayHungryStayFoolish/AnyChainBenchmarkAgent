@@ -130,6 +130,10 @@ TEST_SESSION_ID="session_${SESSION_TIMESTAMP}"
 BOTTLENECK_DETECTED=false
 BOTTLENECK_INFO=""
 OBSERVABILITY_STACK_STARTED=false
+SYNC_OBSERVE_MODE=false
+SYNC_OBSERVE_DURATION=0
+SYNC_OBSERVE_UNTIL_SYNCED=false
+SYNC_OBSERVE_STOP_REQUESTED=false
 
 start_observability_stack() {
     [[ "${OBSERVABILITY_STACK_ENABLED:-false}" == "true" ]] || return 0
@@ -592,7 +596,8 @@ execute_data_analysis() {
         echo "⚠️ Disk analysis script does not exist: tools/disk_analyzer.sh"
     fi
 
-    # Execute all standard analysis scripts
+    # Execute all standard analysis scripts. Sync-observe intentionally skips
+    # RPC/QPS-specific analyzers because no Vegeta workload is generated.
     local analysis_scripts=(
         "analysis/comprehensive_analysis.py"
         "analysis/cpu_disk_correlation_analyzer.py"
@@ -603,6 +608,15 @@ execute_data_analysis() {
     for script in "${analysis_scripts[@]}"; do
         if [[ -f "${SCRIPT_DIR}/$script" ]]; then
             local script_name=$(basename "$script")
+
+            if [[ "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+                case "$script_name" in
+                    "comprehensive_analysis.py"|"qps_analyzer.py"|"rpc_deep_analyzer.py")
+                        echo "⏭️  Skipping $script_name in sync-observe mode (no RPC workload)"
+                        continue
+                        ;;
+                esac
+            fi
 
             # If bottleneck detected, some scripts already handled by specific analysis, skip to avoid duplication
             if [[ "$BOTTLENECK_DETECTED" == "true" ]]; then
@@ -727,12 +741,17 @@ archive_test_results() {
             --quick) benchmark_mode="quick" ;;
             --standard) benchmark_mode="standard" ;;
             --intensive) benchmark_mode="intensive" ;;
+            --sync-observe) benchmark_mode="sync_observe" ;;
         esac
     done
 
     # If no mode parameter found, use default value
     if [[ -z "$benchmark_mode" ]]; then
-        benchmark_mode="quick"  # Default mode, consistent with master_qps_executor.sh
+        if [[ "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+            benchmark_mode="sync_observe"
+        else
+            benchmark_mode="quick"  # Default mode, consistent with master_qps_executor.sh
+        fi
         echo "⚠️ Benchmark mode parameter not detected, using default mode: $benchmark_mode"
     fi
 
@@ -952,13 +971,19 @@ display_final_report_summary() {
 
     echo ""
     echo "🎯 Recommended next steps:"
-    echo "1. Open HTML report to view detailed analysis"
-    echo "2. Check PNG charts to understand performance trends"
-    if [[ "$BOTTLENECK_DETECTED" == "true" ]]; then
+    if [[ "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+        echo "1. Open HTML report to view sync execution analysis"
+        echo "2. Check sync_execution_timeline.png for block, MGas/s, CPU, disk, and network trends"
+        echo "3. For longer sync windows, rerun --sync-observe without --duration and stop when enough data is collected"
+    else
+        echo "1. Open HTML report to view detailed analysis"
+        echo "2. Check PNG charts to understand performance trends"
+        if [[ "$BOTTLENECK_DETECTED" == "true" ]]; then
         echo "3. View bottleneck summary report for optimization recommendations"
         echo "4. Re-test after optimizing system based on recommendations"
-    else
+        else
         echo "3. Consider running intensive test mode to find performance limits"
+        fi
     fi
 }
 
@@ -1006,6 +1031,164 @@ parse_rpc_mode_args() {
                 ;;
         esac
     done
+}
+
+parse_sync_observe_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --sync-observe)
+                SYNC_OBSERVE_MODE=true
+                shift
+                ;;
+            --until-synced)
+                SYNC_OBSERVE_UNTIL_SYNCED=true
+                shift
+                ;;
+            --duration)
+                if [[ -z "${2:-}" || ! "$2" =~ ^[0-9]+$ ]]; then
+                    echo "❌ --duration requires a non-negative integer number of seconds" >&2
+                    exit 1
+                fi
+                SYNC_OBSERVE_DURATION="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+}
+
+sync_observe_request_stop() {
+    SYNC_OBSERVE_STOP_REQUESTED=true
+    echo ""
+    echo "🛑 Stop requested. Finalizing sync observation and generating reports..."
+}
+
+sync_observe_is_synced() {
+    local latest_csv="${PERFORMANCE_LATEST_CSV:-${LOGS_DIR}/performance_latest.csv}"
+    [[ -f "$latest_csv" ]] || return 1
+
+    python3 - "$latest_csv" <<'PY'
+import csv
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+except Exception:
+    raise SystemExit(1)
+
+if not rows:
+    raise SystemExit(1)
+
+row = rows[-1]
+status = str(row.get("sync_status", "")).strip().lower()
+health = str(row.get("local_health", "")).strip().lower()
+gap_text = str(row.get("block_height_diff", "")).strip()
+synced_statuses = {"synced", "in_sync", "healthy", "ok", "true"}
+if status in synced_statuses or health in synced_statuses:
+    raise SystemExit(0)
+try:
+    if gap_text and float(gap_text) <= 0:
+        raise SystemExit(0)
+except ValueError:
+    pass
+raise SystemExit(1)
+PY
+}
+
+wait_for_sync_observe_stop() {
+    local duration="${SYNC_OBSERVE_DURATION:-0}"
+    local until_synced="${SYNC_OBSERVE_UNTIL_SYNCED:-false}"
+    local start_time
+    start_time=$(date +%s)
+
+    SYNC_OBSERVE_STOP_REQUESTED=false
+    trap sync_observe_request_stop INT TERM
+
+    echo "🔭 Sync observation running"
+    if [[ "$duration" -gt 0 ]]; then
+        echo "   Stop condition: duration=${duration}s"
+    elif [[ "$until_synced" == "true" ]]; then
+        echo "   Stop condition: until synced"
+    else
+        echo "   Stop condition: user stop (Ctrl+C)"
+    fi
+
+    while [[ "$SYNC_OBSERVE_STOP_REQUESTED" != "true" ]]; do
+        local now elapsed
+        now=$(date +%s)
+        elapsed=$((now - start_time))
+
+        if [[ "$duration" -gt 0 && "$elapsed" -ge "$duration" ]]; then
+            echo "⏰ Sync observation duration reached (${duration}s)"
+            break
+        fi
+
+        if [[ "$until_synced" == "true" ]] && sync_observe_is_synced; then
+            echo "✅ Sync observation stop condition reached: node appears synced"
+            break
+        fi
+
+        sleep 1
+    done
+
+    trap cleanup_framework EXIT INT TERM
+}
+
+run_sync_observe_mode() {
+    local original_args=("$@")
+
+    export SYNC_OBSERVE_MODE=true
+    export QPS_STATUS_MODE="sync_observe"
+
+    start_observability_stack
+
+    echo "🚀 Starting Blockchain Node Sync Observation"
+    echo "   Test session ID: $TEST_SESSION_ID"
+    echo "   RPC workload: disabled"
+    echo ""
+
+    if ! check_deployment; then
+        exit 1
+    fi
+
+    echo "📋 Phase 1: Start monitoring system"
+    if ! start_monitoring_system; then
+        echo "❌ Monitoring system startup failed"
+        exit 1
+    fi
+
+    echo "📋 Phase 2: Observe sync/runtime state"
+    wait_for_sync_observe_stop
+
+    echo "📋 Phase 3: Stop monitoring system"
+    rm -f "$TMP_DIR/qps_test_status" 2>/dev/null || true
+    sleep 2
+    stop_monitoring_system || true
+
+    echo "📋 Phase 4: Process observation data"
+    process_test_results "${original_args[@]}"
+
+    echo "📋 Phase 5: Execute data analysis"
+    if ! execute_data_analysis "${original_args[@]}"; then
+        echo "⚠️  Standard analysis failed, attempting degraded report..."
+        if ! generate_degraded_report; then
+            echo "❌ Both standard and degraded analysis failed"
+            exit 1
+        fi
+    fi
+
+    echo "📋 Phase 6: Generate final reports"
+    if ! generate_final_reports "${original_args[@]}"; then
+        echo "❌ Report generation failed, sync observation terminated"
+        exit 1
+    fi
+
+    echo ""
+    echo "🎉 Blockchain Node Sync Observation completed!"
 }
 
 # Start local fake-node for end-to-end framework tests (only with --fake-node).
@@ -1147,8 +1330,15 @@ main() {
     # Save original parameters for subsequent passing
     local original_args=("$@")
 
+    parse_sync_observe_args "$@"
+
     # Parse RPC mode parameters
     parse_rpc_mode_args "$@"
+
+    if [[ "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+        run_sync_observe_mode "${original_args[@]}"
+        return $?
+    fi
 
     # Optional fake-node test mode (disabled by default; enabled only with --fake-node).
     # Must run before check_deployment because it points LOCAL_RPC_URL to local fake-node.

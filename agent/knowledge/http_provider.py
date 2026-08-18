@@ -7,7 +7,7 @@ from typing import Any
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from knowledge.base import NoopKnowledgeProvider
+from agent.knowledge.base import NoopKnowledgeProvider
 
 
 class HTTPKnowledgeProvider(NoopKnowledgeProvider):

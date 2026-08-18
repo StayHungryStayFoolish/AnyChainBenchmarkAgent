@@ -16,6 +16,8 @@ def validate_execution_gate(
     blockers = []
     if not plan:
         blockers.append("plan is required")
+    elif real_execution and plan.get("assumed_for_smoke"):
+        blockers.append("assumed smoke-only values cannot be used for real benchmark execution")
     if preflight is None:
         blockers.append("preflight is required")
     elif not preflight.get("passed", False):

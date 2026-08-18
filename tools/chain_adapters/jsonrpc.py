@@ -31,7 +31,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from .base import ChainAdapter, register, _vegeta_post_json, _try_int
+from .base import ChainAdapter, register, _vegeta_post_json, _try_int, load_chain_template
 from .param_spec import apply_rest_param_spec, build_jsonrpc_params, get_param_spec
 from .url_overrides import resolve_param
 
@@ -47,8 +47,7 @@ class JsonRpcAdapter(ChainAdapter):
 
     def _load_chain(self, chain_name: str) -> dict:
         if chain_name not in self._chain_cache:
-            with open(_CHAINS_DIR / f"{chain_name}.json") as f:
-                self._chain_cache[chain_name] = json.load(f)
+            self._chain_cache[chain_name] = load_chain_template(chain_name)
         return self._chain_cache[chain_name]
 
     def build_vegeta_target(

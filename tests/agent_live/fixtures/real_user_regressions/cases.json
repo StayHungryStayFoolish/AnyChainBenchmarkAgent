@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "purpose": "Sanitized behavioral regressions derived from real user CLI failures.",
+  "cases": [
+    {
+      "id": "RR-001",
+      "precondition": "fresh session",
+      "turns": ["Hi", "你好", "你是谁", "你能做什么", "那我们应该从哪里开始"],
+      "expected": "Answer the actual orientation question in the current turn language without mutating workflow state or emitting stale fallback text."
+    },
+    {
+      "id": "RR-002",
+      "precondition": "partial prior session with a blocking configuration question",
+      "turns": ["你是谁啊", "你从哪里来", "你能用来做什么"],
+      "expected": "Treat each turn as a read-only consultation, preserve the exact blocking question, and do not consume the prose as field values."
+    },
+    {
+      "id": "RR-003",
+      "precondition": "opening menu asks for a numbered choice",
+      "turns": ["2", "fake-node 和 real-node 有什么区别", "fake-node 测试", "2"],
+      "expected": "Every visible option has an executable action; consultation preserves the active choice contract and a later number binds to the currently rendered menu."
+    },
+    {
+      "id": "RR-004",
+      "precondition": "fake-node selected and chain question active",
+      "turns": ["sola", "这是另一条真实链", "我不确定协议"],
+      "expected": "Unknown names enter LLM-backed identity resolution and explicit existence/protocol confirmation; they are never silently stored as configured chains."
+    },
+    {
+      "id": "RR-005",
+      "precondition": "solana selected and CLOUD_REGION question active",
+      "turns": ["我需要换成 BNB", "Y", "我需要换成 eth，不使用 fake-node 模式", "Y"],
+      "expected": "Interrupt environment input, confirm chain and mode changes, invalidate incompatible state, then resume at the earliest relevant incomplete group."
+    },
+    {
+      "id": "RR-006",
+      "precondition": "ledger disk configuration is incomplete and the device can be entered directly",
+      "turns": ["vda", "hyperdisk-balanced,", "1", "20000", "1000"],
+      "expected": "Accept an explicit device, resolve disk capacity through either a validated manual value or explicit confirmation of a detected value, normalize surrounding copy punctuation, then collect IOPS and throughput exactly once."
+    },
+    {
+      "id": "RR-007",
+      "precondition": "detected NETWORK_INTERFACE is eth0",
+      "turns": ["Y"],
+      "expected": "Confirm the detected value through the typed option contract; never reject it because a missing default_option side channel disagrees."
+    },
+    {
+      "id": "RR-008",
+      "precondition": "benchmark mode question active",
+      "turns": ["回到上一步", "回到 rpc 配置的位置", "当前模板的默认 workload 是什么？"],
+      "expected": "Backtrack to the prior owned group, answer workload consultation read-only, and retain a usable next action."
+    },
+    {
+      "id": "RR-009",
+      "precondition": "complete prior configuration is resumable",
+      "turns": ["有历史配置么", "如何重新开始呢", "我需要重新测试别的链，可以么"],
+      "expected": "Describe retained state, offer typed continue/modify/reset behavior, and route a new-chain request instead of executing stale preflight."
+    },
+    {
+      "id": "RR-010",
+      "precondition": "Case 2 custom RPC intake with validated endpoint and method",
+      "turns": ["Y", "不再添加 method", "single"],
+      "expected": "Exit method collection, choose workload scope, configure weights when applicable, and materialize only the effective runtime method set."
+    },
+    {
+      "id": "RR-011",
+      "precondition": "custom RPC schema intake active",
+      "turns": [
+        "curl --location 'https://example.invalid' --header 'Content-Type: application/json' --data '{\"method\":\"eth_chainId\",\"params\":[],\"id\":1,\"jsonrpc\":\"2.0\"}'",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}"
+      ],
+      "expected": "Distinguish example URL from selected validation endpoint, extract zero parameters and response schema, then ask for missing evidence or confirmation without looping."
+    },
+    {
+      "id": "RR-012",
+      "precondition": "evidence collection is inactive",
+      "turns": ["这是日志，你可以帮我分析么？", "ERROR connection refused\nretry exhausted\nEND"],
+      "expected": "Ask for or collect one multiline evidence block, analyze it with bounded framework context, and never count ordinary questions or blank prompts as evidence lines."
+    },
+    {
+      "id": "RR-013",
+      "precondition": "fake-node configuration is complete",
+      "turns": ["配置已收集以后会做什么？", "Y", "你执行过测试了么？", "当前是什么状态？"],
+      "expected": "Explain the concrete next stage, execute approved preflight/smoke exactly once, and answer later status questions from job/checkpoint evidence."
+    },
+    {
+      "id": "RR-014",
+      "precondition": "RPC benchmark is partially configured",
+      "turns": ["切换到 sync-observe", "Y", "观察 60 秒", "再切回 real-node", "Y"],
+      "expected": "Retain compatible environment evidence, invalidate workload/QPS/fixture fields in sync-observe, then re-require RPC-only groups when returning."
+    },
+    {
+      "id": "RR-015",
+      "precondition": "no pending question",
+      "turns": ["region 是 us-1，zone 是 us-1-z；用 quick，但我还想换成 BNB，先解释 mixed 是什么"],
+      "expected": "Partition all independent semantic units in order, apply only admitted mutations, answer the consultation, confirm ambiguous changes, and preserve every unresolved unit."
+    }
+  ]
+}

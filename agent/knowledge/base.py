@@ -7,7 +7,7 @@ QA loops without changing the benchmark execution engine.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Protocol
 
 
 class KnowledgeProvider(Protocol):

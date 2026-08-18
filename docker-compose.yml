@@ -10,6 +10,9 @@
 #
 # Optional fake-node service:
 #   FAKE_NODE_CHAIN=solana docker compose --profile fake-node up -d fake-node
+#
+# Optional local EVM developer node for Agent real-node/custom-RPC tests:
+#   tests/agent_live/local_evm_node.sh start
 
 services:
   bench:
@@ -54,3 +57,29 @@ services:
       - "19000:19000"
     init: true
     command: ["bash", "-lc", "go test ./... && go run . -chain \"${FAKE_NODE_CHAIN:-solana}\" -port 19000"]
+
+  geth-dev:
+    image: ethereum/client-go@sha256:746d19134a870e0c83760eee5897696678b0e57c1f73e3392254fcd8426e5782
+    profiles: ["local-evm"]
+    ports:
+      - "18545:8545"
+      - "16060:6060"
+    init: true
+    command:
+      - --dev
+      - --dev.period
+      - "1"
+      - --http
+      - --http.addr
+      - 0.0.0.0
+      - --http.api
+      - eth,net,web3,debug
+      - --http.vhosts
+      - "*"
+      - --metrics
+      - --metrics.addr
+      - 0.0.0.0
+      - --metrics.port
+      - "6060"
+      - --miner.gasprice
+      - "0"

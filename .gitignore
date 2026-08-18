@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv-adk/
+.venv-agent/
 
 # Local agent runtime state
 .agent/

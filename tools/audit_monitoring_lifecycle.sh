@@ -109,7 +109,9 @@ check_monitor_contracts() {
     require_absent_pattern "monitoring/block_height_monitor.sh" 'rm -f "\$MEMORY_SHARE_DIR"/block_height_monitor_cache\.json' "block-height monitor does not hardcode cache cleanup"
 
     require_pattern "tools/disk_bottleneck_detector.sh" 'PERFORMANCE_LATEST_CSV' "disk bottleneck detector reads registered latest performance path"
-    require_pattern "tools/disk_bottleneck_detector.sh" '\[\[ -f "\$TMP_DIR/qps_test_status" \]\] \|\| break' "disk bottleneck detector follows lifecycle marker"
+    require_pattern "tools/disk_bottleneck_detector.sh" 'while \[\[ -f "\$TMP_DIR/qps_test_status" \]\]; do' "disk bottleneck detector polls lifecycle marker without a persistent tail pipeline"
+    require_pattern "monitoring/iostat_collector.sh" '^stop_iostat_collectors\(\)' "iostat collector owns an explicit cleanup operation"
+    require_pattern "monitoring/unified_monitor.sh" 'stop_iostat_collectors' "unified monitor invokes module-owned iostat cleanup"
 
     require_pattern "core/master_qps_executor.sh" 'disk_bottleneck_detector\.sh\.\*-b' "QPS executor checks coordinator disk detector before fallback"
     require_pattern "core/master_qps_executor.sh" 'MONITOR_PIDS_FILE' "QPS executor records fallback monitor PID"

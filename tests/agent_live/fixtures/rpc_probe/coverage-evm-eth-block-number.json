@@ -1,0 +1,24 @@
+{
+  "probe_contract": {
+    "chain": "coverage-evm",
+    "contract_version": 2,
+    "endpoint_hash": "9bed3f8b129166f89e9d9c53c8fcb26e7763c139fbd42dae75a3f40628fee26a",
+    "method_params_hash": "e939eeb8735b14dcbecd7a7f5495cbd1fa91c004ad5cbaa9cc95050048fcf773",
+    "methods": [
+      "eth_blockNumber"
+    ],
+    "transport": "jsonrpc"
+  },
+  "probe_contract_hash": "efbfcf86a99c1ade3aba696cbdce0cf09607f32946c4a45f42c5781c64816388",
+  "checks": [
+    {
+      "http_status": 200,
+      "name": "method_probe:eth_blockNumber",
+      "passed": true,
+      "response_sample": "{\"jsonrpc\":\"2.0\",\"result\":\"0x1\"}",
+      "response_shape_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "ready": true,
+  "status": "ok"
+}

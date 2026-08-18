@@ -28,9 +28,10 @@ Agent 发起压测：
 
 ```text
 用户 prompt
--> ADK root coordinator
--> typed intent path
--> specialized sub-agent
+-> terminal I/O shell
+-> LangGraph Harness typed intent path
+-> group workflow and checkpoint state
+-> 三个限定调用点上的可选 Gemini google_search grounding 函数
 -> deterministic tool and validator gates
 -> benchmark plan
 -> preflight 与风险检查
@@ -77,9 +78,8 @@ agent_config.sh
 - `agent/knowledge/base.py`：provider contract。
 - `agent/knowledge/http_provider.py`：通用 HTTP adapter。
 - `agent/knowledge/loader.py`：provider 选择。
-- `agent/adk_app/instructions.py`：ADK 如何使用 KB evidence，并避免声明未验证能力。
-- `agent/adk_app/tools/read_only.py`：暴露 KB search 和本地 capability evidence 的 ADK read-only tools。
-- `agent/cli.py`：smoke 命令和集成入口。
+- `agent/tools/executor.py`：暴露 `knowledge_search` 工具，查询配置的 KB provider 和本地 capability evidence。
+- `agent.cli`（实现在 `agent/cli.py`）：smoke 命令和集成入口；使用 `python3 -m agent.cli` 调用。
 
 基本原则：
 
@@ -99,7 +99,7 @@ POST /workload/suggest
 验证：
 
 ```bash
-python3 agent/cli.py knowledge-smoke
+python3 -m agent.cli knowledge-smoke
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -116,22 +116,26 @@ PR 要求：
 
 开发位置：
 
-- `agent/cli.py`：JSON CLI 入口。
+- `agent.cli`（实现在 `agent/cli.py`）：JSON CLI 入口；使用 `python3 -m agent.cli` 调用。
 - `agent/tools/schema.py`：OpenAI-compatible tool catalog。
 - `agent/tools/executor.py`：稳定的 named tool execution。
 - `config/agent_config.sh`：LLM、Google auth 和可选 KB 默认配置。
 - `agent/runners/job_manager.py`：job status、artifact index 和 detached run 生命周期。
-- `agent/adk_app/instructions.py`：ADK root instruction。
-- `agent/adk_app/tools/`：ADK function-tool wrappers。
-- `agent/adk_app/evals/`：无 key ADK package 和 tool-contract checks。
+- `agent/llm/search_grounding.py`：唯一使用 `google-adk` 的模块（可选的 Gemini
+  `google_search` 联网检索）；其余 ADK tool wrapper 均已退役。
+
+平台 core integration 使用 `requirements-adk.txt` 中的 LangGraph runtime；该文件名
+只是兼容 alias，默认不会安装 Google ADK。只有平台明确需要 Gemini search grounding
+时，才给 `scripts/install_agent_deps.sh` 增加 `--with-google-search`。DeepSeek、OpenAI
+和 Claude integration 不得导入或依赖 `google.adk`。
 
 支持的集成模式：
 
 - 人类终端：`./bin/anychain-agent`
-- JSON CLI：`python3 agent/cli.py <command>`
-- Tool schema 导出：`python3 agent/cli.py tool-schema`
+- JSON CLI：`python3 -m agent.cli <command>`
+- Tool schema 导出：`python3 -m agent.cli tool-schema`
 - Named tool call：
-  `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+  `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`
 
 常用平台工具：
 
@@ -161,9 +165,9 @@ PR 要求：
 验证：
 
 ```bash
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py tool-call --name discover_environment
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli tool-call --name discover_environment
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -220,7 +224,7 @@ python3 tools/fake-node/runtime_probe_block_height.py --chain <chain>
 ./bin/anychain-agent
 ```
 
-然后让 Agent 为该链创建 fake-node smoke benchmark，执行 preflight，运行 mock job，并分析生成的 archive。
+然后让 Agent 为该链创建 fake-node smoke benchmark，执行 preflight，运行隔离的 fake-node smoke job，并分析生成的 archive。
 
 PR 要求：
 
@@ -239,7 +243,7 @@ PR 要求：
 - `tools/chain_adapters/base.py`
 - `tools/fake-node/handlers/<family>.go`
 - `tools/fake-node/configs/<family>.yaml`
-- 如果 handler registry 需要新增入口，修改 `tools/fake-node/main.go`
+- 如果 handler registry 需要新增入口，修改 `tools/fake-node/fake_node.go`
 - `config/chains/<chain>.json`
 - `docs/en/how-to-add-chain.md`
 - `docs/zh/how-to-add-chain.md`
@@ -284,6 +288,17 @@ RPC method 支持不只是增加一个 method name。框架需要 request constr
 - `docs/audit/rpc-fixtures/`
 
 简单 method 使用 `param_formats`。如果需要 positional params、object params、REST path params、query params 或 request body，使用 `param_spec`。
+
+不能只根据 JSON 语法推断参数语义。零参数 method 必须保留明确的空 params；
+positional/object method 必须保留 list 顺序或 object key，并逐个确认 index/name、
+JSON wire type、区块链 semantic type 或 encoding、meaning、required/optional 和
+example。进入 catalog 前，必须使用确认后的 wire request probe 可访问的 validation
+endpoint。
+
+runtime workload scope 只作用于 job-local override：`single_replace` 选择一个已验证
+method，`mixed_replace` 删除模板 defaults，`mixed_add` 保留 defaults。所有 active
+mixed weight 都必须是正整数且总和严格为 100。这些选择都不得修改
+`config/chains/<chain>.json`。
 
 三参数 method 示例：
 
@@ -338,7 +353,7 @@ python3 tools/fake-node/runtime_probe.py --chain <chain>
 规则：
 
 - `mixed_weighted` 是 mixed 模式按权重生成请求的来源。
-- 权重建议总和为 100，便于审计。
+- 所有启用权重必须是正整数，并且总和必须严格等于 100。
 - sync-health RPC method 不应该计入 workload method。
 - per-method 报告图表只描述压测 workload traffic。
 

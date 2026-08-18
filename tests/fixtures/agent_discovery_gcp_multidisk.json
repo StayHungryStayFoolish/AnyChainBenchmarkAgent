@@ -1,0 +1,123 @@
+{
+  "source": "agent.discovery.fixture",
+  "mode": "read_only_fixture",
+  "host": {
+    "os": "linux",
+    "platform": "Linux-6.8.0-anychain-x86_64-with-glibc2.39",
+    "kernel": "6.8.0-anychain",
+    "machine": "x86_64",
+    "cpu_count": 24,
+    "memory_gib": 98.0
+  },
+  "deployment": {
+    "type": "vm",
+    "container": {
+      "detected": false,
+      "cgroup_hint": ""
+    },
+    "kubernetes": {
+      "detected": false,
+      "namespace": "",
+      "service_host": "",
+      "service_account_token": false
+    }
+  },
+  "cloud": {
+    "provider": "gcp",
+    "platform": "gce",
+    "variant": "gvnic",
+    "region": "global",
+    "zone": "asia-east1-c",
+    "machine_type": "c3-standard-22",
+    "confidence": 0.95
+  },
+  "network": {
+    "default_interface": "ens4",
+    "driver": "gve"
+  },
+  "disks": {
+    "candidates": [
+      {
+        "name": "sda",
+        "type": "disk",
+        "size": "200G",
+        "mountpoint": "",
+        "fstype": "",
+        "label": ""
+      },
+      {
+        "name": "sda1",
+        "type": "part",
+        "size": "512M",
+        "mountpoint": "/boot/efi",
+        "fstype": "vfat",
+        "label": "EFI"
+      },
+      {
+        "name": "sda2",
+        "type": "part",
+        "size": "3.7G",
+        "mountpoint": "/boot",
+        "fstype": "ext4",
+        "label": "BOOT"
+      },
+      {
+        "name": "sda3",
+        "type": "part",
+        "size": "195.8G",
+        "mountpoint": "",
+        "fstype": "lvm2_member",
+        "label": ""
+      },
+      {
+        "name": "sdb",
+        "type": "disk",
+        "size": "2T",
+        "mountpoint": "/mnt/ledger",
+        "fstype": "ext4",
+        "label": "ledger-data"
+      },
+      {
+        "name": "sdc",
+        "type": "disk",
+        "size": "1T",
+        "mountpoint": "/mnt/accounts",
+        "fstype": "xfs",
+        "label": "accounts-state"
+      }
+    ],
+    "proposed_ledger_device": "",
+    "proposed_accounts_device": "sdc",
+    "confidence": 0.3,
+    "ambiguous_candidates": [
+      "sda",
+      "sda3",
+      "sdb",
+      "sdc"
+    ]
+  },
+  "dependencies": {
+    "mode": "audit",
+    "tools": {
+      "bash": {"available": true, "path": "/usr/bin/bash"},
+      "python3": {"available": true, "path": "/usr/bin/python3"},
+      "jq": {"available": true, "path": "/usr/bin/jq"},
+      "curl": {"available": true, "path": "/usr/bin/curl"},
+      "vegeta": {"available": true, "path": "/usr/local/bin/vegeta"},
+      "docker": {"available": true, "path": "/usr/bin/docker"},
+      "kubectl": {"available": false, "path": ""},
+      "go": {"available": true, "path": "/usr/local/go/bin/go"},
+      "iostat": {"available": true, "path": "/usr/bin/iostat"},
+      "ethtool": {"available": true, "path": "/usr/sbin/ethtool"},
+      "ip": {"available": true, "path": "/usr/sbin/ip"},
+      "lsblk": {"available": true, "path": "/usr/bin/lsblk"}
+    },
+    "missing_required": [],
+    "missing_optional": [
+      "kubectl"
+    ]
+  },
+  "warnings": [
+    "Multiple plausible data disks were found; confirm ledger/accounts devices."
+  ]
+}

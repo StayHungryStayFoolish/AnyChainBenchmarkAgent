@@ -303,44 +303,49 @@ start_csv_monitoring() {
     
     # Select monitoring mode based on duration
     if [[ "$duration" -eq 0 ]]; then
-        # Framework lifecycle mode: don't use timeout
+        # Poll complete CSV ranges so removing the lifecycle marker wakes the
+        # loop even when no new sample arrives. A persistent tail pipeline can
+        # otherwise outlive the benchmark and retain the runner's descriptors.
         log_info "📊 Using framework lifecycle control mode"
-        tail -F "$csv_file" 2>/dev/null | while IFS= read -r line; do
-            # Check framework status
-            [[ -f "$TMP_DIR/qps_test_status" ]] || break
-            
-            # Skip header and empty lines
-            [[ "$line" =~ ^timestamp ]] && continue
-            [[ -z "$line" ]] && continue
-            
-            # Detect file rotation: if timestamp format is abnormal, reinitialize field mapping
-            local timestamp=$(echo "$line" | cut -d',' -f1)
-            if [[ ! "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
-                log_warn "⚠️  Detected CSV format change, reinitializing field mapping"
+        local next_line=2
+        while [[ -f "$TMP_DIR/qps_test_status" ]]; do
+            local total_lines=0
+            total_lines=$(wc -l < "$csv_file" 2>/dev/null || echo 0)
+            if (( total_lines < next_line - 1 )); then
+                log_warn "⚠️  Detected CSV rotation, reinitializing field mapping"
                 init_csv_field_mapping "$csv_file"
-                continue
+                next_line=2
             fi
-            
-            # Monitor each configured device
-            for device in "$LEDGER_DEVICE" "$ACCOUNTS_DEVICE"; do
-                [[ -z "$device" ]] && continue
-                
-                # Extract Disk data from CSV
-                local metrics=$(get_disk_data_from_csv "$device" "$line")
-                
-                if [[ -n "$metrics" && "$metrics" != "0,0,0,0,0,0,0" ]]; then
-                    IFS=',' read -r util total_iops std_iops std_throughput r_await w_await _ <<< "$metrics"
-                    
-                    # Calculate average latency
-                    local avg_latency=$(awk "BEGIN {printf "%.2f", ($r_await + $w_await) / 2}" 2>/dev/null || echo "0")
-                    
-                    # Perform bottleneck detection (using provider-standardized parameters)
-                    detect_disk_bottleneck "$device" "$total_iops" "$std_iops" "$std_throughput" "$avg_latency" "$timestamp"
-                    
-                    local bottleneck_detected=$?
-                    log_info "$timestamp,$device,$total_iops,$std_throughput,$avg_latency,$bottleneck_detected"
-                fi
-            done
+            if (( total_lines >= next_line )); then
+                while IFS= read -r line; do
+                    [[ "$line" =~ ^timestamp ]] && continue
+                    [[ -z "$line" ]] && continue
+
+                    local timestamp
+                    timestamp=$(echo "$line" | cut -d',' -f1)
+                    if [[ ! "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+                        log_warn "⚠️  Detected CSV format change, reinitializing field mapping"
+                        init_csv_field_mapping "$csv_file"
+                        continue
+                    fi
+
+                    for device in "$LEDGER_DEVICE" "$ACCOUNTS_DEVICE"; do
+                        [[ -z "$device" ]] && continue
+                        local metrics
+                        metrics=$(get_disk_data_from_csv "$device" "$line")
+                        if [[ -n "$metrics" && "$metrics" != "0,0,0,0,0,0,0" ]]; then
+                            IFS=',' read -r util total_iops std_iops std_throughput r_await w_await _ <<< "$metrics"
+                            local avg_latency
+                            avg_latency=$(awk "BEGIN {printf \"%.2f\", ($r_await + $w_await) / 2}" 2>/dev/null || echo "0")
+                            detect_disk_bottleneck "$device" "$total_iops" "$std_iops" "$std_throughput" "$avg_latency" "$timestamp"
+                            local bottleneck_detected=$?
+                            log_info "$timestamp,$device,$total_iops,$std_throughput,$avg_latency,$bottleneck_detected"
+                        fi
+                    done
+                done < <(sed -n "${next_line},${total_lines}p" "$csv_file")
+                next_line=$((total_lines + 1))
+            fi
+            sleep 1
         done
     else
         # Fixed duration mode: keep original timeout logic

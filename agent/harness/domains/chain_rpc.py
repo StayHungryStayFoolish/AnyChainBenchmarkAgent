@@ -1,0 +1,1266 @@
+"""Chain identity, endpoint, workload, and Case 1/2/3 domain behavior."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import replace
+from functools import partial
+from typing import Any, Mapping
+
+from ..contracts import ActionProposal, HandlerResult
+from ..input_values import (
+    extract_rpc_params_or_request,
+    extract_url_candidate,
+    normalize_scalar,
+    normalize_target_mode,
+)
+from ..advisory import extract_chain_mention
+from ..questions import (
+    choice_question as _choice_question,
+    manual_question as _manual_question,
+    question_text,
+)
+from ..routing import chain_auxiliary_fields_needed, chain_identity_confirmed
+from ..state import AgentGraphState
+from ..transitions import (
+    clear_effective_custom_rpc_workload,
+    invalidate_for_chain_change,
+    invalidate_for_rpc_mode_change,
+    invalidate_for_target_mode,
+    mark_group_reconfigured,
+    record_group_invalidations,
+)
+
+from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
+from agent.onboarding.families import SUPPORTED_FAMILIES
+from agent.validators.rpc_workload import default_workload
+from agent.validators.endpoint_probe import health_probe_methods, validate_rpc_endpoint
+from .rpc_catalog import catalog_method_names, draft_view
+
+choice_question = partial(_choice_question, owner="chain_rpc")
+manual_question = partial(_manual_question, owner="chain_rpc")
+CHAIN_RPC_GROUPS = {
+    "target_mode",
+    "chain_identity",
+    "endpoint_process",
+    "chain_auxiliary_endpoints",
+    "workload_rpc",
+    "target_samples_fixtures",
+}
+CHAIN_RPC_ACTIONS = frozenset(
+    {
+        "choose_target_mode",
+        "choose_chain",
+        "choose_adapter_family",
+        "set_rpc_mode",
+        "rpc_catalog_command",
+        "secondary_handoff_command",
+        "rpc_workload_command",
+        "use_default_workload",
+        "configure_workload_weights",
+        "request_target_change",
+        "request_chain_selection",
+        "request_target_mode_selection",
+        "cancel_target_change",
+        "apply_reviewed_chain_rpc_config",
+    }
+)
+SUPPORTED_ADAPTER_FAMILIES = frozenset(SUPPORTED_FAMILIES)
+
+__all__ = [
+    "CHAIN_RPC_ACTIONS",
+    "CHAIN_RPC_GROUPS",
+    "apply_chain_rpc_action",
+    "apply_chain_rpc_answer",
+    "cancel_chain_rpc_question",
+    "question_for_chain_rpc",
+    "SUPPORTED_ADAPTER_FAMILIES",
+]
+
+
+def _workload_default_question_text(state: AgentGraphState):
+    chain = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
+    rpc_mode = normalize_scalar(state.get("rpc_mode"))
+    defaults = default_workload(chain) if chain else {}
+    single = normalize_scalar(defaults.get("single")) or "<none>"
+    mixed = ", ".join(
+        f"{row.get('method')}={row.get('weight')}"
+        for row in defaults.get("mixed_weighted") or []
+        if isinstance(row, dict) and row.get("method")
+    ) or "<none>"
+    return question_text(
+        "question.chain_rpc.workload_defaults.prompt",
+        chain=chain or "<none>",
+        rpc_mode=rpc_mode or "<none>",
+        single=single,
+        mixed=mixed,
+    )
+
+
+from .chain_handoff import (_prepare_case2_handoff, _prepare_case3_handoff, _promote_case2_endpoint, _record_case3_evidence)
+from .chain_identity import (_apply_chain_candidate, _apply_chain_change_decision, _apply_unknown_chain_decision, _chain_ambiguity_question, _confirm_custom_rpc_family, _enter_case_for_adapter_family, _identity_confirmation_question, _origin_text, _preserve_same_chain, _request_chain_change, _request_target_mode_change, _resolution_from_arguments, _target_mode_is_explicit)
+from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _chain_selection_question, _choice, _endpoint_probe_completion, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
+from .chain_rpc_support import (_adapter_family, _answer_result, _chain_confirmed, _handoff_stops, _invalidate_execution, _next_group, _result, is_existing_family_lifecycle)
+from .rpc_endpoint import (
+    _apply_endpoint_answer,
+    _apply_method_answer,
+    _apply_schema_evidence,
+    _confirm_method_probe,
+    _confirm_parameter_contract,
+    _confirm_probe_response,
+    _confirm_request_contract,
+    _resolve_method_conflict,
+)
+from .rpc_workload import (_apply_continue, _apply_requested_workload, _apply_scope, _apply_weights, _set_single_workload)
+from .rpc_catalog import strict_method_identity
+from .rpc_receipts import emit_endpoint_role_receipt
+from .response_fragments import ResponseCollector, emit, failure
+
+def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any] | None:
+    """Return the next blocking question owned by a Chain/RPC group."""
+
+    if group not in CHAIN_RPC_GROUPS:
+        return None
+    confirmed = state.get("confirmed_config") or {}
+    identity = state.get("chain_identity") or {}
+    if group == "target_mode":
+        return _target_mode_selection_question(state, include_current=not bool(state.get("target_mode")))
+    if group == "chain_identity":
+        identity_question = _identity_confirmation_question(state)
+        if identity_question:
+            return identity_question
+        if identity.get("status") in {"needs_protocol_confirmation", "needs_adapter_family_confirmation"}:
+            return _adapter_family_question(state)
+        if identity.get("status") in {
+            "unsupported_family_handoff",
+            "case3_collecting_evidence",
+            "case3_needs_evidence",
+        }:
+            return _case3_evidence_question(state)
+        if identity.get("canonical") and identity.get("status") == "confirmed":
+            return None
+        return _chain_question(state)
+    if group == "endpoint_process":
+        validation = _endpoint_validation_question(state)
+        if validation:
+            return validation
+        evidence = state.get("endpoint_evidence") or {}
+        sync = state.get("sync_observe") or {}
+        if state.get("target_mode") == "real-node" and not evidence.get("local_rpc_url_ready"):
+            return manual_question(
+                group,
+                "LOCAL_RPC_URL",
+                question_text("question.chain_rpc.local_rpc_url.prompt"),
+                field="LOCAL_RPC_URL",
+                kind="url",
+                evidence_path="endpoint_evidence.local_rpc_url_ready",
+                rejection_evidence_value=False,
+                completion_effect=_endpoint_probe_completion(),
+                domain_context={
+                    "contract_type": "rpc_endpoint",
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+            )
+        if state.get("target_mode") == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
+            return manual_question(
+                group,
+                "BLOCKCHAIN_PROCESS_NAMES",
+                question_text("question.chain_rpc.real_node_process.prompt"),
+                field="BLOCKCHAIN_PROCESS_NAMES",
+                validation={"value_type": "bounded_text", "max_length": 512},
+                evidence_path="confirmed_config.BLOCKCHAIN_PROCESS_NAMES",
+            )
+        if state.get("target_mode") == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
+            return _mainnet_review_question(state, sync_observe=False)
+        if (
+            state.get("workflow_mode") == "sync_observe"
+            and sync.get("source") in {"existing_local_node", "endpoint_only"}
+            and not evidence.get("sync_rpc_url_ready")
+        ):
+            return manual_question(
+                group,
+                "SYNC_OBSERVE_RPC_URL",
+                question_text("question.chain_rpc.sync_observe_rpc_url.prompt"),
+                field="SYNC_OBSERVE_RPC_URL",
+                kind="url",
+                evidence_path="endpoint_evidence.sync_rpc_url_ready",
+                rejection_evidence_value=False,
+                completion_effect=_endpoint_probe_completion(),
+                domain_context={
+                    "contract_type": "rpc_endpoint",
+                    "endpoint_role": "sync_observe",
+                    "rpc_case": "runtime",
+                    "config_field": "SYNC_OBSERVE_RPC_URL",
+                },
+            )
+        if (
+            state.get("workflow_mode") == "sync_observe"
+            and sync.get("source") == "existing_local_node"
+            and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES")
+        ):
+            return manual_question(
+                group,
+                "BLOCKCHAIN_PROCESS_NAMES",
+                question_text("question.chain_rpc.sync_observe_process.prompt"),
+                field="BLOCKCHAIN_PROCESS_NAMES",
+                validation={"value_type": "bounded_text", "max_length": 512},
+                evidence_path="confirmed_config.BLOCKCHAIN_PROCESS_NAMES",
+            )
+        if (
+            state.get("workflow_mode") == "sync_observe"
+            and sync.get("source") in {"existing_local_node", "endpoint_only"}
+            and not confirmed.get("MAINNET_RPC_URL_REVIEWED")
+        ):
+            return _mainnet_review_question(state, sync_observe=True)
+        return None
+    if group == "chain_auxiliary_endpoints":
+        chain = normalize_scalar(identity.get("canonical"))
+        for field in chain_auxiliary_fields_needed(chain):
+            if not confirmed.get(field):
+                return choice_question(
+                    group,
+                    field,
+                    question_text(
+                        "question.chain_rpc.auxiliary_endpoint.prompt",
+                        chain=chain,
+                        field=field,
+                    ),
+                    field=field,
+                    kind="manual_value",
+                    manual_input_allowed=True,
+                    options=[{
+                        "id": "skip",
+                        "label": question_text("question.chain_rpc.option.skip_unconfigured"),
+                        "value": "none",
+                        "expected_patch": {f"confirmed_config.{field}": "none"},
+                    }],
+                )
+        return None
+    if group == "workload_rpc":
+        if not chain_identity_confirmed(state):
+            return None
+        if not state.get("rpc_mode"):
+            return _choice(
+                group,
+                "rpc_mode",
+                question_text("question.chain_rpc.rpc_mode.prompt"),
+                "rpc_mode",
+                [
+                    _action_option("single", question_text("question.chain_rpc.option.rpc_mode", mode="single"), "single", "set_rpc_mode", {"rpc_mode": "single"}, rpc_mode="single", mutation_explicit=True),
+                    _action_option("mixed", question_text("question.chain_rpc.option.rpc_mode", mode="mixed"), "mixed", "set_rpc_mode", {"rpc_mode": "mixed"}, rpc_mode="mixed", mutation_explicit=True),
+                ],
+                queue_barrier=True,
+            )
+        if not (state.get("workload") or {}).get("confirmed"):
+            options = [
+                _action_option(
+                    "default",
+                    question_text("question.chain_rpc.option.use_defaults"),
+                    "default",
+                    "use_default_workload",
+                    {"workload.confirmed": True},
+                ),
+                _action_option(
+                    "custom_rpc",
+                    question_text("question.chain_rpc.option.add_custom_rpc"),
+                    "custom_rpc",
+                    "rpc_catalog_command",
+                    {"custom_rpc.status": "needs_endpoint"},
+                    catalog_command="enter",
+                ),
+            ]
+            if state.get("rpc_mode") == "mixed":
+                options.append(
+                    _action_option(
+                        "weights",
+                        question_text("question.chain_rpc.option.adjust_mixed_weights"),
+                        "weights",
+                        "configure_workload_weights",
+                        {"custom_rpc.status": "needs_weights"},
+                    )
+                )
+            options.append(
+                _action_option(
+                    "change_target",
+                    question_text("question.chain_rpc.option.change_chain_or_target"),
+                    "change_target",
+                    "request_target_change",
+                    {"pending_question.id": "target_change_scope"},
+                )
+            )
+            return _choice(
+                group,
+                "workload_confirm",
+                _workload_default_question_text(state),
+                "workload_choice",
+                options,
+                queue_barrier=True,
+            )
+        return None
+    if (
+        group == "target_samples_fixtures"
+        and state.get("target_mode") == "fake-node"
+        and identity.get("status") == "existing_family_runtime_choice"
+    ):
+        return _choice(
+            group,
+            "new_chain_runtime_choice",
+            question_text("question.chain_rpc.new_chain_runtime_choice.prompt"),
+            "new_chain_runtime_choice",
+            [
+                _answer_option(
+                    "real_node",
+                    question_text("question.chain_rpc.option.use_verified_real_node"),
+                    "use_verified_endpoint_real_node",
+                    {"target_mode": "real-node", "chain_identity.status": "confirmed"},
+                ),
+                _answer_option(
+                    "handoff",
+                    question_text("question.chain_rpc.option.generate_chain_fixture_handoff"),
+                    "generate_handoff",
+                    {"chain_identity.status": "needs_review_handoff", "secondary_handoff.status": "ready"},
+                    return_policy="stop_after_response",
+                ),
+            ],
+            rpc_case="new_chain",
+        )
+    if group == "target_samples_fixtures" and (state.get("fixture_evidence") or {}).get("status") == "missing":
+        missing = [str(item.get("method") or "") for item in (state.get("fixture_evidence") or {}).get("missing", [])]
+        return _choice(
+            group,
+            "custom_rpc_fixture_choice",
+            question_text(
+                "question.chain_rpc.custom_fixture_missing.prompt",
+                methods=", ".join(filter(None, missing)) or "<unknown>",
+            ),
+            "custom_rpc_fixture_choice",
+            [
+                _answer_option("defaults", question_text("question.chain_rpc.option.use_template_defaults"), "use_template_defaults", {"workload.choice": "default"}),
+                _answer_option("real_node", question_text("question.chain_rpc.option.switch_real_node_validate_url"), "switch_real_node", {"target_mode": "real-node"}),
+                _answer_option("handoff", question_text("question.chain_rpc.option.generate_fixture_handoff"), "generate_fixture_handoff", {"secondary_handoff.status": "ready"}, return_policy="stop_after_response"),
+            ],
+            queue_barrier=True,
+            rpc_case="custom_rpc",
+        )
+    return None
+
+
+def _candidate_identity_from_action(
+    state: AgentGraphState,
+    raw: str,
+    arguments: Mapping[str, Any],
+) -> str:
+    """Separate a chain identity from a planner-supplied evidence sentence."""
+
+    if arguments.get("chain_candidates"):
+        return raw
+    evidence = normalize_scalar(arguments.get("source_evidence"))
+    origin = normalize_scalar(_origin_text(state, arguments))
+    if not origin or normalize_scalar(raw) != origin:
+        return raw
+    extraction_text = evidence if evidence and evidence.casefold() in origin.casefold() else origin
+    mention = extract_chain_mention(state, extraction_text)
+    if mention.get("found") is not True:
+        return raw
+    if normalize_scalar(mention.get("confidence")).casefold() not in {"medium", "high"}:
+        return raw
+    candidate = normalize_scalar(mention.get("chain_text"))
+    if not candidate or candidate.casefold() not in origin.casefold():
+        return raw
+    return candidate
+
+
+def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
+    """Validate and apply one registered Chain/RPC action."""
+
+    if action.action_type not in CHAIN_RPC_ACTIONS:
+        return HandlerResult(
+            blocker=failure(
+                "chain_rpc.failure.unsupported_action",
+                arguments={"action_type": action.action_type},
+                source=__name__,
+            )
+        )
+    if action.action_type == "apply_reviewed_chain_rpc_config":
+        from .environment import apply_reviewed_owned_config_values
+
+        return apply_reviewed_owned_config_values(
+            state,
+            action,
+            owner="chain_rpc",
+        )
+    responses: ResponseCollector = []
+    next_state = deepcopy(state)
+    arguments = dict(action.arguments)
+    action_type = action.action_type
+    if action_type == "choose_target_mode":
+        mode = normalize_target_mode(arguments.get("target_mode"))
+        if not mode:
+            return HandlerResult(
+                blocker=failure(
+                    "chain_rpc.failure.invalid_target_mode",
+                    source=__name__,
+                )
+            )
+        if not next_state.get("target_mode") and not _target_mode_is_explicit(next_state, mode, arguments):
+            next_state.setdefault("action_errors", []).append(
+                {
+                    "action": {
+                        "type": action_type,
+                        **deepcopy(arguments),
+                    },
+                    "error": "target_mode_not_explicit",
+                }
+            )
+            return _result(state, next_state, action, completion="unchanged", response_fragments=tuple(responses))
+        previous = normalize_target_mode(next_state.get("target_mode"))
+        if previous and previous != mode:
+            _request_target_mode_change(next_state, mode)
+            return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+        if previous == mode:
+            next_state["workflow_mode"] = "sync_observe" if mode == "sync-observe" else "rpc_benchmark"
+            return _result(state, next_state, action, completion="unchanged", response_fragments=tuple(responses))
+        next_state["target_mode"] = mode
+        next_state["workflow_mode"] = "sync_observe" if mode == "sync-observe" else "rpc_benchmark"
+        invalidate_for_target_mode(next_state, previous_mode=previous)
+        next_state['active_group'] = "chain_identity" if not _chain_confirmed(next_state) else _next_group(next_state)
+        next_state['pending_question'] = {}
+        mark_group_reconfigured(next_state, "target_mode")
+        return _result(state, next_state, action, response_fragments=tuple(responses))
+    if action_type == "choose_chain":
+        raw = normalize_scalar(arguments.get("chain_text"))
+        candidate_values = [
+            normalize_scalar(item)
+            for item in arguments.get("chain_candidates") or ()
+            if normalize_scalar(item)
+        ]
+        candidate_mode = normalize_target_mode(arguments.get("target_mode"))
+        if candidate_mode and _target_mode_is_explicit(next_state, candidate_mode, arguments) and not next_state.get("target_mode"):
+            next_state["target_mode"] = candidate_mode
+            next_state["workflow_mode"] = "sync_observe" if candidate_mode == "sync-observe" else "rpc_benchmark"
+            invalidate_for_target_mode(next_state)
+        if not raw and candidate_mode:
+            mention = extract_chain_mention(next_state, _origin_text(next_state, arguments))
+            if bool(mention.get("found")) and normalize_scalar(mention.get("confidence")).casefold() in {"medium", "high"}:
+                raw = normalize_scalar(mention.get("chain_text"))
+        if not raw and len(candidate_values) == 1:
+            raw = candidate_values[0]
+        ambiguity = _chain_ambiguity_question(next_state, raw, arguments)
+        if ambiguity:
+            next_state['active_group'] = "chain_identity"
+            next_state['pending_question'] = ambiguity
+            return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+        if not raw:
+            next_state['active_group'] = "chain_identity"
+            next_state['pending_question'] = _chain_question(next_state)
+            return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+        raw = _candidate_identity_from_action(next_state, raw, arguments)
+        current = canonicalize_chain_scalar(
+            normalize_scalar((next_state.get("chain_identity") or {}).get("canonical")),
+            known_chains=set(repo_chain_names()),
+        )
+        canonical = canonicalize_chain_scalar(raw, known_chains=set(repo_chain_names()))
+        if current and canonical == current:
+            _preserve_same_chain(next_state, current, responses=responses)
+            return _result(state, next_state, action, completion="unchanged", response_fragments=tuple(responses))
+        resolution = _resolution_from_arguments(arguments)
+        if current:
+            _request_chain_change(next_state, raw, arguments, resolution=resolution, responses=responses)
+            return _result(state, next_state, action, completion="blocked" if next_state.get("pending_question") else "completed", response_fragments=tuple(responses))
+        _apply_chain_candidate(next_state, raw, resolution=resolution, responses=responses)
+        return _result(
+            state,
+            next_state,
+            action,
+            completion="blocked" if next_state.get("pending_question") else "completed",
+            stop=_handoff_stops(next_state),
+            response_fragments=tuple(responses),
+        )
+    if action_type == "set_rpc_mode":
+        if not chain_identity_confirmed(next_state):
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "set_rpc_mode_without_confirmed_chain"}, source=__name__))
+        mode = normalize_scalar(arguments.get("rpc_mode")).casefold()
+        if mode not in {"single", "mixed"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "invalid_rpc_mode"}, source=__name__))
+        if next_state.get("rpc_mode") != mode:
+            invalidate_for_rpc_mode_change(next_state)
+        next_state["rpc_mode"] = mode
+        next_state['active_group'] = "workload_rpc"
+        next_state['pending_question'] = question_for_chain_rpc(next_state, "workload_rpc") or {}
+        return _result(state, next_state, action, completion="blocked" if next_state.get("pending_question") else "completed", response_fragments=tuple(responses))
+    if action_type == "use_default_workload":
+        chain = normalize_scalar((next_state.get("chain_identity") or {}).get("canonical"))
+        rpc_mode = normalize_scalar(next_state.get("rpc_mode"))
+        if not chain_identity_confirmed(next_state) or not chain or rpc_mode not in {"single", "mixed"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "use_default_workload"}, source=__name__))
+        defaults = default_workload(chain)
+        if not defaults.get("exists"):
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_default_workload", arguments={"chain": chain}, source=__name__))
+        if rpc_mode == "single":
+            methods = [normalize_scalar(defaults.get("single"))]
+            methods = [method for method in methods if method]
+            weights: dict[str, int] = {}
+        else:
+            rows = [row for row in defaults.get("mixed_weighted") or [] if isinstance(row, dict)]
+            methods = [normalize_scalar(row.get("method")) for row in rows if normalize_scalar(row.get("method"))]
+            weights = {normalize_scalar(row.get("method")): int(row.get("weight") or 0) for row in rows if normalize_scalar(row.get("method"))}
+            if not methods or sum(weights.values()) != 100 or set(methods) != set(weights):
+                return HandlerResult(blocker=failure("chain_rpc.failure.invalid_default_workload", arguments={"chain": chain}, source=__name__))
+        next_state["workload"] = {
+            "confirmed": True,
+            "choice": "default",
+            "methods": methods,
+            "weights": weights,
+            "replace_defaults": False,
+            "job_local_override": False,
+        }
+        clear_effective_custom_rpc_workload(next_state)
+        next_state["fixture_evidence"] = {}
+        _invalidate_execution(next_state)
+        next_state['active_group'] = "workload_rpc"
+        next_state['pending_question'] = {}
+        mark_group_reconfigured(next_state, "workload_rpc")
+        return _result(state, next_state, action, response_fragments=tuple(responses))
+    if action_type == "configure_workload_weights":
+        if not chain_identity_confirmed(next_state):
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "configure_weights_without_confirmed_chain"}, source=__name__))
+        if next_state.get("rpc_mode") != "mixed":
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "configure_weights_outside_mixed_mode"}, source=__name__))
+        next_state.setdefault("custom_rpc", {})["status"] = "needs_weights"
+        next_state["custom_rpc"]["job_local_override"] = True
+        next_state.setdefault("workload", {})["choice"] = "weights"
+        _invalidate_execution(next_state)
+        next_state['active_group'] = "endpoint_process"
+        next_state['pending_question'] = {}
+        return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))
+    if action_type == "request_target_change":
+        next_state['active_group'] = "workload_rpc"
+        next_state['pending_question'] = _target_change_scope_question(next_state)
+        return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+    if action_type == "request_chain_selection":
+        next_state['active_group'] = "chain_identity"
+        candidates = [
+            normalize_scalar(item)
+            for item in arguments.get("chain_candidates") or []
+            if normalize_scalar(item)
+        ]
+        next_state["pending_question"] = _chain_selection_question(
+            next_state,
+            candidates=candidates,
+        )
+        return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+    if action_type == "request_target_mode_selection":
+        next_state['active_group'] = "target_mode"
+        next_state['pending_question'] = _target_mode_selection_question(next_state)
+        return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
+    if action_type == "choose_adapter_family":
+        family = normalize_scalar(arguments.get("adapter_family")).casefold()
+        identity = next_state.setdefault("chain_identity", {})
+        if (
+            normalize_scalar(identity.get("adapter_family")).casefold() == family
+            and is_existing_family_lifecycle(identity)
+        ):
+            return _result(
+                state,
+                next_state,
+                action,
+                completion="unchanged",
+                response_fragments=tuple(responses),
+            )
+        if (
+            identity.get("status")
+            not in {"needs_identity_confirmation", "needs_protocol_confirmation"}
+            and not is_existing_family_lifecycle(identity)
+        ):
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "adapter_family_outside_identity_resolution"}, source=__name__))
+        _enter_case_for_adapter_family(next_state, family, responses=responses)
+        return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))
+    if action_type == "cancel_target_change":
+        next_state['active_group'] = "workload_rpc"
+        next_state['pending_question'] = question_for_chain_rpc(next_state, "workload_rpc") or {}
+        return _result(state, next_state, action, completion="blocked" if next_state.get("pending_question") else "completed", response_fragments=tuple(responses))
+    if action_type == "secondary_handoff_command":
+        command = normalize_scalar(arguments.get("handoff_command"))
+        evidence = str(arguments.get("handoff_evidence") or "").strip()
+        identity = next_state.get("chain_identity") or {}
+        handoff = next_state.get("secondary_handoff") or {}
+        if command != "append_evidence":
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "secondary_handoff_command"}, source=__name__))
+        if identity.get("case") != "case3" or handoff.get("status") != "collecting_evidence":
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "append_case3_evidence"}, source=__name__))
+        if not evidence:
+            return HandlerResult(blocker=failure("chain_rpc.failure.missing_required_value", arguments={"field": "handoff_evidence"}, source=__name__))
+        _record_case3_evidence(next_state, evidence, responses=responses)
+        return _result(state, next_state, action, completion="in_progress", stop=True, response_fragments=tuple(responses))
+    if action_type == "rpc_catalog_command":
+        identity = next_state.get("chain_identity") or {}
+        if identity.get("case") == "case3" or identity.get("adapter_family") == "unsupported":
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "rpc_catalog_for_unsupported_family"}, source=__name__))
+        command = normalize_scalar(arguments.get("catalog_command"))
+        command_arguments: dict[str, Any] = {}
+        if command == "set_endpoint":
+            command_arguments["rpc_endpoint"] = arguments.get("rpc_endpoint")
+        elif command == "set_method":
+            command_arguments["rpc_method"] = arguments.get("rpc_method")
+        elif command == "append_evidence":
+            command_arguments["rpc_schema_evidence"] = arguments.get("rpc_schema_evidence")
+        elif command not in {
+            "enter",
+            "finish",
+            "keep_current_method",
+            "replace_current_method",
+        }:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": f"rpc_catalog_command:{command}"}, source=__name__))
+        arguments = command_arguments
+    elif action_type == "rpc_workload_command":
+        identity = next_state.get("chain_identity") or {}
+        if not (
+            chain_identity_confirmed(next_state)
+            or is_existing_family_lifecycle(identity)
+        ):
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "custom_workload_without_confirmed_chain"}, source=__name__))
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key in {"workload_scope", "rpc_weights", "finish_methods"}
+        }
+    identity_name = normalize_scalar(
+        (next_state.get("chain_identity") or {}).get("canonical")
+        or (next_state.get("chain_identity") or {}).get("raw")
+    )
+    if not identity_name:
+        return HandlerResult(blocker=failure("chain_rpc.failure.missing_required_value", arguments={"field": "chain_identity"}, source=__name__))
+    if action_type == "rpc_catalog_command" and command == "finish":
+        case = "new_chain" if is_existing_family_lifecycle(identity) else "custom_rpc"
+        _apply_continue(next_state, case, "finish", responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _result(
+            state,
+            next_state,
+            action,
+            completion="in_progress",
+            response_fragments=tuple(responses),
+        )
+    if action_type == "rpc_catalog_command" and command in {
+        "keep_current_method",
+        "replace_current_method",
+    }:
+        case = (
+            "new_chain"
+            if is_existing_family_lifecycle(identity)
+            else "custom_rpc"
+        )
+        if not _resolve_method_conflict(
+            next_state,
+            case=case,
+            replace=command == "replace_current_method",
+        ):
+            return HandlerResult(
+                blocker=failure(
+                    "chain_rpc.failure.invalid_operation",
+                    arguments={"operation": command},
+                    source=__name__,
+                )
+            )
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _result(
+            state,
+            next_state,
+            action,
+            completion="in_progress",
+            response_fragments=tuple(responses),
+        )
+    method = normalize_scalar(arguments.get("rpc_method"))
+    endpoint = extract_url_candidate(arguments.get("rpc_endpoint"))
+    origin_text = _origin_text(next_state, arguments)
+    evidence = str(arguments.get("rpc_schema_evidence") or "").strip()
+    identity = next_state.setdefault("chain_identity", {})
+    if is_existing_family_lifecycle(identity):
+        previous_pending = deepcopy(next_state.get("pending_question") or {})
+        next_state['pending_question'] = {}
+        requested_scope = normalize_scalar(arguments.get("workload_scope"))
+        if requested_scope in {"single_replace", "mixed_replace"}:
+            _apply_scope(
+                next_state,
+                "new_chain",
+                requested_scope,
+                responses=responses,
+            )
+            requested_weights = arguments.get("rpc_weights")
+            if (
+                requested_scope == "mixed_replace"
+                and isinstance(requested_weights, Mapping)
+            ):
+                _apply_weights(
+                    next_state,
+                    "new_chain",
+                    requested_weights,
+                    responses=responses,
+                )
+            _install_chain_rpc_next_question(next_state, "endpoint_process")
+            return _result(
+                state,
+                next_state,
+                action,
+                completion=(
+                    "completed"
+                    if (next_state.get("workload") or {}).get("confirmed")
+                    else "in_progress"
+                ),
+                response_fragments=tuple(responses),
+            )
+        if endpoint and identity.get("status") == "existing_family_needs_endpoint":
+            _apply_endpoint_answer(
+                next_state,
+                {
+                    "endpoint_role": "validation",
+                    "rpc_case": "new_chain",
+                    "config_field": "",
+                },
+                arguments.get("rpc_endpoint") or endpoint,
+                responses=responses,
+            )
+        if method and identity.get("status") == "existing_family_needs_method":
+            _apply_method_answer(next_state, "new_chain", method, responses=responses)
+        if evidence and identity.get("status") in {"existing_family_needs_schema_evidence", "existing_family_schema_needs_confirmation"}:
+            if not _apply_schema_evidence(next_state, case="new_chain", evidence=evidence, responses=responses):
+                next_state['pending_question'] = previous_pending
+        return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))
+    custom = next_state.setdefault("custom_rpc", {})
+    custom["source_turn_text"] = origin_text
+    custom["job_local_override"] = True
+    if method:
+        strict_method = strict_method_identity(method, adapter_family=_adapter_family(next_state))
+        if strict_method:
+            method = strict_method
+            _apply_method_answer(
+                next_state,
+                "custom_rpc",
+                strict_method,
+                responses=responses,
+            )
+        else:
+            method = ""
+            emit(
+                responses,
+                "chain_rpc.response.method_grammar_rejected",
+                source=__name__,
+            )
+        if custom.get("status") == "method_conflict":
+            next_state.setdefault("workload", {})["choice"] = "custom_rpc"
+            next_state["active_group"] = "endpoint_process"
+            record_group_invalidations(
+                next_state,
+                "endpoint_process",
+                "workload_rpc",
+            )
+            return _result(
+                state,
+                next_state,
+                action,
+                completion="blocked",
+                response_fragments=tuple(responses),
+            )
+    requested_scope = normalize_scalar(arguments.get("workload_scope"))
+    requested_weights = arguments.get("rpc_weights")
+    if requested_scope in {"single_replace", "mixed_replace", "mixed_add"}:
+        custom["requested_workload"] = {
+            "scope": requested_scope,
+            "weights": dict(requested_weights) if isinstance(requested_weights, Mapping) else {},
+            "finish_methods": bool(arguments.get("finish_methods")),
+        }
+        if (
+            custom["requested_workload"]["finish_methods"]
+            and catalog_method_names(next_state)
+            and not any((method, endpoint, evidence))
+        ):
+            if _apply_requested_workload(next_state, responses=responses):
+                next_state["pending_question"] = {}
+                return _result(state, next_state, action, completion="completed", response_fragments=tuple(responses))
+    if endpoint:
+        custom["status"] = "needs_endpoint"
+    elif custom.get("endpoint_ready"):
+        resumable_statuses = {
+            "needs_method",
+            "needs_schema_evidence",
+            "schema_needs_confirmation",
+            "method_validated_next",
+            "needs_scope",
+            "needs_single_method",
+            "needs_weights",
+        }
+        if method:
+            custom["status"] = "needs_schema_evidence"
+        elif custom.get("status") not in resumable_statuses:
+            custom["status"] = "needs_schema_evidence" if draft_view(next_state).get("method") else "needs_method"
+    else:
+        custom["status"] = "needs_endpoint"
+    next_state.setdefault("workload", {})["choice"] = "custom_rpc"
+    next_state['active_group'] = "endpoint_process"
+    previous_pending = deepcopy(next_state.get("pending_question") or {})
+    next_state['pending_question'] = {}
+    record_group_invalidations(next_state, "endpoint_process", "workload_rpc")
+    if endpoint:
+        _apply_endpoint_answer(
+            next_state,
+            {
+                "endpoint_role": "validation",
+                "rpc_case": "custom_rpc",
+                "config_field": "",
+            },
+            arguments.get("rpc_endpoint") or endpoint,
+            responses=responses,
+        )
+        if custom.get("status") == "probe_failed":
+            return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))
+    if evidence and custom.get("endpoint_ready") and custom.get("status") in {"needs_schema_evidence", "needs_method", "schema_needs_confirmation"}:
+        if not draft_view(next_state).get("method"):
+            _apply_method_answer(next_state, "custom_rpc", evidence, responses=responses)
+        else:
+            if not _apply_schema_evidence(next_state, case="custom_rpc", evidence=evidence, responses=responses):
+                next_state['pending_question'] = previous_pending
+    return _result(state, next_state, action, completion="in_progress", response_fragments=tuple(responses))
+
+
+def _install_chain_rpc_next_question(state: AgentGraphState, group: str) -> None:
+    question = question_for_chain_rpc(state, group)
+    if question:
+        state['pending_question'] = question
+        state['active_group'] = str(question.get("group") or group)
+
+
+def _method_answer_evidence(
+    state: AgentGraphState,
+    value: Any,
+    user_text: str,
+) -> Any:
+    """Keep a complete wire request when it proves the resolved method."""
+
+    parsed_method, parsed_params = extract_rpc_params_or_request(user_text)
+    if parsed_params is None:
+        return value
+    resolved_method = strict_method_identity(
+        value,
+        adapter_family=_adapter_family(state),
+    )
+    source_method = strict_method_identity(
+        parsed_method,
+        adapter_family=_adapter_family(state),
+        from_protocol_request=True,
+    )
+    return user_text if source_method and source_method == resolved_method else value
+
+
+def apply_chain_rpc_answer(
+    state: AgentGraphState,
+    question: dict[str, Any],
+    value: Any,
+    user_text: str,
+) -> HandlerResult:
+    """Apply one already-coerced answer to a Chain/RPC question."""
+
+    group = normalize_scalar(question.get("group"))
+    if group not in CHAIN_RPC_GROUPS:
+        return HandlerResult(
+            blocker=failure(
+                "chain_rpc.failure.invalid_question_contract",
+                arguments={"question_id": normalize_scalar(question.get("id")) or "<missing>"},
+                source=__name__,
+            )
+        )
+    responses: ResponseCollector = []
+    next_state = deepcopy(state)
+    question_id = normalize_scalar(question.get("id"))
+    rpc_case = normalize_scalar(
+        (question.get("domain_context") or {}).get("rpc_case")
+    )
+    next_state['active_group'] = group
+    next_state['pending_question'] = {}
+    if question_id == "target_mode_change_confirm":
+        requested = normalize_target_mode(next_state.get("target_mode_change_candidate"))
+        next_state["target_mode_change_candidate"] = ""
+        if value is False:
+            next_state['active_group'] = normalize_scalar(question.get("interrupted_group")) or group
+            return _answer_result(state, next_state)
+        if not requested:
+            return HandlerResult(blocker=failure("chain_rpc.failure.missing_required_value", arguments={"field": "target_mode_change_candidate"}, source=__name__))
+        previous = normalize_target_mode(question.get("previous_mode") or next_state.get("target_mode"))
+        next_state["target_mode"] = requested
+        next_state["workflow_mode"] = "sync_observe" if requested == "sync-observe" else "rpc_benchmark"
+        invalidate_for_target_mode(next_state, previous_mode=previous)
+        mark_group_reconfigured(next_state, "target_mode")
+        next_state['active_group'] = "chain_identity" if not _chain_confirmed(next_state) else _next_group(next_state)
+        emit(
+            responses,
+            "chain_rpc.response.target_mode_switched",
+            arguments={"target_mode": requested},
+            source=__name__,
+        )
+        return _answer_result(state, next_state, response_fragments=tuple(responses))
+    if question_id == "target_mode_select":
+        return apply_chain_rpc_action(
+            state,
+            ActionProposal(
+                "target_mode:answer",
+                "choose_target_mode",
+                {"target_mode": value, "selection_contract_verified": True},
+                "high",
+            ),
+        )
+    if question_id in {"chain", "chain_change_input"}:
+        raw = normalize_scalar(value or user_text)
+        raw = _candidate_identity_from_action(
+            next_state,
+            raw,
+            {"source_evidence": user_text},
+        )
+        if question_id == "chain_change_input" and (next_state.get("chain_identity") or {}).get("canonical"):
+            _request_chain_change(next_state, raw, {}, responses=responses)
+        else:
+            _apply_chain_candidate(next_state, raw, responses=responses)
+        return _answer_result(state, next_state, completion="in_progress" if next_state.get("pending_question") else "completed", stop=_handoff_stops(next_state), response_fragments=tuple(responses))
+    if question_id == "chain_ambiguity_confirm":
+        if value == "reenter_chain":
+            next_state["chain_identity"] = {}
+        elif isinstance(value, dict) and value.get("chain_choice"):
+            chain = canonicalize_chain_scalar(str(value.get("chain_choice") or ""), known_chains=set(repo_chain_names()))
+            if chain:
+                previous = normalize_scalar((next_state.get("chain_identity") or {}).get("canonical"))
+                if previous and previous != chain:
+                    invalidate_for_chain_change(next_state)
+                next_state["chain_identity"] = {"raw": str(value.get("chain_choice") or ""), "canonical": chain, "status": "confirmed", "case": "known"}
+                next_state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = chain
+                emit(
+                    responses,
+                    "chain_rpc.response.chain_confirmed",
+                    arguments={"chain": chain},
+                    source=__name__,
+                )
+        elif isinstance(value, dict) and value.get("unknown_chain_choice"):
+            _apply_chain_candidate(next_state, str(value.get("unknown_chain_choice") or ""), responses=responses)
+        return _answer_result(state, next_state, completion="in_progress" if next_state.get("pending_question") else "completed", response_fragments=tuple(responses))
+    if question_id == "chain_change_confirm":
+        _apply_chain_change_decision(next_state, question, value, responses=responses)
+        return _answer_result(state, next_state, completion="in_progress" if next_state.get("pending_question") else "completed", stop=_handoff_stops(next_state), response_fragments=tuple(responses))
+    if question_id == "unknown_chain_identity_confirm":
+        _apply_unknown_chain_decision(next_state, value, user_text, responses=responses)
+        return _answer_result(state, next_state, completion="in_progress", stop=_handoff_stops(next_state), response_fragments=tuple(responses))
+    if question_id in {"adapter_family_confirm", "custom_rpc_adapter_family_confirm"}:
+        family = normalize_scalar(value).casefold()
+        if question_id == "custom_rpc_adapter_family_confirm":
+            _confirm_custom_rpc_family(next_state, family, responses=responses)
+        else:
+            _enter_case_for_adapter_family(next_state, family, responses=responses)
+        return _answer_result(state, next_state, completion="in_progress", stop=_handoff_stops(next_state), response_fragments=tuple(responses))
+    if question_id in {"case3_protocol_evidence", "case3_evidence_input"}:
+        _record_case3_evidence(next_state, str(user_text or value).strip(), responses=responses)
+        return _answer_result(state, next_state, completion="in_progress", stop=True, response_fragments=tuple(responses))
+    if question_id == "case3_evidence_next":
+        if value == "add_more":
+            next_state.setdefault("chain_identity", {})["status"] = "case3_needs_evidence"
+            next_state.setdefault("secondary_handoff", {})["status"] = "collecting_evidence"
+        else:
+            _prepare_case3_handoff(next_state, responses=responses)
+            return _answer_result(state, next_state, stop=True, response_fragments=tuple(responses))
+        return _answer_result(state, next_state, completion="in_progress")
+    endpoint_contract = question.get("domain_context") or {}
+    if (
+        isinstance(endpoint_contract, dict)
+        and endpoint_contract.get("contract_type") == "rpc_endpoint"
+    ):
+        _apply_endpoint_answer(
+            next_state,
+            endpoint_contract,
+            value,
+            responses=responses,
+        )
+        next_question = question_for_chain_rpc(next_state, "endpoint_process")
+        if next_question:
+            next_state['pending_question'] = next_question
+            next_state['active_group'] = "endpoint_process"
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id == "BLOCKCHAIN_PROCESS_NAMES":
+        next_state.setdefault("confirmed_config", {})["BLOCKCHAIN_PROCESS_NAMES"] = normalize_scalar(value)
+        return _answer_result(state, next_state)
+    if question_id == "MAINNET_RPC_URL_REVIEWED":
+        confirmed = next_state.setdefault("confirmed_config", {})
+        if value is False:
+            evidence = next_state.setdefault("endpoint_evidence", {})
+            evidence["mainnet_review_declined"] = True
+            for key in ("mainnet_rpc_url_probe", "mainnet_rpc_url_ready"):
+                evidence.pop(key, None)
+            confirmed.pop("MAINNET_RPC_URL", None)
+            confirmed["MAINNET_RPC_URL_DISABLED"] = True
+        elif value is True:
+            confirmed.pop("MAINNET_RPC_URL_DISABLED", None)
+        elif value is not True:
+            endpoint = extract_url_candidate(value)
+            if not endpoint:
+                return HandlerResult(blocker=failure("chain_rpc.failure.endpoint_invalid", arguments={"field": "MAINNET_RPC_URL"}, source=__name__))
+            identity = next_state.get("chain_identity") or {}
+            chain = normalize_scalar(identity.get("canonical") or identity.get("raw"))
+            family = _adapter_family(next_state)
+            methods, params = health_probe_methods(chain, family)
+            probe = validate_rpc_endpoint(
+                chain=chain,
+                endpoint=endpoint,
+                methods=methods,
+                adapter_family=family,
+                method_params=params,
+                timeout=3.0,
+            )
+            evidence = next_state.setdefault("endpoint_evidence", {})
+            evidence["mainnet_rpc_url_probe"] = probe
+            if not probe.get("ready"):
+                evidence["mainnet_rpc_url_ready"] = False
+                return HandlerResult(
+                    blocker=failure(
+                        "chain_rpc.failure.endpoint_invalid",
+                        arguments={"field": "MAINNET_RPC_URL"},
+                        payload={"probe": probe},
+                        source=__name__,
+                    )
+                )
+            evidence["mainnet_rpc_url_ready"] = True
+            confirmed["MAINNET_RPC_URL"] = endpoint
+            confirmed.pop("MAINNET_RPC_URL_DISABLED", None)
+            emit_endpoint_role_receipt(
+                next_state,
+                role="mainnet_comparison",
+                case=str(identity.get("case") or "known"),
+                config_field="MAINNET_RPC_URL",
+                endpoint=endpoint,
+                ready=True,
+                probe_status=probe.get("status"),
+                chain=chain,
+                adapter_family=family,
+                methods=methods,
+            )
+        confirmed["MAINNET_RPC_URL_REVIEWED"] = True
+        return _answer_result(state, next_state)
+    if question_id in {"custom_rpc_method", "new_chain_method"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _apply_method_answer(
+            next_state,
+            rpc_case,
+            _method_answer_evidence(next_state, value, user_text),
+            responses=responses,
+        )
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_schema_evidence", "new_chain_schema_evidence"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _apply_schema_evidence(
+            next_state,
+            case=rpc_case,
+            evidence=str(value),
+            responses=responses,
+        )
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_parameter_confirm", "new_chain_parameter_confirm"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _confirm_parameter_contract(next_state, rpc_case, bool(value))
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress")
+    if question_id in {"custom_rpc_schema_confirm", "new_chain_schema_confirm"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _confirm_request_contract(next_state, rpc_case, bool(value))
+        if value is False:
+            emit(
+                responses,
+                "chain_rpc.response.request_correction_required",
+                source=__name__,
+            )
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_response_confirm", "new_chain_response_confirm"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _confirm_probe_response(next_state, rpc_case, bool(value), responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_probe_confirm", "new_chain_probe_confirm"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _confirm_method_probe(next_state, rpc_case, bool(value), responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_continue", "new_chain_method_continue"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _apply_continue(next_state, rpc_case, value, responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_scope", "new_chain_workload_scope"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        normalized_scope = normalize_scalar(value)
+        scope = {
+            "single": "single_replace",
+            "mixed": "mixed_replace",
+        }.get(normalized_scope, normalized_scope)
+        _apply_scope(next_state, rpc_case, scope, responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_single_method", "new_chain_single_method"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _set_single_workload(next_state, normalize_scalar(value), rpc_case, responses=responses)
+        return _answer_result(state, next_state, response_fragments=tuple(responses))
+    if question_id in {"custom_rpc_weights", "new_chain_custom_weights"}:
+        if rpc_case not in {"custom_rpc", "new_chain"}:
+            return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
+        _apply_weights(next_state, rpc_case, value, responses=responses)
+        return _answer_result(state, next_state, completion="in_progress" if not (next_state.get("workload") or {}).get("confirmed") else "completed", response_fragments=tuple(responses))
+    if question_id == "new_chain_runtime_choice":
+        if value == "use_verified_endpoint_real_node":
+            promoted = _promote_case2_endpoint(next_state, responses=responses)
+            if not promoted:
+                _install_chain_rpc_next_question(next_state, "endpoint_process")
+            return _answer_result(
+                state,
+                next_state,
+                completion="completed" if promoted else "blocked",
+                response_fragments=tuple(responses),
+            )
+        if value == "generate_handoff":
+            _prepare_case2_handoff(next_state, responses=responses)
+            return _answer_result(state, next_state, stop=True, response_fragments=tuple(responses))
+    if question_id == "custom_rpc_fixture_choice":
+        if value == "use_template_defaults":
+            return apply_chain_rpc_action(state, ActionProposal("fixture:defaults", "use_default_workload", {}, "high"))
+        if value == "switch_real_node":
+            previous = normalize_target_mode(next_state.get("target_mode"))
+            next_state["target_mode"] = "real-node"
+            next_state["workflow_mode"] = "rpc_benchmark"
+            invalidate_for_target_mode(next_state, previous_mode=previous)
+            next_state["fixture_evidence"] = {}
+            next_state['active_group'] = _next_group(next_state)
+            emit(
+                responses,
+                "chain_rpc.response.custom_workload_switched_real_node",
+                source=__name__,
+            )
+            return _answer_result(state, next_state, response_fragments=tuple(responses))
+        if value == "generate_fixture_handoff":
+            evidence = next_state.get("fixture_evidence") or {}
+            next_state["secondary_handoff"] = {
+                "status": "ready",
+                "kind": "custom_rpc_fixture_recording",
+                "chain": (next_state.get("chain_identity") or {}).get("canonical", ""),
+                "workload": deepcopy(next_state.get("workload") or {}),
+                "endpoint_evidence": deepcopy(next_state.get("endpoint_evidence") or {}),
+                "missing_fixtures": deepcopy(evidence.get("missing") or []),
+                "requirements": ["record real endpoint response", "validate fixture authenticity", "validate fixture coverage", "rerun preflight and smoke"],
+            }
+            emit(
+                responses,
+                "chain_rpc.response.fixture_handoff_created",
+                payload={"handoff": deepcopy(next_state["secondary_handoff"])},
+                source=__name__,
+            )
+            return _answer_result(state, next_state, stop=True, response_fragments=tuple(responses))
+    if question_id == "rpc_mode":
+        return apply_chain_rpc_action(state, ActionProposal("rpc_mode:answer", "set_rpc_mode", {"rpc_mode": value}, "high"))
+    if question_id == "workload_confirm":
+        mapping = {
+            "default": "use_default_workload",
+            "custom_rpc": "rpc_catalog_command",
+            "weights": "configure_workload_weights",
+            "change_target": "request_target_change",
+        }
+        action_type = mapping.get(str(value))
+        if action_type:
+            arguments = {"catalog_command": "enter"} if action_type == "rpc_catalog_command" else {}
+            return apply_chain_rpc_action(state, ActionProposal(f"workload:{value}", action_type, arguments, "high"))
+    if question_id == "target_change_scope":
+        mapping = {"chain": "request_chain_selection", "target_mode": "request_target_mode_selection", "cancel": "cancel_target_change"}
+        action_type = mapping.get(str(value))
+        if action_type:
+            return apply_chain_rpc_action(state, ActionProposal(f"target_change:{value}", action_type, {}, "high"))
+    if group == "chain_auxiliary_endpoints":
+        field = normalize_scalar(question.get("field"))
+        if field:
+            next_state.setdefault("confirmed_config", {})[field] = normalize_scalar(value)
+            mark_group_reconfigured(next_state, group)
+            record_group_invalidations(next_state, group)
+            return _answer_result(state, next_state)
+    return HandlerResult(
+        blocker=failure(
+            "chain_rpc.failure.invalid_question_contract",
+            arguments={"question_id": question_id or "<missing>"},
+            source=__name__,
+        )
+    )
+
+
+def cancel_chain_rpc_question(state: AgentGraphState, question: dict[str, Any]) -> HandlerResult:
+    """Cancel domain-local transient work without changing shared routing state."""
+
+    group = normalize_scalar(question.get("group"))
+    if group not in CHAIN_RPC_GROUPS:
+        return HandlerResult(
+            blocker=failure(
+                "chain_rpc.failure.invalid_question_contract",
+                arguments={"question_id": normalize_scalar(question.get("id")) or "<missing>"},
+                source=__name__,
+            )
+        )
+    next_state = deepcopy(state)
+    question_id = normalize_scalar(question.get("id"))
+    rpc_case = normalize_scalar(
+        (question.get("domain_context") or {}).get("rpc_case")
+    )
+    endpoint_role = normalize_scalar(
+        (question.get("domain_context") or {}).get("endpoint_role")
+    )
+    resume_group = ""
+    if question_id == "target_mode_change_confirm":
+        next_state["target_mode_change_candidate"] = ""
+        resume_group = normalize_scalar(question.get("interrupted_group")) or group
+    elif question_id in {"chain_change_confirm", "chain_change_input"}:
+        candidate = (next_state.get("chain_identity") or {}).get("change_candidate") or {}
+        next_state.setdefault("chain_identity", {}).pop("change_candidate", None)
+        resume_group = normalize_scalar(candidate.get("interrupted_group")) or group
+    elif rpc_case == "custom_rpc":
+        next_state["custom_rpc"] = {}
+        if (next_state.get("workload") or {}).get("choice") in {"custom_rpc", "weights"}:
+            next_state["workload"] = {}
+        resume_group = "workload_rpc"
+    elif rpc_case == "new_chain":
+        identity = next_state.setdefault("chain_identity", {})
+        for key in ("candidate_method", "candidate_params", "schema_draft", "schema_evidence", "weights", "workload_scope"):
+            identity.pop(key, None)
+        if identity.get("case") == "case2":
+            identity["status"] = "needs_protocol_confirmation"
+        evidence = next_state.setdefault("endpoint_evidence", {})
+        for key in (
+            "candidate_endpoint",
+            "candidate_endpoint_ready",
+            "new_chain_endpoint_probe",
+        ):
+            evidence.pop(key, None)
+        resume_group = "chain_identity"
+    elif endpoint_role == "sync_observe":
+        evidence = next_state.setdefault("endpoint_evidence", {})
+        for key in ("sync_rpc_url_ready", "sync_rpc_url_probe", "candidate_endpoint"):
+            evidence.pop(key, None)
+        resume_group = "sync_observe"
+    next_state['pending_question'] = {}
+    result = _answer_result(state, next_state, completion="unchanged")
+    return replace(
+        result,
+        next_group="",
+        navigation_resume_group=resume_group,
+        followup_actions=(
+            ({"type": "clear_sync_observe_source"},)
+            if endpoint_role == "sync_observe"
+            else ()
+        ),
+    )

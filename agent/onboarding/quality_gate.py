@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from onboarding.families import SUPPORTED_FAMILIES
+from agent.onboarding.families import SUPPORTED_FAMILIES
 
 
 REQUIRED_CHAIN_EVIDENCE = [
@@ -120,7 +120,7 @@ def coding_brief(package: dict[str, Any]) -> str:
         "",
         "Documentation sync required:",
         "- Update the matching docs/en and docs/zh pages when support boundaries, chain/RPC behavior, fake-node fixtures, or validation steps change.",
-        "- Regenerate or validate the framework knowledge index with: python3 agent/cli.py framework-index --output /tmp/framework_index.json",
+        "- Regenerate or validate the framework knowledge index with: python3 -m agent.cli framework-index --output /tmp/framework_index.json",
         "- Treat documentation as Agent knowledge: stale docs can make the Agent give incorrect guidance.",
         "",
         "Completion rule:",

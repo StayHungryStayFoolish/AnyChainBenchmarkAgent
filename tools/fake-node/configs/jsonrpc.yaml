@@ -48,6 +48,9 @@ methods:
     tier: mid
 
   # ---- Ethereum / EVM methods (eth_*) ----
+  eth_chainId:
+    fixture: eth_chainId.json
+    tier: cheap
   eth_blockNumber:
     fixture: eth_blockNumber.json
     tier: cheap

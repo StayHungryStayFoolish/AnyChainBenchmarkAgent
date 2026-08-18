@@ -6,12 +6,43 @@ import re
 
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_ASCII_ALPHA_RE = re.compile(r"[A-Za-z]")
+_SINGLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+[,，;；、]?$")
+_TECHNICAL_SCALAR_RE = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)(\s*[,，]\s*[A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)*[,，;；]?$"
+)
+_STRUCTURED_ASSIGNMENT_LINE_RE = re.compile(
+    r"^\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]\s*\S(?:.*\S)?\s*[,，;；]?$"
+)
+_TECHNICAL_PASTE_RE = re.compile(
+    r"(^|\n)\s*(curl\b|--data\b|--header\b|response\s*:|request\s*:|traceback\b|file\s+\"|file\s+'|\{|\[)",
+    re.IGNORECASE,
+)
 
 
 def detect_language(text: str, default: str = "en") -> str:
     """Return the preferred response language for a user turn."""
-    if _CJK_RE.search(text or ""):
+    raw = text or ""
+    stripped = raw.strip().lower()
+    if stripped in {"y", "n", "yes", "no", "back", "previous", "undo"}:
+        return default if default in {"zh", "en"} else "en"
+    if stripped in {"hi", "hello", "hey"}:
+        return "en"
+    if _CJK_RE.search(raw):
         return "zh"
+    if default == "zh" and ("\n" in raw or _TECHNICAL_PASTE_RE.search(raw)):
+        return "zh"
+    if default == "zh" and _SINGLE_TOKEN_RE.fullmatch(raw.strip()):
+        return "zh"
+    if default == "zh" and _TECHNICAL_SCALAR_RE.fullmatch(raw.strip()):
+        return "zh"
+    assignment_lines = [line for line in raw.splitlines() if line.strip()]
+    if default == "zh" and assignment_lines and all(
+        _STRUCTURED_ASSIGNMENT_LINE_RE.fullmatch(line) for line in assignment_lines
+    ):
+        return "zh"
+    if _ASCII_ALPHA_RE.search(raw):
+        return "en"
     if default in {"zh", "en"}:
         return default
     return "en"
@@ -28,7 +59,7 @@ _ZH = {
     "welcome": "AnyChain Benchmark Agent 已启动。",
     "mode": "当前模型配置：provider={provider}, model={model}, auth={auth_mode}",
     "web_research": "Web research：{status}",
-    "adk": "ADK runtime：{status}",
+    "adk": "Gemini google_search 可选能力：{status}",
     "job_found": "检测到最近 job：{job_id}，状态：{status}",
     "job_next_actions": "可选下一步：{actions}",
     "job_none": "没有检测到历史 job。",
@@ -41,16 +72,18 @@ _ZH = {
     "environment_inference_summary": "环境推断草案：\n{summary}",
     "doctor_start": "正在执行只读环境检查。",
     "doctor_summary": "检查完成：status={status}，缺失依赖={missing}，能力={chains} chains / {methods} RPC methods。",
-    "dependency_offer": "检测到缺失依赖：{missing}。我可以在你确认后运行 scripts/install_deps.sh --yes。是否允许？[Y/n]",
-    "dependency_required_for_benchmark": "执行 smoke 或 benchmark 前需要先处理缺失依赖：{missing}。是否允许我现在运行 scripts/install_deps.sh --yes？[Y/n]",
+    "dependency_offer": "检测到缺失依赖：{missing}。回复 `Y` 获取需要在当前 shell 中执行的安装命令，或回复 `N` 跳过。",
     "dependency_declined": "已跳过依赖安装。后续真实 benchmark 可能仍会被 preflight 阻止。",
     "dependency_install_start": "开始安装 benchmark 依赖。这一步可能需要一些时间。",
     "dependency_install_done": "依赖安装命令完成，exit_code={exit_code}。",
-    "agent_runtime_offer": "检测到 Agent runtime 依赖缺失：google-adk。是否允许我运行 scripts/install_agent_deps.sh --yes 安装到隔离环境？[Y/n]",
-    "agent_runtime_declined": "已跳过 Agent runtime 安装。底层 LLM/ADK 能力仍不可用。",
+    "dependency_install_external": "请退出或暂停 Agent，在当前 shell 中执行：`{command}`。完成后重新启动 Agent；startup doctor 会验证结果。Agent 不会在会话内自动执行安装脚本。",
+    "agent_runtime_offer": "检测到所选模型 provider 的 Agent runtime 依赖或配置缺失：{missing}。回复 `Y` 获取隔离环境安装命令，或回复 `N` 跳过。",
+    "agent_runtime_declined": "已跳过 Agent runtime 安装。当前所选模型 provider 仍不可用。",
     "agent_runtime_install_start": "开始安装 Agent runtime 依赖到隔离环境。",
     "agent_runtime_install_done": "Agent runtime 安装命令完成，exit_code={exit_code}。",
+    "agent_runtime_install_external": "请退出或暂停 Agent，在当前 shell 中执行：`{command}`。完成后重新启动 Agent；startup doctor 会验证 provider runtime。Agent 不会在会话内自动执行安装脚本。",
     "llm_config_warning": "LLM 配置还不完整：{errors}",
+    "llm_provider_unavailable": "底层模型当前不可用（{reason}）。本轮没有提交任何 Agent 状态。请修正 provider/model/认证或稍后重试；doctor/status/jobs 等确定性命令仍可使用。",
     "jobs_empty": "没有找到 job。",
     "jobs_header": "最近 job：",
     "job_not_found": "没有找到 job：{job_id}",
@@ -58,13 +91,24 @@ _ZH = {
     "log_missing": "日志文件尚未生成。job 可能刚启动，稍后可再次输入 logs 或 follow。",
     "log_empty": "日志文件当前为空。",
     "follow_start": "开始跟踪 job={job_id} 日志：{path}\n按 Ctrl+C 只会退出日志跟踪，不会停止 benchmark，也不会退出 Agent。",
-    "follow_stopped": "已退出日志跟踪。benchmark 如果仍在运行会继续执行。你可以复制日志片段到 User> 让我分析。日志路径：{path}",
+    "follow_stopped": "已退出日志跟踪。benchmark 如果仍在运行会继续执行。你可以把日志片段复制到 User>，Agent 会按 evidence 分析。日志路径：{path}",
+    "follow_limit_reached": "日志跟踪已达到本轮安全上限并停止；benchmark 不受影响。你可以再次执行 `follow {job_id}` 继续查看。",
     "follow_done": "日志跟踪结束，job 状态：{status}",
-    "unknown": "ADK 没有返回可显示内容。你可以继续描述测试目标，或输入 doctor/status/jobs 查看确定性状态。",
+    "unknown": "底层模型没有返回可显示内容。你可以继续描述测试目标，或输入 doctor/status/jobs 查看确定性状态。",
     "adk_runtime_error": "底层模型调用暂时失败，我不会展示内部错误。这个自然语言请求尚未完成；请重试，或输入 doctor/status/jobs 查看确定性状态。",
+    "harness_runtime_error": "Agent 工作流状态校验失败，本轮没有应用。请保留当前会话并重试；如持续出现，请运行 doctor 并提供调试日志。",
+    "llm_billing_error": "底层模型服务返回余额或配额不足。自然语言 Agent 能力暂时不可用；请补充模型账户余额/配额后重试。doctor/status/jobs 这些确定性命令仍可使用。",
+    "thinking": "[thinking] 正在处理当前请求。按 Ctrl+C 可取消本轮，不会退出 Agent。",
+    "turn_cancelled": "已取消当前这一轮。Agent 会话仍在，你可以继续输入。",
+    "turn_timeout": "本轮因 timeout 停止，未提交本轮状态（整轮 deadline={timeout:g}s, provider={provider}, model={model}）。Agent 会话仍在，你可以重试。",
+    "turn_reconciliation_required": "本轮外部操作的最终状态不确定，Agent 已停止继续执行且未推进会话配置。请先核对最近 job/执行记录；在完成对账前不要重复提交同一操作。",
+    "terminal_detour_interrupted": "上一个终端命令在显示结果前被中断。Agent 配置没有变化；请重新运行该命令。",
+    "reconciliation_barrier": "会话因未完成的外部操作对账而暂停：transaction={transaction_id}。先使用 jobs/status/logs 核对，再运行 `reconcile {transaction_id} confirmed <evidence>` 或 `reconcile {transaction_id} not-observed <evidence>`。",
+    "reconciliation_resolved": "已记录对账结论：transaction={transaction_id}，resolution={resolution}。后续操作将从未变更的 Product Head 继续。",
+    "reconciliation_command_invalid": "对账命令格式无效。使用 `reconcile <transaction_id> confirmed <evidence>` 或 `reconcile <transaction_id> not-observed <evidence>`。",
+    "authority_lease_conflict": "此 Agent 会话已由另一个正在运行的 CLI 持有。请关闭旧 CLI，或使用不同的 --session-id；当前进程不会争用或修改该会话。",
     "framework_context_loaded": "已加载框架事实：{chains} chains，{families} adapter families，{methods} RPC methods，fake-node fixtures={fixtures}。",
     "ctrl_c_exit": "收到 Ctrl+C，正在退出 AnyChain Benchmark Agent。",
-    "adk_missing_hint": "注意：google-adk 当前不可用。请允许 Agent 安装隔离运行时，或先运行 bash scripts/install_agent_deps.sh --yes。",
 }
 
 
@@ -72,7 +116,7 @@ _EN = {
     "welcome": "AnyChain Benchmark Agent started.",
     "mode": "Model config: provider={provider}, model={model}, auth={auth_mode}",
     "web_research": "Web research: {status}",
-    "adk": "ADK runtime: {status}",
+    "adk": "Optional Gemini google_search capability: {status}",
     "job_found": "Found latest job: {job_id}, status: {status}",
     "job_next_actions": "Available next actions: {actions}",
     "job_none": "No previous job was found.",
@@ -85,16 +129,18 @@ _EN = {
     "environment_inference_summary": "Environment inference draft:\n{summary}",
     "doctor_start": "Running read-only environment diagnostics.",
     "doctor_summary": "Doctor complete: status={status}, missing dependencies={missing}, capabilities={chains} chains / {methods} RPC methods.",
-    "dependency_offer": "Missing dependencies detected: {missing}. I can run scripts/install_deps.sh --yes after your confirmation. Allow this? [Y/n]",
-    "dependency_required_for_benchmark": "Smoke or benchmark execution needs missing dependencies first: {missing}. Allow me to run scripts/install_deps.sh --yes now? [Y/n]",
+    "dependency_offer": "Missing dependencies detected: {missing}. Reply `Y` to show the installation command for the current shell, or `N` to skip it.",
     "dependency_declined": "Skipped dependency installation. A real benchmark may still be blocked by preflight.",
     "dependency_install_start": "Starting benchmark dependency installation. This may take a while.",
     "dependency_install_done": "Dependency installation command completed, exit_code={exit_code}.",
-    "agent_runtime_offer": "Agent runtime dependency is missing: google-adk. Allow me to run scripts/install_agent_deps.sh --yes and install it into an isolated environment? [Y/n]",
-    "agent_runtime_declined": "Skipped Agent runtime installation. Underlying LLM/ADK capabilities remain unavailable.",
+    "dependency_install_external": "Exit or pause the Agent and run this in the current shell: `{command}`. Restart the Agent afterward; startup doctor will verify the result. The Agent does not execute installation scripts inside the session.",
+    "agent_runtime_offer": "The selected model provider has missing Agent runtime dependencies or configuration: {missing}. Reply `Y` to show the isolated-environment installation command, or `N` to skip it.",
+    "agent_runtime_declined": "Skipped Agent runtime installation. The selected model provider remains unavailable.",
     "agent_runtime_install_start": "Starting Agent runtime dependency installation into the isolated environment.",
     "agent_runtime_install_done": "Agent runtime installation command completed, exit_code={exit_code}.",
+    "agent_runtime_install_external": "Exit or pause the Agent and run this in the current shell: `{command}`. Restart the Agent afterward; startup doctor will verify provider runtime. The Agent does not execute installation scripts inside the session.",
     "llm_config_warning": "LLM configuration is incomplete: {errors}",
+    "llm_provider_unavailable": "The model provider is unavailable ({reason}). No Agent state was committed. Correct the provider/model/authentication or retry later; deterministic doctor/status/jobs commands remain available.",
     "jobs_empty": "No jobs found.",
     "jobs_header": "Recent jobs:",
     "job_not_found": "Job not found: {job_id}",
@@ -103,10 +149,21 @@ _EN = {
     "log_empty": "The log file is currently empty.",
     "follow_start": "Following logs for job={job_id}: {path}\nPress Ctrl+C to leave log-follow mode only; it will not stop the benchmark or exit the Agent.",
     "follow_stopped": "Stopped log-follow mode. The benchmark continues if it is still running. Paste any log snippet at User> for analysis. Log path: {path}",
+    "follow_limit_reached": "Log follow reached this turn's safety limit and stopped; the benchmark is unaffected. Run `follow {job_id}` again to continue.",
     "follow_done": "Log follow finished; job status: {status}",
-    "unknown": "ADK did not return displayable text. You can continue describing the benchmark goal, or type doctor/status/jobs for deterministic state.",
-    "adk_runtime_error": "The underlying model call failed temporarily. I will not show internal errors. This natural-language request was not completed; retry, or type doctor/status/jobs for deterministic state.",
+    "unknown": "The configured model did not return displayable text. You can continue describing the benchmark goal, or type doctor/status/jobs for deterministic state.",
+    "adk_runtime_error": "The underlying model call failed temporarily. Internal errors are hidden. This natural-language request was not completed; retry, or type doctor/status/jobs for deterministic state.",
+    "harness_runtime_error": "Agent workflow state validation failed and this turn was not applied. Keep the current session and retry; if it persists, run doctor and provide the debug log.",
+    "llm_billing_error": "The underlying model provider reported insufficient balance or quota. Natural-language Agent capability is unavailable until the model account is funded or quota is restored. Deterministic commands such as doctor/status/jobs still work.",
+    "thinking": "[thinking] Processing the current request. Press Ctrl+C to cancel this turn without exiting the Agent.",
+    "turn_cancelled": "Cancelled the current turn. The Agent session is still active; you can continue.",
+    "turn_timeout": "This turn stopped on timeout without committing turn state (whole-turn deadline={timeout:g}s, provider={provider}, model={model}). The Agent session is still active; you can retry.",
+    "turn_reconciliation_required": "The final state of this turn's external operation is uncertain. The Agent stopped without advancing the session configuration. Reconcile the latest job/execution record before submitting the same operation again.",
+    "terminal_detour_interrupted": "The previous terminal command was interrupted before its result was displayed. Agent configuration did not change; run the command again.",
+    "reconciliation_barrier": "The session is paused for unresolved external-operation reconciliation: transaction={transaction_id}. Inspect jobs/status/logs, then run `reconcile {transaction_id} confirmed <evidence>` or `reconcile {transaction_id} not-observed <evidence>`.",
+    "reconciliation_resolved": "Recorded reconciliation: transaction={transaction_id}, resolution={resolution}. Subsequent work continues from the unchanged Product Head.",
+    "reconciliation_command_invalid": "Invalid reconciliation command. Use `reconcile <transaction_id> confirmed <evidence>` or `reconcile <transaction_id> not-observed <evidence>`.",
+    "authority_lease_conflict": "Another live CLI owns this Agent session. Close the older CLI or use a different --session-id; this process will not compete for or modify that session.",
     "framework_context_loaded": "Loaded framework facts: {chains} chains, {families} adapter families, {methods} RPC methods, fake-node fixtures={fixtures}.",
     "ctrl_c_exit": "Received Ctrl+C; exiting AnyChain Benchmark Agent.",
-    "adk_missing_hint": "Note: google-adk is not available. Allow the Agent to install the isolated runtime, or run bash scripts/install_agent_deps.sh --yes first.",
 }

@@ -151,6 +151,10 @@ for subdir in logs reports vegeta_results stats; do
     [[ -d "$archive_dir/$subdir" ]] || fail "archive missing $subdir directory: $archive_dir"
 done
 assert_file "$archive_dir/test_summary.json" "archive summary"
+summary_start_time="$(jq -r '.start_time // ""' "$archive_dir/test_summary.json")"
+summary_end_time="$(jq -r '.end_time // ""' "$archive_dir/test_summary.json")"
+[[ -n "$summary_start_time" ]] || fail "archive summary has no observed start_time"
+[[ -n "$summary_end_time" ]] || fail "archive summary has no observed end_time"
 echo "✅ archive directory structure"
 
 bash tools/audit_monitoring_lifecycle.sh >/dev/null

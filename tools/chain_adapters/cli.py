@@ -24,6 +24,7 @@ _TOOLS_DIR = os.path.dirname(_THIS_DIR)                          # tools
 sys.path.insert(0, _TOOLS_DIR)
 
 from chain_adapters import get_adapter  # noqa: E402
+from chain_adapters.base import load_chain_template  # noqa: E402
 from chain_adapters.param_spec import get_param_spec  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -49,12 +50,7 @@ def _get_param_format(chain: str, method: str) -> str:
       Discovered when hedera_dual mixed C1 live-curl returned HTTP 400.
       See KNOWN_BROKEN_MIXED in tests/test_chain_adapters.py.
     """
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    chain_file = os.path.join(repo_root, "config", "chains", f"{chain}.json")
-    if not os.path.exists(chain_file):
-        return "single_address"
-    with open(chain_file) as f:
-        tpl = json.load(f)
+    tpl = load_chain_template(chain)
     param_formats = tpl.get("param_formats", {})
     if isinstance(param_formats, dict):
         return param_formats.get(method, "single_address")
@@ -62,9 +58,7 @@ def _get_param_format(chain: str, method: str) -> str:
 
 
 def _load_chain_template(chain: str) -> dict:
-    chain_file = _CHAINS_DIR / f"{chain}.json"
-    with open(chain_file) as f:
-        return json.load(f)
+    return load_chain_template(chain)
 
 
 def _chain_methods(tpl: dict) -> list[str]:

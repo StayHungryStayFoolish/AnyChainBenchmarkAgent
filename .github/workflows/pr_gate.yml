@@ -44,6 +44,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Agent parsing dependency
+        run: python3 -m pip install pyyaml
+
       - name: Validate shell syntax
         run: |
           set -euo pipefail

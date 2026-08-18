@@ -1,0 +1,395 @@
+from __future__ import annotations
+
+import os
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class AgentRuntimeIsolationTests(unittest.TestCase):
+    def test_runtime_event_accepts_action_local_duplicate_sibling_fragments(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
+        from tests.agent_live.coverage_evidence import validate_runtime_turn_event
+        from tests.agent_live.dynamic_dual_ai_chaos import _runtime_event_from_mapping
+        from tests.agent_live.graph_turn import reviewed_action_plan, reviewed_stage_planner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            runtime = AnyChainGraphRuntime(
+                "action-local-fragments",
+                checkpoint_path=root / "checkpoints.sqlite",
+                session_purpose="dynamic-dual-ai-chaos",
+            )
+            state = new_state(
+                "action-local-fragments",
+                language="zh",
+                session_purpose="dynamic-dual-ai-chaos",
+            )
+            state["target_mode"] = "sync-observe"
+            state["workflow_mode"] = "sync_observe"
+            state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
+            runtime._persist_state(state)
+            text = "返回 RPC 配置。\n我想先检查端点地址和连接设置。"
+
+            def planner(planner_state, planner_text):
+                return reviewed_action_plan(
+                    planner_state,
+                    planner_text,
+                    [
+                        {
+                            "type": "answer_opening_question",
+                            "topic": "current_config",
+                            "source_evidence": "返回 RPC 配置。",
+                            "confidence": "high",
+                        },
+                        {
+                            "type": "answer_opening_question",
+                            "topic": "current_config",
+                            "source_evidence": "我想先检查端点地址和连接设置。",
+                            "confidence": "high",
+                        },
+                    ],
+                )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                reviewed_stage_planner(planner),
+            ):
+                result = runtime.invoke(text, language="zh")
+            runtime.close()
+
+            raw_event = json.loads(
+                event_file.read_text(encoding="utf-8").splitlines()[-1]
+            )
+
+        validate_runtime_turn_event(_runtime_event_from_mapping(raw_event))
+        domain_receipts = [
+            receipt
+            for receipt in raw_event["control_receipts"]
+            if receipt.get("receipt_type") == "domain_commit"
+        ]
+        self.assertEqual(len(domain_receipts), 2)
+        self.assertEqual(
+            [
+                [fragment["message_id"] for fragment in receipt["response_fragments"]]
+                for receipt in domain_receipts
+            ],
+            [
+                ["harness.orientation.consultation.current_config"],
+                ["harness.orientation.consultation.current_config"],
+            ],
+        )
+        self.assertEqual(len(result.get("visible_response") or []), 1)
+
+    def test_jobs_directory_can_be_isolated_for_cli_and_chaos_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            isolated = Path(tmpdir, "jobs").resolve()
+            env = dict(os.environ)
+            env["ANYCHAIN_AGENT_JOBS_DIR"] = str(isolated)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from agent.runners.job_manager import DEFAULT_JOBS_DIR; "
+                        "from agent.terminal.startup_state import load_startup_state; "
+                        "print(DEFAULT_JOBS_DIR); "
+                        "print(load_startup_state()['jobs_dir'])"
+                    ),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(completed.stdout.splitlines(), [str(isolated), str(isolated)])
+
+    def test_runtime_emits_committed_turn_fingerprint_without_exposing_config(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(os.environ, {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)}),
+                reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
+                ),
+                AnyChainGraphRuntime(
+                    "event-runtime",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+            ):
+                result = runtime.invoke("hello", language="en")
+
+            event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["event_type"], "turn_committed")
+            self.assertEqual(event["schema_version"], 6)
+            self.assertEqual(event["terminal_outcome"], "committed")
+            self.assertTrue(event["runtime_event_id"])
+            self.assertTrue(event["terminal_event_id"])
+            self.assertTrue(event["transaction_id"])
+            self.assertEqual(
+                event["product_authority_id"],
+                "chaos:event-runtime",
+            )
+            self.assertEqual(
+                event["physical_thread_id"],
+                event["product_checkpoint_thread_id"],
+            )
+            self.assertEqual(
+                event["attempt_checkpoint_id"],
+                event["product_checkpoint_id"],
+            )
+            self.assertEqual(len(event["render_hash"]), 64)
+            self.assertEqual(event["thread_id"], "event-runtime")
+            self.assertEqual(event["turn_index"], result["turn_index"])
+            self.assertEqual(len(event["before_fingerprint"]), 64)
+            self.assertEqual(len(event["after_fingerprint"]), 64)
+            self.assertIn("revision", event)
+            self.assertIn("pending_contract", event)
+            self.assertIn("admitted_action_types", event)
+            self.assertTrue(event["state_diff_hashes"])
+            self.assertTrue(event["next_result"])
+            self.assertEqual(
+                [item["type"] for item in event["admitted_action_provenance"]],
+                ["greeting"],
+            )
+            action_receipt = event["admitted_action_provenance"][0]
+            self.assertEqual(len(action_receipt["arguments_hash"]), 64)
+            self.assertEqual(len(action_receipt["source_hash"]), 64)
+            self.assertIn(
+                event["turn_receipt_summary"]["status"],
+                {"blocked", "committed"},
+            )
+            self.assertEqual(
+                event["pending_transition"]["after_id"],
+                result["pending_question"]["id"],
+            )
+            self.assertEqual(
+                event["render_manifest"]["fragment_count"],
+                len(result["visible_response"]),
+            )
+            self.assertIn("execution_receipt_summary", event)
+            self.assertTrue(event["control_receipts"])
+            self.assertTrue(
+                all(
+                    len(item["receipt_id"]) == 64
+                    for item in event["control_receipts"]
+                )
+            )
+            self.assertIn("material_state_diff_hashes", event)
+            self.assertNotIn("confirmed_config", event)
+            self.assertNotIn(
+                "hello",
+                json.dumps(event, ensure_ascii=False),
+            )
+
+    def test_runtime_binds_secret_projected_turn_to_original_submission(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
+
+        submitted = (
+            "Use endpoint "
+            "https://user:password@example.invalid/secret-token"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
+                ),
+                AnyChainGraphRuntime(
+                    "secret-input-runtime",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+            ):
+                runtime.invoke(submitted, language="en")
+
+            event = json.loads(
+                event_file.read_text(encoding="utf-8").splitlines()[-1]
+            )
+            receipt = event["turn_receipt_summary"]
+            self.assertEqual(
+                receipt["submitted_input_hash"],
+                user_input_hash(submitted),
+            )
+            self.assertNotIn(
+                "secret-token",
+                json.dumps(event, ensure_ascii=False),
+            )
+
+    def test_invariant_recovery_emits_one_committed_turn_observation(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
+        from agent.harness.state import new_state
+
+        submitted_input = "trigger invalid transition"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            invalid = new_state("recovered-runtime", language="en", session_purpose="chaos")
+            invalid["turn_index"] = 1
+            invalid["active_group"] = "not-a-real-group"
+            with (
+                patch.dict(os.environ, {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)}),
+                AnyChainGraphRuntime(
+                    "recovered-runtime",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+                patch.object(runtime.graph, "invoke", return_value=invalid),
+            ):
+                result = runtime.invoke(submitted_input, language="en")
+
+            events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([event["event_type"] for event in events], ["turn_committed"])
+            self.assertEqual([event["observation"] for event in events], ["turn_recovered"])
+            self.assertEqual(events[0]["turn_index"], result["turn_index"])
+            self.assertEqual(result["active_group"], "failure_recovery")
+            self.assertEqual(events[0]["pending_question_id"], "failure_recovery_action")
+            self.assertEqual(events[0]["control_receipts"], [])
+            self.assertEqual(result["turn_context"]["id"], result["turn_index"])
+            self.assertEqual(result["last_user_input"], submitted_input)
+            self.assertEqual(result["turn_context"]["text"], submitted_input)
+            self.assertEqual(result["turn_receipt"]["status"], "failed")
+            self.assertEqual(result["turn_receipt"]["admitted_action_ids"], [])
+            self.assertEqual(
+                events[0]["turn_receipt_summary"]["input_hash"],
+                user_input_hash(submitted_input),
+            )
+
+    def test_invariant_recovery_does_not_carry_prior_turn_receipts(self) -> None:
+        from copy import deepcopy
+
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                AnyChainGraphRuntime(
+                    "recovery-after-receipts",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+            ):
+                with reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
+                ):
+                    previous = runtime.invoke("Hi", language="en")
+                self.assertTrue(
+                    (previous.get("turn_context") or {}).get(
+                        "control_receipts"
+                    )
+                )
+                invalid = deepcopy(previous)
+                invalid["active_group"] = "not-a-real-group"
+                with patch.object(runtime.graph, "invoke", return_value=invalid):
+                    submitted_input = "change several settings"
+                    recovered = runtime.invoke(submitted_input, language="en")
+
+            events = [
+                json.loads(line)
+                for line in event_file.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[-1]["observation"], "turn_recovered")
+            self.assertEqual(events[-1]["control_receipts"], [])
+            self.assertEqual(
+                events[-1]["turn_receipt_summary"]["input_hash"],
+                user_input_hash(submitted_input),
+            )
+            self.assertEqual(
+                recovered["turn_context"]["id"],
+                recovered["turn_index"],
+            )
+            self.assertEqual(recovered["last_user_input"], submitted_input)
+            self.assertEqual(recovered["turn_receipt"]["status"], "failed")
+            self.assertEqual(
+                recovered["turn_receipt"]["admitted_action_ids"],
+                [],
+            )
+
+    def test_invariant_raised_inside_graph_is_recovered_at_transaction_boundary(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.invariants import StateInvariantError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(os.environ, {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)}),
+                AnyChainGraphRuntime(
+                    "raised-invariant-runtime",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+                patch.object(
+                    runtime.graph,
+                    "invoke",
+                    side_effect=StateInvariantError("declared option postcondition failed"),
+                ),
+            ):
+                result = runtime.invoke("confirm", language="en")
+
+            events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([event["event_type"] for event in events], ["turn_committed"])
+            self.assertEqual([event["observation"] for event in events], ["turn_recovered"])
+            self.assertEqual(result["active_group"], "failure_recovery")
+            self.assertEqual(result["turn_index"], 1)
+            record = result["failure_recovery"]["record"]
+            self.assertIn("declared option postcondition failed", str(record))
+
+
+if __name__ == "__main__":
+    unittest.main()

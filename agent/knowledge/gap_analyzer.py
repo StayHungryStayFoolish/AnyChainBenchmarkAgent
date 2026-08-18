@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.framework_capabilities import load_framework_capabilities
+from agent.knowledge.framework_capabilities import load_framework_capabilities
+from agent.onboarding.families import SUPPORTED_FAMILIES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -76,8 +77,8 @@ def onboarding_plan(chain: str, methods: list[str], gaps: list[dict[str, str]]) 
     gap_types = {gap["type"] for gap in gaps}
     if "chain_template" in gap_types:
         steps.extend([
-            f"Create config/chains/{chain}.json from config/chains/chain_template.json.bak.",
-            "Select _meta.adapter_family based on protocol: jsonrpc, rest, bitcoin_jsonrpc, substrate, tendermint, or hedera_dual.",
+            f"Create config/chains/{chain}.json from config/chain_template.json.bak.",
+            f"Select _meta.adapter_family based on protocol: {', '.join(SUPPORTED_FAMILIES[:-1])}, or {SUPPORTED_FAMILIES[-1]}.",
             "Define rpc_methods.single, rpc_methods.mixed_weighted, param_formats, and proxy_extraction.",
         ])
     if "rpc_method" in gap_types:
@@ -92,86 +93,5 @@ def onboarding_plan(chain: str, methods: list[str], gaps: list[dict[str, str]]) 
         steps.append("Add _meta.sync_health so block-height/sync-health monitoring can classify node health.")
     if not steps:
         steps.append("No blocking framework gaps detected. Run preflight and a fake-node smoke test next.")
-    steps.append("Validate with python3 agent/cli.py capabilities and the fake-node local closed-loop guide.")
+    steps.append("Validate with python3 -m agent.cli capabilities and the fake-node local closed-loop guide.")
     return steps
-
-
-def answer_gap_question(question: str) -> dict[str, Any] | None:
-    lowered = question.lower()
-    if not any(token in lowered for token in ("support", "missing", "gap", "add chain", "new chain", "新增", "缺", "支持")):
-        return None
-    inventory = load_framework_capabilities()
-    chain = _find_chain(lowered, inventory)
-    if not chain:
-        chain = _find_unknown_chain(question)
-    methods = _find_methods(question)
-    if not chain and not methods:
-        return None
-    result = analyze_capability_gap(chain, methods)
-    return {
-        "intent": "framework_question",
-        "answer": _format_gap_answer(result),
-        "confidence": 0.9,
-        "gap_analysis": result,
-        "sources": [
-            {"path": str(REPO_ROOT / "config" / "chains"), "line": 0, "text": "chain templates"},
-            {"path": str(REPO_ROOT / "tools" / "fake-node" / "fixtures"), "line": 0, "text": "fake-node fixtures"},
-        ],
-    }
-
-
-def _find_chain(text: str, inventory: dict[str, Any]) -> str:
-    for item in sorted(inventory["chains"], key=lambda row: len(row["chain"]), reverse=True):
-        if item["chain"] in text:
-            return item["chain"]
-    return ""
-
-
-def _find_unknown_chain(question: str) -> str:
-    tokens = [token.strip("`'\".,:;()[]{}?").lower() for token in question.split()]
-    markers = {"chain", "chains", "node", "新增", "添加", "支持"}
-    stop = markers | {"new", "add", "support", "supported", "does", "the", "a", "an", "and", "or", "rpc", "method", "methods", "如何", "怎么"}
-    for idx, token in enumerate(tokens):
-        if token in {"chain", "node"} and idx > 0:
-            candidate = tokens[idx - 1]
-            if candidate and candidate not in stop and len(candidate) >= 3:
-                return candidate
-        if token in markers and idx + 1 < len(tokens):
-            candidate = tokens[idx + 1]
-            if candidate and candidate not in stop and len(candidate) >= 3:
-                return candidate
-    return ""
-
-
-def _find_methods(question: str) -> list[str]:
-    methods = []
-    stop = {
-        "does", "support", "rpc", "method", "methods", "chain", "chains",
-        "新增", "支持", "方法", "是否", "这个", "配置",
-    }
-    for token in question.replace(",", " ").split():
-        cleaned = token.strip("`'\".,:;()[]{}?")
-        lowered = cleaned.lower()
-        if lowered in stop:
-            continue
-        if any(marker in cleaned for marker in ("_", ".", "GET", "POST")):
-            methods.append(cleaned)
-        elif any(ch.isupper() for ch in cleaned[1:]) and len(cleaned) >= 4:
-            methods.append(cleaned)
-    return methods
-
-
-def _format_gap_answer(result: dict[str, Any]) -> str:
-    status = "supported" if result["supported"] else "has gaps"
-    lines = [f"{result['chain'] or '<unknown chain>'}: {status}."]
-    if result.get("family"):
-        lines.append(f"Adapter family: {result['family']}.")
-    lines.append(f"fake-node fixtures: {result['fixture_count']}.")
-    if result["gaps"]:
-        lines.append("Detected gaps:")
-        for gap in result["gaps"]:
-            lines.append(f"- [{gap['severity']}] {gap['message']}")
-    lines.append("Recommended plan:")
-    for step in result["onboarding_plan"]:
-        lines.append(f"- {step}")
-    return "\n".join(lines)

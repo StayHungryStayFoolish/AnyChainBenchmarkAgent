@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
+from agent.knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
 
 
 DEFAULT_INDEX_PATH = REPO_ROOT / ".agent" / "knowledge" / "framework_index.json"
@@ -16,8 +16,8 @@ DEFAULT_INDEX_PATH = REPO_ROOT / ".agent" / "knowledge" / "framework_index.json"
 KEY_CODE_PATHS = [
     {
         "topic": "agent_terminal",
-        "paths": ["bin/anychain-agent", "agent/terminal/repl.py", "agent/terminal/io.py"],
-        "purpose": "Human-facing Agent terminal, dependency bootstrap, language routing, startup diagnostics, and ADK session bridge.",
+        "paths": ["bin/anychain-agent", "agent/terminal/repl.py", "agent/terminal/io.py", "agent/harness"],
+        "purpose": "Human-facing Agent terminal plus LangGraph Harness workflow, checkpointing, startup diagnostics, and language routing.",
     },
     {
         "topic": "environment_discovery",
@@ -26,8 +26,8 @@ KEY_CODE_PATHS = [
     },
     {
         "topic": "benchmark_orchestration",
-        "paths": ["agent/adk_app/agents/domain.py", "agent/adk_app/instructions.py", "agent/validators", "agent/planners", "agent/runners"],
-        "purpose": "ADK multi-agent orchestration, deterministic validation gates, plan generation, runtime.env preparation, preflight, smoke, and jobs.",
+        "paths": ["agent/harness", "agent/tools/executor.py", "agent/validators", "agent/planners", "agent/runners"],
+        "purpose": "LangGraph Harness orchestration, the CLI tool-dispatch surface, deterministic validation gates, plan generation, runtime.env preparation, preflight, smoke, and jobs.",
     },
     {
         "topic": "chain_templates",
@@ -53,12 +53,12 @@ KEY_CODE_PATHS = [
 
 
 VALIDATION_COMMANDS = [
-    "python3 agent/cli.py framework-index --output /tmp/framework_index.json",
-    "python3 agent/cli.py capabilities",
+    "python3 -m agent.cli framework-index --output /tmp/framework_index.json",
+    "python3 -m agent.cli capabilities",
     "python3 tools/chain_adapters/cli.py validate-template --chain all",
     "python3 tools/fake-node/check_fixture_coverage.py --json",
     "python3 tools/fake-node/runtime_probe.py",
-    "python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract",
+    "python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness",
 ]
 
 DOC_INDEX = [

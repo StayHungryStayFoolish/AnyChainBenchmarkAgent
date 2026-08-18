@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from planners.strategy_planner import write_json
+from agent.planners.strategy_planner import write_json
 
 
 def build_artifact_index(job: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:

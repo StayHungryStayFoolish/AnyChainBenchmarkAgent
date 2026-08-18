@@ -79,6 +79,7 @@
       "threshold_unit": "block",
       "notes": "Use eth_syncing on the local node: false maps to lag 0; syncing objects map to highestBlock-currentBlock and reuse BLOCK_HEIGHT_DIFF_THRESHOLD."
     },
+    "identity_probe": {"method": "eth_chainId", "params": [], "result_pointer": "/result", "expected": "534352", "normalization": "integer", "source": "Scroll mainnet chain ID"},
     "health_probe": {
       "method": "eth_syncing",
       "params": [],

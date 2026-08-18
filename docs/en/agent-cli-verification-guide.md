@@ -13,7 +13,8 @@ customer data, or personal credentials in shared evidence.
 Verify that `./bin/anychain-agent` behaves like a product Agent:
 
 - starts cleanly in a real terminal;
-- uses the configured LLM through Google ADK;
+- uses the configured LLM through the LangGraph Harness, with Google ADK used
+  only by the optional Gemini `google_search` grounding function;
 - correctly reports the configured auth mode, including Google ADC or attached
   service-account modes when available;
 - keeps input/output stable for English and Chinese;
@@ -23,8 +24,34 @@ Verify that `./bin/anychain-agent` behaves like a product Agent:
   validation;
 - handles ambiguous answers, corrections, backtracking, and mode changes;
 - keeps long-running jobs detached and resumable;
-- uses Gemini-only ADK `google_search` only for unsupported-chain and custom-RPC
-  onboarding evidence.
+- uses Gemini-only ADK `google_search` only for unknown-chain/protocol,
+  custom-RPC schema, and sync-observe client-setup evidence.
+
+The workflow metadata authority is
+`agent/workflows/group_registry.py::GROUPS`: 20 `GroupSpec` entries, each with
+exactly one of eight domain owners. The graph has an additional `coordinator`
+control owner for typed pending-answer and graph-control actions; it owns no
+group.
+
+The current semantic graph is split into observable checkpoint transitions:
+
+```text
+prepare -> adjudicate
+  -> partition
+  -> compile_owner (one scheduled owner per transition; repeat as required)
+  -> review_plan (independent whole-plan semantic admission)
+  -> admit (deterministic action validation)
+  -> select_action -> owner -> commit_action
+  -> side-effect intent/invoke/receipt when required
+  -> fallback -> compose -> validate
+```
+
+Only exact declared options, including declared numbered and Y/N choices, exact
+terminal commands, evidence-transport framing, and empty input use the local
+deterministic path. A manual typed value, natural-language alternative,
+multi-intent turn, or structured block requiring semantic ownership must pass
+through the split semantic path before deterministic pending/domain
+validation.
 
 ## Required Reading
 
@@ -41,23 +68,32 @@ Read these files before testing or changing code:
 ## Environment Rules
 
 - Start from a clean checkout of the target branch and record the commit hash.
-- Use an isolated Python/ADK environment.
+- Use an isolated Python 3.10+ Agent environment. `.venv-adk` is a retained
+  compatibility path, not a statement that Google ADK is required.
 - Run `bash scripts/install_agent_deps.sh --yes` before terminal testing, or
-  let the Agent request approval to install missing Agent dependencies.
+  let the launcher request approval and run it before the REPL starts. Once the
+  REPL is running, dependency prompts return an external shell command instead
+  of executing installers inside the conversation.
 - Do not commit API keys, ADC files, service account JSON, `.agent/`, live logs,
   generated benchmark archives, or terminal recordings containing secrets.
 - Redact credentials, local usernames, hostnames, internal project IDs, and
   private endpoint URLs from shared evidence.
-- Record whether the configured model supports ADK `google_search`.
+- Install Google ADK only when search coverage is requested:
+  `bash scripts/install_agent_deps.sh --yes --with-google-search`.
+- Record whether the configured model and optional extra support ADK
+  `google_search`.
 - If Google/Gemini search is unavailable, still run all non-search terminal
   and fake-node boundaries.
 - Put local model credentials only in `config/agent_config.local.sh` or the
   execution environment. Never edit repository defaults with real secrets.
 - Do not claim that real-node execution was tested unless an approved endpoint
   was explicitly provided for that run.
-- Fake-node validation is enough for Agent CLI workflow coverage, but the
-  Agent must still collect the same machine/resource metadata it would need for
-  real-node execution.
+- Fake-node validates only the fake-node closed loop. It is not sufficient for
+  full Agent CLI workflow coverage and cannot qualify real-node,
+  sync-observe, custom-RPC live-probe, or real execution edges. The Agent must
+  still collect the machine/resource metadata required by the selected path.
+- Acceptance runs are Docker/Linux-only. A host run may be a developer check,
+  but it must not be recorded as product workflow or coverage evidence.
 
 ## Baseline Commands
 
@@ -65,8 +101,8 @@ Read these files before testing or changing code:
 git status --short --branch
 git rev-parse HEAD
 bash scripts/install_agent_deps.sh --yes
-python3 agent/cli.py adk-status
-python3 agent/cli.py llm-config
+python3 -m agent.cli adk-status
+python3 -m agent.cli llm-config
 ./bin/anychain-agent
 ```
 
@@ -90,47 +126,163 @@ explain what it will install and verify it requests approval before invoking
 Run before any fix and again after any fix:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+PYTHONDONTWRITEBYTECODE=1 python3 tests/run_offline_python_suite.py
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 
-Then run the live matrices with the configured model:
+Run these commands inside the Linux `bench` service. Checkpoint schema version
+24 is the current contract. Migration coverage must prove the version-16
+pending-owner/Chain-RPC context boundary, version-17 semantic planning,
+version-18 response authority, version-19 drafts, version-20 Product Head
+binding, version-21 atom evidence and secret references, version-22 durable
+bindings, and version-23 signed sensitivity, memory-hard verifiers, registry
+transactions, and reference-only durable plans. Version 24 must additionally
+prove the admission-bound semantic-draft no-op finalization receipt: only a
+ready draft whose atoms are all settled as background and whose source units
+are admitted as context may clear without an action. Ordinary empty model plans
+remain fail-closed. Version-21 raw
+credentials/references and version-22 legacy bindings/references must be
+quarantined.
+
+Passing domain behavior through a test adapter that directly constructs
+`review_plan` state does not prove the graph split. Split-stage evidence must
+execute real `partition`, every scheduled `compile_owner`, `review_plan`, and
+`admit` transitions. It must verify checkpoint recovery before and after each
+stage, owner cursor/document consistency, multi-owner semantic order, planner
+failure behavior, and that a completed owner is not invoked again after
+resume.
+
+Then run the LangGraph CLI matrix with the configured model. It drives the same
+`./bin/anychain-agent` entrypoint users run, isolates terminal/checkpoint state
+per scenario, and validates LangGraph checkpoint state:
 
 ```bash
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_intent_smoke_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_product_acceptance_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_chaos_conversation_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_edge_acceptance_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
+python3 tests/agent_live/run_langgraph_cli_matrix.py
 ```
 
 Use `provider=gemini` only when Gemini credentials are configured. Use another
 repository-supported provider for non-search live validation, but do not claim
 Google Search coverage unless Gemini ADK `google_search` is actually available.
+
+`tests/agent_live/run_product_acceptance.py` is the sole Phase 8
+evidence-admission controller. It generates revision-bound catalogs and admits
+evidence created by subordinate retained-regression, real-CLI, dynamic Chaos,
+and real-execution providers; it does not run those conversations or jobs
+itself. This long-lived guide does not declare the current G3-G6 result; run
+the controller for the target revision. Any gate without all required admitted
+provider and product-review evidence remains open.
+
+## Dual-AI Chaos Verification
+
+For broad Agent workflow, routing, group-state, or Harness changes, the scripted
+matrix is only a regression guard. It does not prove the product conversation is
+stable.
+
+Run an additional dual-AI chaos session:
+
+- Start the real Docker/Linux CLI: `./bin/anychain-agent`.
+- Configure the Agent to use a real provider such as DeepSeek for non-search
+  validation.
+- Let Codex act as the user simulator. Codex must choose each next user message
+  from the live Agent response, not from a fixed list of scripted prompts.
+- Save the complete transcript and review the user-visible flow, not only final
+  checkpoint state.
+
+Codex must use explicit user personas. Do not run a neutral happy-path checklist.
+At minimum exercise these personas:
+
+- first-time confused evaluator: asks who the Agent is, where to start, what
+  fake-node/real-node/sync-observe mean, and what the Agent will do next;
+- impatient operations engineer: gives short answers, asks whether execution
+  happened, and expects direct state and next-action summaries;
+- copy/paste-heavy technical user: pastes env/YAML/JSON/log/request/response
+  blocks with whitespace, punctuation, and partial data;
+- requirement-changing user: changes chain, target mode, QPS, RPC mode,
+  custom RPC methods, endpoint, region/zone, and observability mid-flow;
+- mixed-language user: alternates Chinese and English while using technical
+  identifiers;
+- report/debug analyst: asks for latest job, logs, reports, errors, and
+  evidence interpretation;
+- custom-RPC integrator: exercises supported-chain custom RPC and new-chain
+  existing-family onboarding with incomplete or contradictory evidence;
+- unsupported-chain evaluator: triggers secondary-development handoff and then
+  returns to a supported path;
+- resume-session user: starts from a previous partial checkpoint, then tests
+  continue, modify, clear, and natural-language detours.
+
+The first-time confused evaluator is a mandatory baseline. Start from a
+non-empty previous checkpoint, normally a partial `sync-observe / bsc` session,
+then ask questions equivalent to:
+
+```text
+who are u?
+你从哪里来
+你要去哪里
+你可以做什么？
+那我们现在可以从哪里开始？
+fake node，real node，sync observe 都是什么？
+fake node
+```
+
+The Agent must explain itself, explain modes, handle the old session explicitly,
+and must not silently reuse a stale chain. Continue the path through resource
+confirmation, workload, QPS, observability, and preflight/smoke approval. A
+positive answer to the preflight/smoke prompt, such as `1`, `Y`, or `是的`, must
+execute preflight/smoke or return a concrete blocker. It must not be consumed by
+chain selection, generic help, or framework capability text.
+
+After execution approval, the persona must ask:
+
+```text
+你执行过测试了么？
+当前是什么状态？
+那你接下来要做什么？
+那你该做什么了？
+```
+
+The Agent must answer from checkpoint/job/preflight/smoke state and provide a
+specific next action. Generic workflow descriptions or "no pending question"
+answers fail this gate.
+
+The Codex user simulator must cover at least these behaviors:
+
+1. Start with arbitrary text, not only `Hi` or `hello`.
+2. Answer a pending question with a valid short option, an invalid value, and a
+   natural-language detour.
+3. Jump between groups: disk, network, chain, target mode, workload/RPC, QPS,
+   observability, sync-observe, evidence analysis, and report analysis.
+4. Return/backtrack from one group to another, including a half-completed group.
+5. Change chain, target mode, RPC mode, QPS profile, custom RPC methods, and
+   observability after some values have already been confirmed.
+6. Paste copied config in env/YAML/JSON form and require the Agent to infer,
+   summarize, and ask for confirmation before applying it.
+7. Paste request/response samples, endpoint URLs, official-doc excerpts, and
+   contradictory evidence for custom RPC flows.
+8. Exercise Case 1, Case 2, and Case 3 chain/RPC onboarding paths, then jump
+   back to a supported chain or another case.
+9. Switch languages and include technical scalar values with whitespace or
+   punctuation.
+10. Resume from a partial previous session and test continue, modify, and clear.
+11. Verify execution side effects after approval: preflight/smoke/job state,
+    artifact paths, or a clear blocker must exist.
+12. Ask current-state and next-action questions after major transitions. The
+    response must be grounded in state, not generic documentation.
+
+If a failure appears in this session, classify it before changing code:
+
+- terminal shell problem: input, Ctrl+C, language persistence, transcript
+  rendering, dependency prompt;
+- Harness state problem: group completion, fallback order, interruption stack,
+  invalidation, resume;
+- semantic-planning problem: LLM partition/compilation or unsupported ambiguity
+  handling;
+- validator/tool problem: endpoint probe, custom RPC schema, fixture, QPS,
+  observability, preflight/smoke;
+- documentation drift.
+
+Fix the owning layer. Do not add terminal keyword routing, fuzzy matching, or
+special-case patches that bypass the LangGraph Harness.
 
 ## Manual Terminal Tests
 
@@ -147,23 +299,23 @@ doctor
 
 Expected:
 
-- Agent reports provider, model, auth mode, and web-research status;
+- the startup banner reports provider, model, auth mode, and web-research status;
 - Agent reports cloud/deployment discovery such as GCE, GKE, EC2, EKS,
   generic Kubernetes, VM, container, or unknown;
 - Agent reports CPU, memory, network interface candidates, and disk candidates
   when the host exposes them;
 - when metadata services are unavailable, Agent says what is unknown instead
   of inventing cloud, region, zone, or machine type;
-- if benchmark dependencies are missing, Agent asks for installation approval
-  before using `scripts/install_deps.sh --yes`;
+- if benchmark dependencies are missing, Agent asks for consent before showing
+  `scripts/install_deps.sh --yes`, and does not execute it inside the session;
 - if Agent runtime dependencies are missing, the launcher asks before using
   `scripts/install_agent_deps.sh --yes`.
 
 For ADC/Gemini environments, also verify:
 
 ```bash
-python3 agent/cli.py llm-config
-python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
+python3 -m agent.cli llm-config
+python3 -m agent.cli llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
 Expected:
@@ -261,6 +413,26 @@ Expected:
 - Agent asks whether to use default chain-template methods or add custom RPC
   methods.
 
+### 5A. Sync-Observe Without RPC Load
+
+Prompt:
+
+```text
+Observe my BSC node while it is syncing. Do not send RPC benchmark load.
+```
+
+Expected:
+
+- Agent routes to sync-observe, not quick/standard/intensive RPC benchmark;
+- Agent does not ask for RPC mode, mixed weights, custom RPC methods, Vegeta,
+  or QPS profile;
+- Agent confirms chain/sync-health reference behavior, node process identity,
+  optional node Prometheus metrics endpoint, disk/network metadata, and stop
+  condition: until stopped, fixed duration, or until synced;
+- generated report paths include sync/resource charts. MGas/s may be zero or
+  unavailable if the node metrics endpoint exposes no usable gas metric, but
+  the report must preserve metric source/status evidence.
+
 ### 6. Multi-Disk And Optional Accounts Disk
 
 If the host has multiple disks, verify that the Agent shows numbered disk
@@ -321,8 +493,19 @@ Add a custom RPC method with three parameters to a mixed workload.
 
 Expected:
 
-- Agent asks for method name, parameter contract, parameter samples,
-  request/response samples, mixed weight, and fake-node fixture plan;
+- Agent asks for method name, endpoint provenance, request/response evidence,
+  workload scope, and fixture plan;
+- zero-parameter methods preserve explicit empty params; positional and object
+  params preserve list order or object keys and individually confirm index/name,
+  JSON wire type, blockchain semantic type or encoding, meaning,
+  required/optional status, and example;
+- the endpoint is probed using the confirmed wire request before the method is
+  admitted to the versioned catalog;
+- `single_replace` selects one validated method; `mixed_replace` removes
+  defaults; `mixed_add` retains defaults; every active mixed weight is a
+  positive integer and the exact total is 100;
+- the canonical chain template remains unchanged and only a job-local runtime
+  override is materialized;
 - Agent does not claim production support before fixture recording and smoke
   validation.
 
@@ -456,17 +639,21 @@ Expected:
 If a scenario fails twice, inspect the redacted logs and fix the smallest
 responsible code path:
 
-- prompt or agent instruction issue: `agent/adk_app/instructions.py`;
+- semantic planning issue: `agent/harness/hierarchical_planner.py`;
+- semantic document/admission issue:
+  `agent/harness/semantic_admission.py`;
 - deterministic guard or tool issue: `agent/validators/` or
-  `agent/adk_app/tools/`;
+  `agent/tools/executor.py`;
 - terminal UX issue: `agent/terminal/`;
-- workflow state issue: `agent/adk_app/workflow/`;
-- live matrix gap: `tests/agent_live/*.json`;
+- workflow state issue: `agent/harness/`;
+- live matrix gap: `tests/agent_live/run_langgraph_cli_matrix.py`;
 - documentation drift: update the relevant README or docs page.
 
 Do not fix business behavior by adding keyword lists, fuzzy matching, or regex
-intent routing in terminal code. Intent understanding must remain model-driven
-through ADK, with deterministic tools used as validation and execution gates.
+intent routing in terminal code. Ambiguous semantic understanding must remain
+model-driven through the LangGraph hierarchical planner and whole-plan
+admission boundary, with deterministic group workflows used as validation and
+execution gates.
 
 ## Evidence To Return
 
@@ -481,6 +668,11 @@ Return a concise report with:
 - failures found and files changed;
 - tests run after fixes;
 - boundaries still untested, if any.
+
+Coverage reports must distinguish cataloged/generated from observed execution.
+Report observed pass, observed fail, not-run, externally blocked, uncovered
+pairs/triples, completed critical sequences, and hashed real job artifacts.
+Neither a PTY response nor a generated schedule/row is a passing observation.
 
 Use this report shape:
 

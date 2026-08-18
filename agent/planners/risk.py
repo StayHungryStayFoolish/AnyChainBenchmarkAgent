@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.gap_analyzer import analyze_capability_gap
+from agent.knowledge.gap_analyzer import analyze_capability_gap
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,9 +45,21 @@ def score_plan_risk(plan: dict[str, Any]) -> dict[str, Any]:
         findings.append({"severity": "medium", "points": 15, "message": "Ledger/data disk confidence is low."})
 
     env = plan.get("execution", {}).get("environment", {})
-    if not plan.get("use_fake_node") and not env.get("LOCAL_RPC_URL"):
+    workflow_type = str(
+        plan.get("workflow_type") or plan.get("run_mode") or "rpc_benchmark"
+    ).strip().lower().replace("-", "_")
+    endpoint_name = (
+        "SYNC_OBSERVE_RPC_URL"
+        if workflow_type == "sync_observe"
+        else "LOCAL_RPC_URL"
+    )
+    if not plan.get("use_fake_node") and not env.get(endpoint_name):
         score += 30
-        findings.append({"severity": "high", "points": 30, "message": "Real benchmark selected without LOCAL_RPC_URL."})
+        findings.append({
+            "severity": "high",
+            "points": 30,
+            "message": f"{workflow_type} selected without {endpoint_name}.",
+        })
 
     if env.get("OBSERVABILITY_STACK_ENABLED") != "true":
         score += 5
@@ -93,6 +105,8 @@ def _recommendations(findings: list[dict[str, str | int]]) -> list[str]:
         recs.append("Normalize mixed workload weights to 100 and re-run plan validation.")
     if "LOCAL_RPC_URL" in messages:
         recs.append("Provide LOCAL_RPC_URL or switch to fake-node for local closed-loop validation.")
+    if "SYNC_OBSERVE_RPC_URL" in messages:
+        recs.append("Provide a validated SYNC_OBSERVE_RPC_URL for the real node being observed.")
     if not recs:
         recs.append("Review findings and confirm the plan before execution.")
     return recs

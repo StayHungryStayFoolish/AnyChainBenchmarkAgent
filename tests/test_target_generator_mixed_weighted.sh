@@ -55,3 +55,73 @@ if counts != expected:
 PY
 
 echo "PASS: target_generator mixed_weighted distribution"
+
+OVERRIDE_DIR="$(mktemp -d -t bnb-mixed-override-XXXXXX)"
+trap 'rm -rf "$TMP_DIR" "$OVERRIDE_DIR"' EXIT
+OVERRIDE_FILE="$OVERRIDE_DIR/chain_template.override.json"
+OVERRIDE_TARGETS_FILE="$OVERRIDE_DIR/targets.jsonl"
+
+cat > "$OVERRIDE_FILE" <<'JSON'
+{
+  "chain_type": "ethereum",
+  "rpc_methods": {
+    "single": "eth_customTriple",
+    "mixed": "eth_customTriple",
+    "mixed_weighted": [
+      {"method": "eth_customTriple", "weight": 100}
+    ]
+  },
+  "param_spec": {
+    "eth_customTriple": {
+      "transport": "jsonrpc_list",
+      "params": [
+        {"source": "address"},
+        {"literal": "latest"},
+        {"literal": 7, "type": "int"}
+      ]
+    }
+  },
+  "params": {
+    "target_address": "0x0000000000000000000000000000000000000000"
+  }
+}
+JSON
+
+(
+    cd "$REPO_ROOT"
+    BLOCKCHAIN_NODE=ethereum \
+    RPC_MODE=mixed \
+    LOCAL_RPC_URL=http://127.0.0.1:19000 \
+    CHAIN_CONFIG_OVERRIDE_FILE="$OVERRIDE_FILE" \
+        ./tools/target_generator.sh \
+            --rpc-mode mixed \
+            --rpc-url http://127.0.0.1:19000 \
+            -a "$ACCOUNTS_FILE" \
+            -o "$OVERRIDE_TARGETS_FILE" \
+            >/dev/null 2>"$ERR_FILE"
+)
+
+python3 - "$OVERRIDE_TARGETS_FILE" <<'PY'
+import base64
+import collections
+import json
+import sys
+
+counts = collections.Counter()
+sample = None
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        target = json.loads(line)
+        body = json.loads(base64.b64decode(target["body"]))
+        counts[body["method"]] += 1
+        sample = sample or body
+
+if set(counts) != {"eth_customTriple"}:
+    print(f"runtime override leaked default mixed methods: {dict(counts)}", file=sys.stderr)
+    raise SystemExit(1)
+if not sample or sample.get("params", [None, None, None])[1:] != ["latest", 7]:
+    print(f"runtime override param_spec was not applied: {sample}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+echo "PASS: target_generator runtime override removes default mixed methods and applies custom param_spec"
