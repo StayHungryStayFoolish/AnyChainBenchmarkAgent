@@ -154,6 +154,7 @@ class PublishedAgentTerminologyContractTests(unittest.TestCase):
         self.assertEqual(bsc["metrics_path"], "/debug/metrics/prometheus")
         self.assertIn('chain_mgasps{quantile="0.5"}', bsc["native_samples"])
         self.assertIn("TPS", bsc["report_kpis"])
+        self.assertIn("empty_block_rate", bsc["report_kpis"])
         self.assertEqual(
             bsc["requirements"][0]["id"],
             "client_prometheus_endpoint_enabled",
@@ -181,6 +182,7 @@ class PublishedAgentTerminologyContractTests(unittest.TestCase):
         self.assertIn('chain_mgasps{quantile="0.5"}', rendered)
         self.assertIn("active block import", rendered)
         self.assertIn("TPS", rendered)
+        self.assertIn("empty_block_rate", rendered)
         self.assertIn("does not run Vegeta", rendered)
         self.assertIn("can continue", rendered)
         self.assertIn("N/A", rendered)

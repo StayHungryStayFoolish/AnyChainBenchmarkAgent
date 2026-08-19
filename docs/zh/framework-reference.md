@@ -197,8 +197,11 @@ RX/TX。如果客户端没有暴露 MGas/s，报告会记录指标来源和状�
 对于 BSC v1.7.x，需要用 `--metrics` 启动 BSC client，并将
 `NODE_PROMETHEUS_METRICS_URL` 指向其 `/debug/metrics/prometheus` endpoint。BSC
 profile 会增加客户端原生的区块导入、导入 MGas/s、justified/finalized 落后、交易、
-Gas、TPS、CPU、内存和样本质量结果。该 profile 只在规范链名 `bsc` 下选择，不能把它
-解释成所有 EVM client 的通用承诺。
+Gas、TPS、Empty Block Rate、CPU、内存和样本质量结果。Empty Block Rate 表示有效
+导入区块样本中原生交易数为 0 的样本比例；没有有效交易数样本时显示 `N/A`。当抓取
+间隔跳过已导入区块时，该值是基于样本的估算，并由现有 coverage/quality 字段明确
+标记精度边界。该 profile 只在规范链名 `bsc` 下选择，不能把它解释成所有 EVM
+client 的通用承诺。
 
 ### 4. 查看报告
 
@@ -232,8 +235,10 @@ Exporter 是只读的，会读取 runtime JSON 和
 `sync-observe` 使用同一个 `/metrics` 入口。`sync-observe` 下会暴露区块高度、
 节点 metrics 提供的 MGas/s 或 gas/s、execution metric source/status、节点进程
 CPU、热点线程/核心 CPU、CPU iowait、节点进程 RSS/内存占比，以及现有磁盘、网络、
-系统指标。BSC profile 还会暴露最新的原始区块导入、MGas/s、交易、gas-used、
-imported/justified/finalized 高度和 observation count，并携带 profile/quality label。
+系统指标。BSC profile 还会暴露最新的原始区块导入、MGas/s、交易、每区块
+empty/non-empty 状态、gas-used、imported/justified/finalized 高度和 observation
+count，并携带 profile/quality label。Prometheus 可以在指定时间窗口聚合每区块
+empty 状态；归档 HTML 报告会计算对应窗口的 Empty Block Rate。
 如果客户端没有暴露 execution gas 指标，MGas/s 不会被伪造，`execution_metric_available`
 会通过 source/status label 说明不可用状态。
 

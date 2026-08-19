@@ -50,6 +50,7 @@ class BscSyncMetricsTest(unittest.TestCase):
         self.assertFalse(result["transactions_estimated"])
         self.assertEqual(result["tps"], 20.0)
         self.assertEqual(result["avg_tx_per_block"], 20.0)
+        self.assertEqual(result["empty_block_rate_pct"], 0.0)
         self.assertEqual(result["avg_block_gas_used_mgas"], 2.0)
         self.assertEqual(result["block_gas_used_per_sec_mgas"], 2.0)
         self.assertEqual(result["avg_gas_per_tx"], 100_000.0)
@@ -81,6 +82,15 @@ class BscSyncMetricsTest(unittest.TestCase):
         result = calculate_bsc_sync_kpis(df)
 
         self.assertEqual(result["avg_gas_per_tx"], 5_500_000 / 50)
+        self.assertAlmostEqual(result["empty_block_rate_pct"], 100.0 / 3.0)
+
+    def test_empty_block_rate_is_unavailable_without_transaction_samples(self) -> None:
+        df = self._frame()
+        df.loc[1:, "client_block_tx_count"] = None
+
+        result = calculate_bsc_sync_kpis(df)
+
+        self.assertIsNone(result["empty_block_rate_pct"])
 
     def test_ignores_duplicate_scrapes_of_the_same_head(self) -> None:
         df = pd.concat([self._frame(), self._frame().iloc[[3]]], ignore_index=True)

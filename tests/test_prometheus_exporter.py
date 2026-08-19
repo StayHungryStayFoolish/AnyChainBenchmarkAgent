@@ -144,6 +144,7 @@ def main() -> int:
         assert 'blockchain_benchmark_mainnet_block_height{chain="bsc",rpc_mode="mixed"} 105' in output
         assert 'blockchain_benchmark_client_block_insert_milliseconds_p50{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 348.19' in output
         assert 'blockchain_benchmark_client_block_transactions{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 1769' in output
+        assert 'blockchain_benchmark_client_block_empty{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 0' in output
         assert 'blockchain_benchmark_client_block_gas_used{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 1.405e+08' in output
         assert 'blockchain_benchmark_client_head_block{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 5000' in output
         assert 'blockchain_benchmark_client_import_observation_count{chain="bsc",client_profile="bsc_v1_7",quality="complete",rpc_mode="mixed"} 42' in output

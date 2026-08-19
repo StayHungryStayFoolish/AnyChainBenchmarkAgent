@@ -92,7 +92,7 @@ flowchart TD
 `chain_mgasps{quantile="0.5"}`、`chain_inserts`、`chain_insert_txsize`、
 `chain_insert_gasused` 以及 imported/justified/finalized head gauges。报告会增加
 区块导入 P50、MGas/s、finality 落后 P50/P90/P99、交易总数、每区块/每秒 Gas、
-每交易 Gas、每区块交易数、TPS、CPU、内存和样本质量。这些 BSC 指标不会自动套用
+每交易 Gas、每区块交易数、空块率、TPS、CPU、内存和样本质量。这些 BSC 指标不会自动套用
 到其他 EVM client；当 scrape interval 跳过已导入区块时，累计交易和 Gas 会明确标记
 为估算并展示覆盖率。
 

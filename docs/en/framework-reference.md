@@ -214,8 +214,13 @@ missing values can be distinguished from framework data loss.
 For BSC v1.7.x, start the BSC client with `--metrics` and point
 `NODE_PROMETHEUS_METRICS_URL` at its `/debug/metrics/prometheus` endpoint. The
 BSC profile adds native block-insert, import MGas/s, justified/finalized lag,
-transaction, gas, TPS, CPU, memory, and sample-quality results. This profile is
-selected only for canonical chain `bsc`; it is not a generic EVM promise.
+transaction, gas, TPS, empty-block rate, CPU, memory, and sample-quality results.
+The empty-block rate is the percentage of eligible imported-block samples whose
+native transaction count is zero. It is `N/A` when no eligible transaction-count
+samples exist. When the scrape interval skips imported blocks, the value is a
+sample-based estimate and the existing coverage/quality fields make that limit
+explicit. This profile is selected only for canonical chain `bsc`; it is not a
+generic EVM promise.
 
 ### 4. Find the Report
 
@@ -254,8 +259,11 @@ progress, execution MGas/s/gas/s when the node client reports it, execution
 metric status/source, node process CPU, hottest thread/core CPU, CPU iowait,
 node process RSS/memory percentage, and the existing disk/network/system gauges.
 For the BSC profile it also exposes the latest raw block-insert, MGas/s,
-transaction, gas-used, imported/justified/finalized height, and observation
-count samples with profile/quality labels. If the client does not expose
+transaction, per-block empty/non-empty state, gas-used,
+imported/justified/finalized height, and observation count samples with
+profile/quality labels. Prometheus can aggregate the per-block empty state over
+the desired time window; the archived HTML report calculates the corresponding
+window percentage. If the client does not expose
 execution gas metrics, the MGas/s gauge is omitted and
 `execution_metric_available` is emitted with the source/status labels.
 
