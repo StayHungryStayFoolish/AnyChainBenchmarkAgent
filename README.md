@@ -91,8 +91,8 @@ Preview the generated benchmark report before running the framework:
   MGas/s when client metrics expose it, node process CPU/thread hotspots, disk
   latency/iowait context, and network throughput. For BSC v1.7.x, the native
   profile also reports block-insert P50, justified/finalized lag percentiles,
-  transactions, gas/block, gas/second, gas/transaction, TX/block, TPS, and
-  sample quality from the BSC Prometheus endpoint.
+  transactions, gas/block, gas/second, gas/transaction, TX/block, empty-block
+  rate, TPS, and sample quality from the BSC Prometheus endpoint.
 - Produces HTML reports and archives every run.
 - Provides optional Prometheus/Grafana telemetry through a read-only exporter.
 - Exposes JSON CLI tools, an OpenAI-compatible tool schema, and a stable

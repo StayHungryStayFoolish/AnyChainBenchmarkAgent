@@ -655,6 +655,7 @@ class ReportGenerator:
             (self.t["bsc_avg_gas_per_tx"], self._format_bsc_kpi(kpis.get("avg_gas_per_tx"), 0, " gas/tx")),
             (self.t["bsc_avg_tx_per_block"], self._format_bsc_kpi(kpis.get("avg_tx_per_block"), 2)),
             (self.t["bsc_tps"], self._format_bsc_kpi(kpis.get("tps"), 2, " tx/s")),
+            (self.t["bsc_empty_block_rate"], self._format_bsc_kpi(kpis.get("empty_block_rate_pct"), 2, "%")),
             (self.t["bsc_process_cpu"], self._format_bsc_kpi(kpis.get("process_cpu_avg_pct"), 2, "%")),
             (self.t["bsc_process_memory"], self._format_bsc_kpi(kpis.get("process_memory_rss_avg_gib"), 2, " GiB")),
             (self.t["bsc_system_memory"], self._format_bsc_kpi(kpis.get("memory_used_avg_gib"), 2, " GiB")),

@@ -245,6 +245,13 @@ def emit_latest_csv_metrics(builder: PrometheusBuilder, latest_row: dict[str, An
         ("client_finalized_block", "client_finalized_block", "Client-native finalized block height."),
     ):
         builder.gauge(metric, help_text, latest_row.get(field), client_labels)
+    client_block_tx_count = to_float(latest_row.get("client_block_tx_count"))
+    builder.gauge(
+        "client_block_empty",
+        "Whether the latest client-native imported-block sample has zero transactions (1 empty, 0 non-empty).",
+        None if client_block_tx_count is None else int(client_block_tx_count == 0),
+        client_labels,
+    )
     builder.gauge(
         "client_import_observation_count",
         "Client-native execution observations represented by the latest resetting summary scrape.",

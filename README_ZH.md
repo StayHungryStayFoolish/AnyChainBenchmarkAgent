@@ -75,7 +75,7 @@ preflight、smoke 和 approval gate 才控制执行。
   MGas/s、节点进程 CPU/线程热点、磁盘 latency/iowait 背景和网络吞吐。对于 BSC
   v1.7.x，客户端原生 profile 还会从 BSC Prometheus endpoint 展示区块导入 P50、
   justified/finalized 落后分位数、交易总数、每区块/每秒 Gas、每交易 Gas、每区块
-  交易数、TPS 和样本质量。
+  交易数、空块率、TPS 和样本质量。
 - 生成 HTML 报告并归档每次运行。
 - 通过只读 exporter 可选接入 Prometheus/Grafana。
 - 提供 JSON CLI tools、OpenAI-compatible tool schema 和稳定的 `tool-call`

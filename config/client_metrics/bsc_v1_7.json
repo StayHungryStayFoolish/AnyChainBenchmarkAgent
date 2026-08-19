@@ -19,6 +19,7 @@
       "block_gas_used_per_sec",
       "avg_gas_per_tx",
       "avg_tx_per_block",
+      "empty_block_rate",
       "TPS"
     ],
     "requirements": [

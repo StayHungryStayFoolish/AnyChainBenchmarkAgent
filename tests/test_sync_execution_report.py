@@ -94,6 +94,8 @@ def main() -> int:
         assert "chain_mgasps{quantile=&quot;0.5&quot;}" in html
         assert "BNB Smart Chain Native Import Metrics" in html
         assert "Estimated transactions" in html
+        assert "Empty block rate" in html
+        assert "0.00%" in html
         assert (reports_dir / "sync_execution_timeline.png").exists()
         assert (reports_dir / "bsc_sync_kpis.png").exists()
 
@@ -112,6 +114,7 @@ def main() -> int:
         html = Path(output).read_text(encoding="utf-8")
         assert "节点同步执行分析" in html
         assert "BNB Smart Chain 客户端原生导入指标" in html
+        assert "空块率" in html
         assert "Node Sync Execution Analysis" not in html
 
         os.environ["SYNC_OBSERVE_MODE"] = "false"

@@ -100,8 +100,8 @@ from the same endpoint: `chain_mgasps{quantile="0.5"}`, `chain_inserts`,
 `chain_insert_txsize`, `chain_insert_gasused`, and the imported/justified/
 finalized head gauges. The report adds block-insert P50, MGas/s, finality-lag
 P50/P90/P99, transactions, gas/block, gas/second, gas/transaction, TX/block,
-TPS, CPU, memory, and sample quality. These BSC samples are not assumed for
-other EVM clients. If the scrape interval skips imported blocks, cumulative
+empty-block rate, TPS, CPU, memory, and sample quality. These BSC samples are
+not assumed for other EVM clients. If the scrape interval skips imported blocks, cumulative
 transaction and gas values are explicitly marked as estimates with coverage.
 
 Sync-observe does not record fake-node fixtures. A node may first download a

@@ -56,6 +56,7 @@ def _base_result() -> Dict[str, Any]:
         "transactions_estimated": False,
         "tps": None,
         "avg_tx_per_block": None,
+        "empty_block_rate_pct": None,
         "avg_block_gas_used_mgas": None,
         "block_gas_used_per_sec_mgas": None,
         "avg_gas_per_tx": None,
@@ -111,6 +112,8 @@ def calculate_bsc_sync_kpis(df: pd.DataFrame) -> Dict[str, Any]:
     tx_values = _numeric(imported, "client_block_tx_count").dropna()
     gas_values = _numeric(imported, "client_block_gas_used").dropna()
     result["avg_tx_per_block"] = _finite_mean(tx_values)
+    if not tx_values.empty:
+        result["empty_block_rate_pct"] = float(tx_values.eq(0).mean() * 100.0)
     avg_gas = _finite_mean(gas_values)
     result["avg_block_gas_used_mgas"] = avg_gas / 1_000_000.0 if avg_gas is not None else None
 
